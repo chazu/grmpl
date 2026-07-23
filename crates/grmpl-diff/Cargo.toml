@@ -1,0 +1,13 @@
+[package]
+name = "grmpl-diff"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The differential engine: Query (a dataflow plan as a value), Snapshot, find, and incremental watch. Depends on grmpl-core's TraceStore trait, never on fjall."
+
+[dependencies]
+grmpl-core = { workspace = true }
+
+[dev-dependencies]
+grmpl-store = { path = "../grmpl-store" }
+tempfile = "3"

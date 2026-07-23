@@ -1,0 +1,8 @@
+[package]
+name = "grmpl-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "grmpl semantic core: pure value types, the differential substrate, and the trait boundary. Depends on nothing below the line."
+
+[dependencies]

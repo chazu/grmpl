@@ -1,0 +1,21 @@
+[package]
+name = "grmpl-transport"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Implementations of grmpl-core's Transport boundary: an in-process net and an iroh-backed QUIC transport. The only crate that names iroh (below the bright line)."
+
+[features]
+default = []
+# The iroh-backed transport pulls in a large async dependency tree; opt in.
+iroh = ["dep:iroh", "dep:tokio", "dep:n0-future"]
+
+[dependencies]
+grmpl-core = { workspace = true }
+iroh = { version = "0.92", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "io-util"], optional = true }
+n0-future = { version = "0.3", optional = true }
+
+[dev-dependencies]
+grmpl-store = { path = "../grmpl-store" }
+tempfile = "3"

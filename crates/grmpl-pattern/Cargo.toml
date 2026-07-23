@@ -1,0 +1,9 @@
+[package]
+name = "grmpl-pattern"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The pattern algebra (`form`): matching over ordered data as a relation between input structure and bindings (Pattern law). Parsing is matching, not a privileged subsystem."
+
+[dependencies]
+grmpl-core = { workspace = true }

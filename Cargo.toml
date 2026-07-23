@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grmpl-core",
+    "crates/grmpl-store",
+    "crates/grmpl-diff",
+    "crates/grmpl-proc",
+    "crates/grmpl-pattern",
+    "crates/grmpl-lang",
+    "crates/grmpl-transport",
+    "examples",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+grmpl-core = { path = "crates/grmpl-core" }
+fjall = "3.1"

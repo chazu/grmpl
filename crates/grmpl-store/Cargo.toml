@@ -1,0 +1,13 @@
+[package]
+name = "grmpl-store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "fjall-backed implementation of grmpl-core's TraceStore/EditionStore. The only crate that names fjall (below the bright line)."
+
+[dependencies]
+grmpl-core = { workspace = true }
+fjall = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

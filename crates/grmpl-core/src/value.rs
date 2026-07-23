@@ -1,0 +1,81 @@
+//! Values, tuples, entities, and interned identifiers (DESIGN.md §2.1).
+
+use std::sync::Arc;
+
+/// A stable identity in the modeled world. An entity is a legitimate domain
+/// value (Object law). It is **not** hidden tuple identity — tuples are
+/// structural, identified by content.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Entity(pub u64);
+
+/// A domain value.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Value {
+    Ent(Entity),
+    Int(i64),
+    Text(Arc<str>),
+    Bool(bool),
+    Tuple(Arc<[Value]>),
+}
+
+impl Value {
+    pub fn text(s: impl AsRef<str>) -> Value {
+        Value::Text(Arc::from(s.as_ref()))
+    }
+}
+
+impl From<Entity> for Value {
+    fn from(e: Entity) -> Value {
+        Value::Ent(e)
+    }
+}
+impl From<i64> for Value {
+    fn from(i: i64) -> Value {
+        Value::Int(i)
+    }
+}
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        Value::Bool(b)
+    }
+}
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        Value::text(s)
+    }
+}
+
+/// A row in a relation. Structural: identity is by content, never hidden.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Tuple(pub Arc<[Value]>);
+
+impl Tuple {
+    pub fn new(vals: impl Into<Arc<[Value]>>) -> Self {
+        Tuple(vals.into())
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        &self.0
+    }
+
+    pub fn arity(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<const N: usize> From<[Value; N]> for Tuple {
+    fn from(vals: [Value; N]) -> Tuple {
+        Tuple(Arc::from(vals))
+    }
+}
+
+/// Interned relation name. The schema (later) maps it to an arity + column
+/// types; the store maps it to a physical keyspace.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct RelId(pub u32);
+
+/// Identity of an authority domain. In v1 this is a local id; in the
+/// distributed future it maps to an iroh `EndpointId` (Ed25519 pubkey),
+/// *below the line* only.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct DomainId(pub u64);

@@ -1,0 +1,16 @@
+[package]
+name = "grmpl-proc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The process layer: the optimistic commit protocol, Process, and the actor loop. Depends on grmpl-core + grmpl-diff, never on fjall."
+
+[dependencies]
+grmpl-core = { workspace = true }
+grmpl-diff = { path = "../grmpl-diff" }
+
+[dev-dependencies]
+grmpl-store = { path = "../grmpl-store" }
+grmpl-pattern = { path = "../grmpl-pattern" }
+grmpl-transport = { path = "../grmpl-transport" }
+tempfile = "3"

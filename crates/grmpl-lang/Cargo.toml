@@ -1,0 +1,16 @@
+[package]
+name = "grmpl-lang"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "A minimal text surface (rel / view / form) that lowers to the core Query and Pattern constructors. Demonstrates that the MOO facade compiles to relational queries."
+
+[dependencies]
+grmpl-core = { workspace = true }
+grmpl-diff = { path = "../grmpl-diff" }
+grmpl-pattern = { path = "../grmpl-pattern" }
+grmpl-proc = { path = "../grmpl-proc" }
+
+[dev-dependencies]
+grmpl-store = { path = "../grmpl-store" }
+tempfile = "3"
