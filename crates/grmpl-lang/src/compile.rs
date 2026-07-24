@@ -120,6 +120,13 @@ struct CatalogAlloc<'a> {
 }
 
 impl<'a> CatalogAlloc<'a> {
+    /// Snapshot the catalog's high-water id once, up front, then hand out fresh
+    /// ids above it. This read-then-register sequence is **not** atomic against
+    /// a *concurrent* compile sharing the same catalog: two compiles that each
+    /// snapshot the same high-water mark could assign the same fresh id to two
+    /// distinct names. `compile_with_catalog` is therefore a **provisioning-time,
+    /// single-threaded** operation — run it while nothing else is registering
+    /// names, not from racing threads against one live catalog.
     fn new(catalog: &'a dyn Catalog, rel_base: u32) -> Result<Self, String> {
         let highest = catalog
             .entries()
@@ -169,6 +176,12 @@ impl Program {
     /// property TKT-72's catalog was built for: physical ids no longer depend on
     /// source layout. Schemas are still recorded separately via
     /// [`register_schemas`](Self::register_schemas).
+    ///
+    /// **Provisioning-time / single-threaded.** Fresh-id assignment snapshots
+    /// the catalog's high-water mark and then registers above it; that
+    /// read-then-register is not atomic across *concurrent* compiles, so two
+    /// threads compiling against one shared catalog could hand the same fresh id
+    /// to distinct names. Compile while nothing else is registering names.
     pub fn compile_with_catalog(
         src: &str,
         catalog: &dyn Catalog,
