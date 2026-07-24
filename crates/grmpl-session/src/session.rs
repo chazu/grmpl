@@ -10,9 +10,11 @@
 //!   3. **a `Process`** — bound to a per-player inbox slice, driving the actor
 //!      loop.
 //!
-//! Commits are serialized behind one writer (`lock`). That is the interim
-//! **single-writer inbox seq scheme**: inbox positions and the entity counter
-//! advance without cross-writer races. P4 replaces it with a durable allocator.
+//! Commits are serialized behind one writer (`lock`). Inbox seqs no longer rely
+//! on that serialization: they are drawn from the durable, race-safe P4
+//! [`SeqAlloc`](grmpl_proc::SeqAlloc) via [`enqueue_seq`](grmpl_proc::enqueue_seq)
+//! (seeded once per player at spawn), so a concurrent append resolves to a
+//! distinct seq on its own. The entity counter still advances under the writer.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -21,12 +23,12 @@ use grmpl_core::{
     Edition, Entity, Error, Fact, NoSchemas, Patch, Result, TraceStore, Tuple, Value,
 };
 use grmpl_diff::Query;
-use grmpl_proc::{commit_patch, enqueue, Alloc, CommitOutcome, Process};
+use grmpl_proc::{commit_patch, enqueue_seq, seed_seq, Alloc, CommitOutcome, Process};
 
 use crate::watch::Subscription;
 use crate::world::{
-    player_behavior, world_authority, CURSOR, ENTITY_SEQ, ID_BASE, INBOX, LOCATED, NAMED, PLAYER,
-    ROOT_ROOM, TELL,
+    player_behavior, world_authority, CURSOR, ENTITY_SEQ, ID_BASE, INBOX, INBOX_SEQ, LOCATED,
+    NAMED, PLAYER, ROOT_ROOM, TELL,
 };
 
 /// A running world server. Holds the store and serializes all commits behind a
@@ -116,7 +118,12 @@ impl Server {
             .assert(Fact::new(LOCATED, Tuple::from([Value::Ent(player), Value::Ent(ROOT_ROOM)])));
         let patch = alloc.seal(patch);
         match commit_patch(&*self.store, &NoSchemas, &patch, &world_authority())? {
-            CommitOutcome::Committed(_) => Ok(player),
+            CommitOutcome::Committed(_) => {
+                // Seed the player's durable inbox-seq counter once, here on the
+                // un-raced spawn path, so every later `enqueue_seq` is race-safe.
+                seed_seq(&*self.store, INBOX_SEQ, player)?;
+                Ok(player)
+            }
             CommitOutcome::Rejected => {
                 Err(Error::Store("player spawn was rejected".into()))
             }
@@ -155,8 +162,7 @@ impl Session {
         let store_arc = Arc::clone(&server.store);
         let store: &dyn TraceStore = &*store_arc;
 
-        let seq = self.next_inbox_seq(store)?;
-        enqueue(store, INBOX, self.player, seq, tokenize(line))?;
+        enqueue_seq(store, INBOX, INBOX_SEQ, self.player, tokenize(line))?;
         self.process.run_to_idle(store, &NoSchemas)?;
 
         self.drain_output(store)
@@ -194,22 +200,6 @@ impl Session {
         let _w = server.lock.lock().unwrap();
         let store: &dyn TraceStore = &*server.store;
         Ok(sub.pump_and_drain(store, out)?.len())
-    }
-
-    /// The next free inbox position for this player: one past the highest seq
-    /// present (single-writer, so no gap or collision).
-    fn next_inbox_seq(&self, store: &dyn TraceStore) -> Result<i64> {
-        let at = store.current();
-        let mut next = 0;
-        for (t, d) in store.read_at(INBOX, at)? {
-            let s = t.as_slice();
-            if d > 0 && s.first() == Some(&Value::Ent(self.player)) {
-                if let Some(Value::Int(seq)) = s.get(1) {
-                    next = next.max(*seq + 1);
-                }
-            }
-        }
-        Ok(next)
     }
 
     /// Collect `TELL` text addressed to this player committed since the last

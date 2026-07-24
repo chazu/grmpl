@@ -17,6 +17,7 @@ use grmpl_core::{
 };
 
 use crate::commit::{check_schema, CommitOutcome};
+use crate::SeqAlloc;
 
 /// Envelope on the wire: `seq(i64, BE) || encoded_message`.
 fn encode_envelope(seq: i64, m: &Message) -> Vec<u8> {
@@ -46,7 +47,8 @@ pub struct Domain<'a> {
     pub routes: HashMap<RelId, DomainId>,
     /// `(seq, target_domain, inbox_rel, body)` — pending outbound messages.
     pub outbox: RelId,
-    /// Single-row counter `(next_seq)`.
+    /// Single-row outbox seq counter `(next_seq)`, allocated through the durable,
+    /// race-safe [`SeqAlloc`] (a single global key, so `key = []`).
     pub outseq: RelId,
     /// `(sender_domain, seq)` — inbound messages already applied (dedup).
     pub seen: RelId,
@@ -60,16 +62,35 @@ impl<'a> Domain<'a> {
         }
     }
 
-    fn read_outseq(&self) -> Result<i64> {
+    /// Do all of `preconds` still hold (positive weight) at the current edition?
+    /// Used to tell a lost outbox-seq race (retry) from a genuine caller
+    /// precondition failure (`Rejected`).
+    fn all_hold(&self, preconds: &[(RelId, Tuple)]) -> Result<bool> {
         let at = self.store.current();
-        for (t, d) in self.store.read_at(self.outseq, at)? {
-            if d > 0 {
-                if let Some(Value::Int(n)) = t.as_slice().first() {
-                    return Ok(*n);
-                }
+        for (rel, tuple) in preconds {
+            let held =
+                self.store.read_at(*rel, at)?.into_iter().any(|(t, d)| d > 0 && &t == tuple);
+            if !held {
+                return Ok(false);
             }
         }
-        Ok(0)
+        Ok(true)
+    }
+
+    /// Seed the outbox seq counter once, on an un-raced path (domain setup,
+    /// before any concurrent [`commit`](Self::commit)). The very first outbox
+    /// allocation has no counter row to precondition on; seeding here makes every
+    /// later allocation fully race-safe. Idempotent — a no-op once the counter
+    /// exists.
+    pub fn seed_outseq(&self) -> Result<()> {
+        let alloc = SeqAlloc::read(self.store, self.outseq, Vec::new())?;
+        let patch = alloc.seed(Patch::new());
+        if !patch.asserts.is_empty() {
+            let updates: Vec<(RelId, Tuple, Diff)> =
+                patch.asserts.iter().map(|f| (f.rel, f.tuple.clone(), 1)).collect();
+            self.store.commit(&updates)?;
+        }
+        Ok(())
     }
 
     fn seen_holds(&self, sender: DomainId, seq: i64) -> Result<bool> {
@@ -114,55 +135,94 @@ impl<'a> Domain<'a> {
             patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
         )?;
 
-        let preconditions: Vec<(RelId, Tuple)> =
+        let base_preconditions: Vec<(RelId, Tuple)> =
             patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();
 
-        let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
+        // Seq-independent effects: world writes, the cursor move, timers, and any
+        // *local* emits all ride every commit attempt unchanged.
+        let mut base_updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
         for f in &patch.asserts {
-            updates.push((f.rel, f.tuple.clone(), 1));
+            base_updates.push((f.rel, f.tuple.clone(), 1));
         }
         for f in &patch.retracts {
-            updates.push((f.rel, f.tuple.clone(), -1));
+            base_updates.push((f.rel, f.tuple.clone(), -1));
         }
         if let Some(cm) = &patch.cursor_advance {
             if let Some(old) = &cm.retract {
-                updates.push((cm.rel, old.clone(), -1));
+                base_updates.push((cm.rel, old.clone(), -1));
             }
-            updates.push((cm.rel, cm.assert.clone(), 1));
+            base_updates.push((cm.rel, cm.assert.clone(), 1));
         }
         for f in &sched {
-            updates.push((f.rel, f.tuple.clone(), 1));
+            base_updates.push((f.rel, f.tuple.clone(), 1));
         }
 
-        // Partition emits into local inbox writes and durable outbox rows.
-        let start_seq = self.read_outseq()?;
-        let mut next_seq = start_seq;
+        // Partition emits: local inbox writes ride the base updates; remote emits
+        // become durable outbox rows whose seqs come from the guarded `SeqAlloc`.
+        let mut remotes: Vec<(DomainId, RelId, Tuple)> = Vec::new();
         for m in &patch.emits {
             match self.is_remote(m.inbox) {
-                None => updates.push((m.inbox, m.body.clone(), 1)), // local
-                Some(target) => {
-                    let row = Tuple::from([
-                        Value::Int(next_seq),
-                        Value::Int(target.0 as i64),
-                        Value::Int(m.inbox.0 as i64),
-                        Value::Tuple(m.body.0.clone()),
-                    ]);
-                    updates.push((self.outbox, row, 1));
-                    next_seq += 1;
+                None => base_updates.push((m.inbox, m.body.clone(), 1)), // local
+                Some(target) => remotes.push((target, m.inbox, m.body.clone())),
+            }
+        }
+
+        // No remote emit: no outbox seq to allocate — commit exactly as before,
+        // in one atomic `commit_if`.
+        if remotes.is_empty() {
+            return Ok(match self.store.commit_if(&base_preconditions, &base_updates)? {
+                Some(e) => CommitOutcome::Committed(e),
+                None => CommitOutcome::Rejected,
+            });
+        }
+
+        // Remote emits: draw outbox seqs from the durable, race-safe `SeqAlloc`.
+        // A commit that loses only the seq race retries against the winner's
+        // counter (so the caller's world writes are never dropped by contention);
+        // a genuine caller precondition failure still surfaces as `Rejected`
+        // without spinning.
+        for _ in 0..64 {
+            let mut alloc = SeqAlloc::read(self.store, self.outseq, Vec::new())?;
+            let mut preconditions = base_preconditions.clone();
+            let mut updates = base_updates.clone();
+            for (target, inbox, body) in &remotes {
+                let seq = alloc.fresh();
+                let row = Tuple::from([
+                    Value::Int(seq),
+                    Value::Int(target.0 as i64),
+                    Value::Int(inbox.0 as i64),
+                    Value::Tuple(body.0.clone()),
+                ]);
+                updates.push((self.outbox, row, 1));
+            }
+            // Fold the guarded counter advance (precondition + retract + assert)
+            // in, so the outbox rows and their counter bump commit atomically.
+            let seq_patch = alloc.seal(Patch::new());
+            for f in &seq_patch.preconditions {
+                preconditions.push((f.rel, f.tuple.clone()));
+            }
+            for f in &seq_patch.retracts {
+                updates.push((f.rel, f.tuple.clone(), -1));
+            }
+            for f in &seq_patch.asserts {
+                updates.push((f.rel, f.tuple.clone(), 1));
+            }
+
+            match self.store.commit_if(&preconditions, &updates)? {
+                Some(e) => return Ok(CommitOutcome::Committed(e)),
+                None => {
+                    // A lost seq race leaves the caller's preconditions intact;
+                    // retry. A caller `expect` that no longer holds is a real
+                    // rejection — return it (matching the pre-swap contract).
+                    if self.all_hold(&base_preconditions)? {
+                        continue;
+                    }
+                    return Ok(CommitOutcome::Rejected);
                 }
             }
         }
-        if next_seq != start_seq {
-            if start_seq > 0 {
-                updates.push((self.outseq, Tuple::from([Value::Int(start_seq)]), -1));
-            }
-            updates.push((self.outseq, Tuple::from([Value::Int(next_seq)]), 1));
-        }
-
-        match self.store.commit_if(&preconditions, &updates)? {
-            Some(e) => Ok(CommitOutcome::Committed(e)),
-            None => Ok(CommitOutcome::Rejected),
-        }
+        // Contention did not settle within the cap; the caller retries.
+        Ok(CommitOutcome::Rejected)
     }
 
     /// Ship every pending outbox message over the transport, retracting each on
