@@ -1,0 +1,11 @@
+[package]
+name = "grmpl-type"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "P8a value/row typing: synthesizes a row type for a core Query IR plan against the P1 relation schemas, checking column, comparison, join-key, union, and aggregate consistency. Above the bright line — names no storage or network."
+
+[dependencies]
+grmpl-core = { workspace = true }
+grmpl-diff = { path = "../grmpl-diff" }
+grmpl-lang = { path = "../grmpl-lang" }
