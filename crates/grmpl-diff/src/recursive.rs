@@ -20,7 +20,7 @@
 //!     2. **Regrowth** (the same semi-naïve pass) re-derives, from the surviving
 //!        set, everything still reachable under the new base — repairing the
 //!        over-approximation and folding in any co-committed insertions.
-//!   No recompute-from-∅.
+//!        No recompute-from-∅.
 //!
 //! Diffing old-vs-new base is why DRed here needs no per-tuple derivation
 //! provenance: a one-step re-evaluation of `step` at each edition tells us

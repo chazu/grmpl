@@ -58,7 +58,7 @@ impl Authority {
     /// Does this authority permit writing `fact`?
     pub fn permits(&self, fact: &Fact) -> bool {
         self.owns.iter().any(|s| {
-            s.rel == fact.rel && s.range.as_ref().map_or(true, |r| r.contains(&fact.tuple))
+            s.rel == fact.rel && s.range.as_ref().is_none_or(|r| r.contains(&fact.tuple))
         })
     }
 }
