@@ -3,7 +3,7 @@ name = "grmpl-type"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "P8a value/row typing: synthesizes a row type for a core Query IR plan against the P1 relation schemas, checking column, comparison, join-key, union, and aggregate consistency. Above the bright line — names no storage or network."
+description = "P8 typing over the core IR: P8a synthesizes a row type for a Query IR plan against the P1 relation schemas (column/comparison/join-key/union/aggregate consistency); P8b infers an on-handler's effect row (the relations it writes) and checks it against a process Authority at relation granularity, statically. Above the bright line — names no storage or network."
 
 [dependencies]
 grmpl-core = { workspace = true }
@@ -14,4 +14,7 @@ grmpl-lang = { path = "../grmpl-lang" }
 # A concrete store to *run* lowered plans in the soundness oracle (below the
 # bright line, so test-only — mirrors grmpl-diff / grmpl-lang's own dev-deps).
 grmpl-store = { path = "../grmpl-store" }
+# The commit boundary, to prove the P8b relation-level Authority check predicts
+# the runtime `commit_patch` Authority law (test-only).
+grmpl-proc = { path = "../grmpl-proc" }
 tempfile = "3"

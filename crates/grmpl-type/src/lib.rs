@@ -39,6 +39,14 @@
 //! commit-boundary rule (schemas are opt-in) but inverts the default: to *type*
 //! a plan, its relations must be declared.
 //!
+//! ## Effect rows & the Authority check (P8b)
+//!
+//! P8a types the *read* side; the [`effect`] module types the *write* side. It
+//! infers a handler's **effect row** — the relations it may `assert`/`retract`
+//! into — and checks that write set against a process's `Authority` at relation
+//! granularity, statically. See [`check_handler_authority`]. Key-ranges stay
+//! checked at the commit boundary.
+//!
 //! ## Bright line
 //!
 //! This crate is **above the line** (`DESIGN.md` §1): it depends only on the
@@ -51,6 +59,12 @@ use std::fmt;
 use grmpl_core::{Edition, RelId, Schema, SchemaCatalog, Ty, Value};
 use grmpl_diff::Agg;
 use grmpl_lang::{Comp, PredExpr, QueryIr, RowExpr};
+
+pub mod effect;
+
+pub use effect::{
+    check_authority, check_handler_authority, infer_handler_effects, EffectError, EffectRow,
+};
 
 /// A **row type**: the ordered value types of a relation's columns. It is the
 /// `Ty` projection of a [`Schema`] — the same layout, without the column names.

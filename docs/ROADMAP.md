@@ -396,7 +396,11 @@ Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
 * **P7 — Core IR** (CBPV split reified).
-* **P8 — Typing:** value/row types, effect rows, CALM.
+* **P8 — Typing:** value/row types (P8a, landed — `grmpl-type::check_query`),
+  effect rows + relation-level Authority check (P8b, landed —
+  `grmpl-type::effect`: infer an `on`-handler's write set and check it against a
+  process `Authority` at relation granularity; key-ranges stay checked at
+  commit), CALM (P8c).
 * **P9 — Pattern algebra:** inputs, printing, streams.
 * **P10 — Replay & forks.**
 * **P11 — Concatenative surface.**
