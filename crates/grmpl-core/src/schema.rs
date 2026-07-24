@@ -29,6 +29,10 @@ pub enum Ty {
     Tuple,
     /// An opaque byte string ([`Value::Bytes`]).
     Bytes,
+    /// Serialized behavior IR ([`Value::Code`]) — a stored, live-redefinable
+    /// behavior (P12). Distinct from [`Ty::Bytes`] so a relation column can
+    /// declare it *holds code*, which is what the commit boundary re-checks.
+    Code,
     /// Any value — an untyped column. Admits everything.
     Any,
 }
@@ -44,6 +48,7 @@ impl Ty {
             Ty::Bool => matches!(v, Value::Bool(_)),
             Ty::Tuple => matches!(v, Value::Tuple(_)),
             Ty::Bytes => matches!(v, Value::Bytes(_)),
+            Ty::Code => matches!(v, Value::Code(_)),
         }
     }
 
@@ -56,6 +61,7 @@ impl Ty {
             Ty::Bool => "Bool",
             Ty::Tuple => "Tuple",
             Ty::Bytes => "Bytes",
+            Ty::Code => "Code",
             Ty::Any => "Any",
         }
     }
@@ -70,6 +76,7 @@ impl Ty {
             "Bool" => Ty::Bool,
             "Tuple" => Ty::Tuple,
             "Bytes" => Ty::Bytes,
+            "Code" => Ty::Code,
             "Any" => Ty::Any,
             _ => return None,
         })

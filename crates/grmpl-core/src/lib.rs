@@ -8,6 +8,7 @@
 //! reverse.
 
 pub mod authority;
+pub mod behavior;
 pub mod error;
 pub mod fact;
 pub mod patch;
@@ -19,6 +20,7 @@ pub mod value;
 pub mod wire;
 
 pub use authority::{Authority, KeyRange, Scope};
+pub use behavior::{BehaviorChecker, NoBehaviorCheck};
 pub use error::{Error, Result};
 pub use fact::Fact;
 pub use patch::{CursorMove, Message, Patch, Scheduled};

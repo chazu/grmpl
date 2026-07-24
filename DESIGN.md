@@ -74,6 +74,12 @@ pub enum Value {
     Text(Arc<str>),
     Bool(bool),
     Tuple(Arc<[Value]>),
+    Bytes(Arc<[u8]>),
+    /// Serialized P7 IR — a stored, live-redefinable behavior (P12). Opaque to
+    /// the core (it names no IR); only `grmpl-lang` (de)codes it. Storing a
+    /// behavior is asserting one of these; committing it re-runs the P8b
+    /// effect/authority check at the commit boundary (`BehaviorChecker`).
+    Code(Arc<[u8]>),
 }
 
 /// A row in a relation. Structural: identity is by content, never hidden.
