@@ -231,13 +231,14 @@ impl FjallStore {
     /// batch (data + edition bump together).
     fn write_batch(&self, next: u64, updates: &[(RelId, Tuple, Diff)]) -> Result<()> {
         let mut batch = self.db.batch();
-        let mut counter: u64 = 0;
-        for (rel, tuple, diff) in updates {
+        // `counter` is load-bearing: (edition, counter) is the commit-order key
+        // that makes `scan_updates` deterministic, so it must track the exact
+        // submit order of `updates`. `enumerate` yields that same 0,1,2… order.
+        for (counter, (rel, tuple, diff)) in updates.iter().enumerate() {
             let ks = self.keyspace_for(*rel)?;
-            let key = encode_key(next, counter);
+            let key = encode_key(next, counter as u64);
             let val = codec::encode_record(*diff, tuple);
             batch.insert(&ks, key, val);
-            counter += 1;
         }
         // Bump the edition in the same atomic batch.
         batch.insert(&self.meta, EDITION_KEY, next.to_be_bytes().to_vec());
