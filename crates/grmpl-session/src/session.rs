@@ -14,13 +14,16 @@
 //! **single-writer inbox seq scheme**: inbox positions and the entity counter
 //! advance without cross-writer races. P4 replaces it with a durable allocator.
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
     Edition, Entity, Error, Fact, NoSchemas, Patch, Result, TraceStore, Tuple, Value,
 };
+use grmpl_diff::Query;
 use grmpl_proc::{commit_patch, enqueue, Alloc, CommitOutcome, Process};
 
+use crate::watch::Subscription;
 use crate::world::{
     player_behavior, world_authority, CURSOR, ENTITY_SEQ, ID_BASE, INBOX, LOCATED, NAMED, PLAYER,
     ROOT_ROOM, TELL,
@@ -84,6 +87,7 @@ impl Server {
                 behavior: player_behavior(player),
             },
             out_cursor: self.store.current(),
+            subscription: None,
         })
     }
 
@@ -128,6 +132,10 @@ pub struct Session {
     process: Process,
     /// The edition through which this session has already delivered `TELL` text.
     out_cursor: Edition,
+    /// The player's live view subscription, if it has issued `watch`. Its drain
+    /// cursor is durable (in the store), so this is only the in-memory handle —
+    /// a reconnect re-subscribes and resumes from the persisted cursor.
+    subscription: Option<Subscription>,
 }
 
 impl Session {
@@ -152,6 +160,40 @@ impl Session {
         self.process.run_to_idle(store, &NoSchemas)?;
 
         self.drain_output(store)
+    }
+
+    /// Subscribe this player to the default reactive view — the set of named
+    /// things in the world — so subsequent world changes (any player's `create`
+    /// / `dig`) stream to this socket as activations. Idempotent: installs the
+    /// on-watch once (skip-initial), and a reconnect resumes the durable stream
+    /// without re-installing. The `watch` key is the player entity (one
+    /// subscription per player).
+    pub fn subscribe(&mut self) -> Result<()> {
+        let server = Arc::clone(&self.server);
+        let _w = server.lock.lock().unwrap();
+        let store: &dyn TraceStore = &*server.store;
+
+        let sub = Subscription::new(Query::rel(NAMED), self.player, self.player);
+        if !sub.is_installed(store)? {
+            sub.install(store)?;
+        }
+        self.subscription = Some(sub);
+        Ok(())
+    }
+
+    /// Pump the player's subscription and stream any newly-materialized
+    /// activations to `out`, exactly as `TELL` text is streamed — reactive push.
+    /// A no-op (returns `0`) if the player has not subscribed. Serialized behind
+    /// the server's single writer.
+    pub fn push_activations(&mut self, out: &mut dyn Write) -> Result<usize> {
+        let sub = match &self.subscription {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        let server = Arc::clone(&self.server);
+        let _w = server.lock.lock().unwrap();
+        let store: &dyn TraceStore = &*server.store;
+        Ok(sub.pump_and_drain(store, out)?.len())
     }
 
     /// The next free inbox position for this player: one past the highest seq

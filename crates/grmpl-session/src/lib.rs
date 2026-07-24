@@ -26,7 +26,9 @@
 
 pub mod net;
 pub mod session;
+pub mod watch;
 pub mod world;
 
 pub use net::serve;
 pub use session::{Server, Session};
+pub use watch::{Delivered, Subscription};

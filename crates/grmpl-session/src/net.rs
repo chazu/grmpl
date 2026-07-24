@@ -65,6 +65,16 @@ fn handle(server: Arc<Server>, stream: TcpStream) -> std::io::Result<()> {
         if cmd == "quit" {
             break;
         }
+        // `watch` turns on reactive push for this connection: subsequent world
+        // changes stream back as activation lines after each command's output.
+        if cmd == "watch" {
+            match session.subscribe() {
+                Ok(()) => writeln!(writer, "Watching.")?,
+                Err(e) => writeln!(writer, "error: {e}")?,
+            }
+            writer.flush()?;
+            continue;
+        }
         match session.submit(cmd) {
             Ok(msgs) => {
                 for m in msgs {
@@ -72,6 +82,12 @@ fn handle(server: Arc<Server>, stream: TcpStream) -> std::io::Result<()> {
                 }
             }
             Err(e) => writeln!(writer, "error: {e}")?,
+        }
+        // Reactive push: drain any activations this player's subscription has
+        // materialized (its own command may have changed a watched view, or a
+        // peer's did) and stream them, like `TELL` output, to the socket.
+        if let Err(e) = session.push_activations(&mut writer) {
+            writeln!(writer, "error: {e}")?;
         }
         writer.flush()?;
     }
