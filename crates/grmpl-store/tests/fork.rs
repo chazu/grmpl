@@ -4,7 +4,7 @@
 //! Fork identity / clock semantics are deferred to P15; v1 is the flat copy.
 
 use grmpl_core::{
-    Catalog, Column, Edition, EditionStore, Entity, RelId, Schema, SchemaCatalog, TraceStore,
+    Catalog, Column, Diff, Edition, EditionStore, Entity, RelId, Schema, SchemaCatalog, TraceStore,
     Tuple, Ty, Value,
 };
 use grmpl_store::FjallStore;
@@ -103,4 +103,123 @@ fn fork_does_not_disturb_the_source() {
         before,
         "forking then writing the fork leaves the source untouched"
     );
+}
+
+// --- Randomized-churn law oracle (fork bit-identity under arbitrary history) --
+//
+// The example tests above pin *one* fixed trace. The steward bar for a
+// determinism/replay law (CLAUDE.md §Determinism) is that it holds under
+// *arbitrary* committed history, so this oracle churns a random history, forks
+// at a random cut, and re-asserts the fork law every seed:
+//
+//   * bit-identity — the fork's `canonical_dump` equals the source's at the cut
+//     (clock and watermark too), whether or not the source was consolidated;
+//   * isolation    — committing to the fork never disturbs the source's copy;
+//   * reconvergence — replaying the *same* remaining commits onto both stores
+//     re-converges them bit-for-bit after every step.
+//
+// A seedable xorshift64* PRNG (mirroring grmpl-store/tests/determinism.rs) keeps
+// each round reproducible and every assertion prints its `seed`.
+
+/// Deterministic, seedable PRNG (xorshift64*) — reproducible churn with no
+/// external `rand` dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+/// A random batch of asserts/retracts over `R` — small key/diff spaces so
+/// retractions cancel real state.
+fn random_batch(rng: &mut Rng) -> Vec<(RelId, Tuple, Diff)> {
+    let len = 1 + rng.below(5); // 1..=5 updates
+    (0..len)
+        .map(|_| {
+            let t = ent(rng.below(8));
+            let d: Diff = if rng.below(2) == 0 { 1 } else { -1 };
+            (R, t, d)
+        })
+        .collect()
+}
+
+#[test]
+fn fork_bit_identity_and_reconvergence_under_random_churn() {
+    for seed in 1..=24u64 {
+        fork_churn_round(seed);
+    }
+}
+
+fn fork_churn_round(seed: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let mut rng = Rng::new(seed);
+
+    store.register("things", R).unwrap();
+    store.put_schema(R, &thing_schema(), Edition(1)).unwrap();
+
+    // A random committed history before the fork cut.
+    let pre = 1 + rng.below(12); // 1..=12 commits
+    for _ in 0..pre {
+        let batch = random_batch(&mut rng);
+        store.commit(&batch).unwrap();
+    }
+    // Sometimes consolidate first, so the fork copies a checkpoint (O(state))
+    // rather than raw history — the copy must be bit-identical either way.
+    if rng.below(2) == 0 {
+        store.consolidate(store.current()).unwrap();
+    }
+
+    let fork_dir = tempfile::tempdir().unwrap();
+    let fork = store.fork(fork_dir.path()).unwrap();
+
+    // Bit-identical at the cut, down to clock and watermark.
+    assert_eq!(
+        store.canonical_dump().unwrap(),
+        fork.canonical_dump().unwrap(),
+        "seed {seed}: fork is not bit-identical to its source at the cut"
+    );
+    assert_eq!(fork.current(), store.current(), "seed {seed}: fork clock differs");
+    assert_eq!(
+        TraceStore::watermark(&fork),
+        TraceStore::watermark(&store),
+        "seed {seed}: fork watermark differs"
+    );
+
+    // Drive both with the *same* remaining commits. Each round: write the fork
+    // first and prove the source is untouched (isolation), then apply the
+    // identical commit to the source and prove they reconverge bit-for-bit.
+    let post = 1 + rng.below(12);
+    for _ in 0..post {
+        let batch = random_batch(&mut rng);
+        let source_before = store.canonical_dump().unwrap();
+
+        fork.commit(&batch).unwrap();
+        assert_eq!(
+            store.canonical_dump().unwrap(),
+            source_before,
+            "seed {seed}: writing the fork disturbed the source"
+        );
+
+        store.commit(&batch).unwrap();
+        assert_eq!(
+            store.canonical_dump().unwrap(),
+            fork.canonical_dump().unwrap(),
+            "seed {seed}: identical commits failed to reconverge source and fork"
+        );
+    }
 }
