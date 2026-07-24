@@ -109,7 +109,7 @@ impl Program {
                             Some(t) => Ty::parse(t).ok_or_else(|| {
                                 format!(
                                     "relation `{name}` column `{}` has unknown type `{t}` \
-                                     (expected Ent, Int, Text, Bool, Tuple, or Any)",
+                                     (expected Ent, Int, Text, Bool, Tuple, Bytes, or Any)",
                                     c.name
                                 )
                             })?,

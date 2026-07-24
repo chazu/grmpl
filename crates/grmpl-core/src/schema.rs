@@ -27,6 +27,8 @@ pub enum Ty {
     Bool,
     /// A nested tuple ([`Value::Tuple`]).
     Tuple,
+    /// An opaque byte string ([`Value::Bytes`]).
+    Bytes,
     /// Any value — an untyped column. Admits everything.
     Any,
 }
@@ -41,6 +43,7 @@ impl Ty {
             Ty::Text => matches!(v, Value::Text(_)),
             Ty::Bool => matches!(v, Value::Bool(_)),
             Ty::Tuple => matches!(v, Value::Tuple(_)),
+            Ty::Bytes => matches!(v, Value::Bytes(_)),
         }
     }
 
@@ -52,6 +55,7 @@ impl Ty {
             Ty::Text => "Text",
             Ty::Bool => "Bool",
             Ty::Tuple => "Tuple",
+            Ty::Bytes => "Bytes",
             Ty::Any => "Any",
         }
     }
@@ -65,6 +69,7 @@ impl Ty {
             "Text" => Ty::Text,
             "Bool" => Ty::Bool,
             "Tuple" => Ty::Tuple,
+            "Bytes" => Ty::Bytes,
             "Any" => Ty::Any,
             _ => return None,
         })
