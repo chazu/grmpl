@@ -1,5 +1,13 @@
 //! Lowering the AST to core constructors.
 //!
+//! Every executable fragment is lowered in two steps: the AST is first compiled
+//! into the inspectable [core IR](crate::ir) (a [`QueryIr`] for a `view`, a
+//! [`FormIr`] for a `form`), and only then is that IR `lower`ed to a runnable
+//! `Query` / `Form`, which is the single point where `Fn` closures are
+//! generated. The public [`Program::view`] / [`Program::form`] chain the two;
+//! [`Program::view_ir`] / [`Program::form_ir`] hand back the IR itself for the
+//! phases that consume it (typing, constructor inversion, storage).
+//!
 //! * `rel`  → a relation schema (name → `RelId` + **named, typed columns**).
 //!   The optional `col: Ty` annotation lowers to a `grmpl_core::Ty`; an
 //!   unannotated column defaults to the permissive `Ty::Any`. A compiled
@@ -18,14 +26,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grmpl_core::{
-    Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, Result as CoreResult, RelId,
+    Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, RelId, Result as CoreResult,
     Schema, SchemaCatalog, Tuple, Ty, Value,
 };
 use grmpl_diff::{Agg, Query, Snapshot};
-use grmpl_pattern::{Bindings, Form, Pattern, Rule, VarId};
+use grmpl_pattern::{Form, Pattern, VarId};
 use grmpl_proc::Behavior;
 
 use crate::ast::{Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
+use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
 use crate::parser::parse;
 
 /// An aggregate named by *column* — the P1 named-column surface for
@@ -107,11 +116,29 @@ impl Program {
                         };
                         columns.push(Column::new(c.name.clone(), ty));
                     }
-                    rels.insert(name, RelInfo { id: RelId(next_id), columns });
+                    rels.insert(
+                        name,
+                        RelInfo {
+                            id: RelId(next_id),
+                            columns,
+                        },
+                    );
                     next_id += 1;
                 }
-                Decl::View { name, params, atoms, yields } => {
-                    views.insert(name, ViewDef { params, atoms, yields });
+                Decl::View {
+                    name,
+                    params,
+                    atoms,
+                    yields,
+                } => {
+                    views.insert(
+                        name,
+                        ViewDef {
+                            params,
+                            atoms,
+                            yields,
+                        },
+                    );
                 }
                 Decl::Form { name, rules } => {
                     forms.insert(name, rules);
@@ -121,7 +148,12 @@ impl Program {
                 }
             }
         }
-        Ok(Program { rels, views, forms, ons })
+        Ok(Program {
+            rels,
+            views,
+            forms,
+            ons,
+        })
     }
 
     /// The yielded column names of a view (in order).
@@ -148,7 +180,9 @@ impl Program {
     /// `rel`, or `None` if either is undeclared. This is the primitive that
     /// turns a column *name* into an index for `view`/`on`.
     pub fn resolve_column(&self, rel: &str, col: &str) -> Option<usize> {
-        self.rels.get(rel).and_then(|r| r.columns.iter().position(|c| c.name == col))
+        self.rels
+            .get(rel)
+            .and_then(|r| r.columns.iter().position(|c| c.name == col))
     }
 
     /// Register every declared relation into the durable registry: bind its
@@ -174,9 +208,25 @@ impl Program {
         Ok(())
     }
 
-    /// Instantiate a view as a `Query`, binding its parameters to `args`.
+    /// Instantiate a view as a runnable `Query`, binding its parameters to
+    /// `args`. This is [`view_ir`](Self::view_ir) followed by the final
+    /// [`QueryIr::lower`].
     pub fn view(&self, name: &str, args: &[Value]) -> Result<Query, String> {
-        let v = self.views.get(name).ok_or_else(|| format!("no view `{name}`"))?;
+        Ok(self.view_ir(name, args)?.lower())
+    }
+
+    /// Instantiate a view as the inspectable [`QueryIr`], binding its parameters
+    /// to `args`. The conjunctive body is planned left-to-right: each atom
+    /// becomes a `Rel` optionally wrapped in a `Filter` (literals, view
+    /// parameters, and repeated variables within the atom become equality
+    /// predicates), joined to the accumulated plan on their shared variables,
+    /// and the whole is projected onto the `yield` variables and de-duplicated.
+    /// No closures are generated here — that is deferred to `lower`.
+    pub fn view_ir(&self, name: &str, args: &[Value]) -> Result<QueryIr, String> {
+        let v = self
+            .views
+            .get(name)
+            .ok_or_else(|| format!("no view `{name}`"))?;
         if args.len() != v.params.len() {
             return Err(format!(
                 "view `{name}` takes {} argument(s), got {}",
@@ -184,11 +234,15 @@ impl Program {
                 args.len()
             ));
         }
-        let params: HashMap<&str, Value> =
-            v.params.iter().map(|s| s.as_str()).zip(args.iter().cloned()).collect();
+        let params: HashMap<&str, Value> = v
+            .params
+            .iter()
+            .map(|s| s.as_str())
+            .zip(args.iter().cloned())
+            .collect();
 
         let mut varcol: HashMap<String, usize> = HashMap::new();
-        let mut acc: Option<Query> = None;
+        let mut acc: Option<QueryIr> = None;
         let mut width = 0usize;
 
         for atom in &v.atoms {
@@ -205,32 +259,37 @@ impl Program {
                 ));
             }
 
-            let mut q = Query::rel(info.id);
             let mut local_first: Vec<(String, usize)> = Vec::new();
-            let mut lit_filters: Vec<(usize, Value)> = Vec::new();
-            let mut eqs: Vec<(usize, usize)> = Vec::new();
+            let mut preds: Vec<PredExpr> = Vec::new();
 
             for (i, arg) in atom.args.iter().enumerate() {
                 match arg {
-                    Arg::Str(s) => lit_filters.push((i, Value::text(s))),
-                    Arg::Int(n) => lit_filters.push((i, Value::Int(*n))),
+                    Arg::Str(s) => {
+                        preds.push(PredExpr::Eq(RowExpr::Col(i), RowExpr::Lit(Value::text(s))));
+                    }
+                    Arg::Int(n) => {
+                        preds.push(PredExpr::Eq(RowExpr::Col(i), RowExpr::Lit(Value::Int(*n))));
+                    }
                     Arg::Var(vn) => {
                         if let Some(val) = params.get(vn.as_str()) {
-                            lit_filters.push((i, val.clone()));
+                            preds.push(PredExpr::Eq(RowExpr::Col(i), RowExpr::Lit(val.clone())));
                         }
                         match local_first.iter().find(|(n, _)| n == vn) {
-                            Some((_, first)) => eqs.push((*first, i)),
+                            Some((_, first)) => {
+                                preds.push(PredExpr::Eq(RowExpr::Col(*first), RowExpr::Col(i)));
+                            }
                             None => local_first.push((vn.clone(), i)),
                         }
                     }
                 }
             }
 
-            for (col, val) in lit_filters {
-                q = q.filter(move |t| t.as_slice()[col] == val);
-            }
-            for (a, b) in eqs {
-                q = q.filter(move |t| t.as_slice()[a] == t.as_slice()[b]);
+            let mut q = QueryIr::Rel(info.id);
+            if !preds.is_empty() {
+                q = QueryIr::Filter {
+                    input: Box::new(q),
+                    pred: PredExpr::And(preds),
+                };
             }
 
             match acc.take() {
@@ -250,7 +309,12 @@ impl Program {
                             rk.push(*apos);
                         }
                     }
-                    acc = Some(prev.join(q, lk, rk));
+                    acc = Some(QueryIr::Join {
+                        left: Box::new(prev),
+                        right: Box::new(q),
+                        left_key: lk,
+                        right_key: rk,
+                    });
                     for (vn, apos) in &local_first {
                         varcol.entry(vn.clone()).or_insert(width + *apos);
                     }
@@ -267,7 +331,10 @@ impl Program {
                 .ok_or_else(|| format!("view `{name}` yields unbound variable `{y}`"))?;
             cols.push(c);
         }
-        Ok(base.project(cols).distinct())
+        Ok(QueryIr::Distinct(Box::new(QueryIr::Project {
+            input: Box::new(base),
+            cols,
+        })))
     }
 
     /// Aggregate over a view's yielded columns *by name*: instantiate `view`
@@ -283,9 +350,23 @@ impl Program {
         group: &[&str],
         agg: NamedAgg,
     ) -> Result<Query, String> {
-        let base = self.view(view, args)?;
-        let yields =
-            self.view_yields(view).ok_or_else(|| format!("no view `{view}`"))?.to_vec();
+        Ok(self.reduce_view_ir(view, args, group, agg)?.lower())
+    }
+
+    /// [`reduce_view`](Self::reduce_view) as inspectable IR: the view's
+    /// [`QueryIr`] wrapped in a [`QueryIr::Reduce`].
+    pub fn reduce_view_ir(
+        &self,
+        view: &str,
+        args: &[Value],
+        group: &[&str],
+        agg: NamedAgg,
+    ) -> Result<QueryIr, String> {
+        let base = self.view_ir(view, args)?;
+        let yields = self
+            .view_yields(view)
+            .ok_or_else(|| format!("no view `{view}`"))?
+            .to_vec();
         let idx = |col: &str| -> Result<usize, String> {
             yields
                 .iter()
@@ -302,12 +383,28 @@ impl Program {
             NamedAgg::Min(c) => Agg::Min(idx(&c)?),
             NamedAgg::Max(c) => Agg::Max(idx(&c)?),
         };
-        Ok(base.reduce(key, agg))
+        Ok(QueryIr::Reduce {
+            input: Box::new(base),
+            key,
+            agg,
+        })
     }
 
-    /// Build a parser from a declared `form`.
+    /// Build a runnable parser from a declared `form`. This is
+    /// [`form_ir`](Self::form_ir) followed by the final [`FormIr::lower`].
     pub fn form(&self, name: &str) -> Result<Form, String> {
-        let rules_ast = self.forms.get(name).ok_or_else(|| format!("no form `{name}`"))?;
+        Ok(self.form_ir(name)?.lower())
+    }
+
+    /// Compile a declared `form` into the inspectable [`FormIr`]. Each rule's
+    /// pattern is lowered to a `grmpl_pattern::Pattern` (already structural
+    /// data) and its `-> Tag(args)` arrow to an inspectable [`CtorSpec`] — the
+    /// constructor closure is generated only by `lower`.
+    pub fn form_ir(&self, name: &str) -> Result<FormIr, String> {
+        let rules_ast = self
+            .forms
+            .get(name)
+            .ok_or_else(|| format!("no form `{name}`"))?;
         let mut rules = Vec::new();
         for r in rules_ast {
             // Assign a VarId to each distinct bind name in this rule.
@@ -323,23 +420,46 @@ impl Program {
                     }
                 }
             }
-            let tag = r.tag.clone();
-            let arg_ids: Vec<u32> = r
+            let args: Vec<VarId> = r
                 .ctor_args
                 .iter()
-                .map(|a| ids.get(a).copied().ok_or_else(|| format!("ctor arg `{a}` is not bound in the pattern")))
+                .map(|a| {
+                    ids.get(a)
+                        .copied()
+                        .map(VarId)
+                        .ok_or_else(|| format!("ctor arg `{a}` is not bound in the pattern"))
+                })
                 .collect::<Result<_, _>>()?;
-
-            let ctor = move |b: &Bindings| {
-                let mut vals = vec![Value::text(&tag)];
-                for id in &arg_ids {
-                    vals.push(b.get(&VarId(*id)).cloned().unwrap_or(Value::text("")));
-                }
-                Value::Tuple(Arc::from(vals))
+            let ctor = CtorSpec {
+                tag: r.tag.clone(),
+                args,
             };
-            rules.push(Rule::new(Pattern::Seq(pats), ctor));
+            rules.push(RuleIr {
+                pattern: Pattern::Seq(pats),
+                ctor,
+            });
         }
-        Ok(Form::new(rules))
+        Ok(FormIr { rules })
+    }
+
+    /// Name the computation of *materializing* a view at an edition: the view's
+    /// [`QueryIr`] wrapped as [`Comp::Find`]. The plan is data until run.
+    pub fn find_view(&self, name: &str, args: &[Value]) -> Result<Comp, String> {
+        Ok(Comp::Find(self.view_ir(name, args)?))
+    }
+
+    /// Name the computation of *maintaining* a view as a delta stream — the
+    /// plan a P5 `on watch` reactive handler installs. The view's [`QueryIr`]
+    /// wrapped as [`Comp::Watch`]; `plan().lower()` yields the `Query` for
+    /// `grmpl_proc::OnWatch`.
+    pub fn watch_view(&self, name: &str, args: &[Value]) -> Result<Comp, String> {
+        Ok(Comp::Watch(self.view_ir(name, args)?))
+    }
+
+    /// Name the computation of *parsing* with a declared `form`: its [`FormIr`]
+    /// wrapped as [`Comp::Parse`].
+    pub fn parse_form(&self, name: &str) -> Result<Comp, String> {
+        Ok(Comp::Parse(self.form_ir(name)?))
     }
 
     /// Compile an `on` handler into a runnable [`Behavior`], bound to the process
@@ -348,14 +468,23 @@ impl Program {
     /// (resolving nouns via views, looking up base facts, building the patch),
     /// and returns the resulting `Patch`. A failed `resolve`/`find` yields an
     /// empty patch (no effect).
-    pub fn behavior(prog: &Arc<Program>, inbox: &str, self_entity: Entity) -> Result<Behavior, String> {
-        let on = prog.ons.get(inbox).ok_or_else(|| format!("no on-handler for `{inbox}`"))?;
+    pub fn behavior(
+        prog: &Arc<Program>,
+        inbox: &str,
+        self_entity: Entity,
+    ) -> Result<Behavior, String> {
+        let on = prog
+            .ons
+            .get(inbox)
+            .ok_or_else(|| format!("no on-handler for `{inbox}`"))?;
         let form = prog.form(&on.form)?;
         let arms = on.arms.clone();
         let prog = Arc::clone(prog);
-        Ok(Box::new(move |snap: &Snapshot, body: &Tuple| -> CoreResult<Patch> {
-            run_behavior(&prog, &form, &arms, self_entity, snap, body)
-        }))
+        Ok(Box::new(
+            move |snap: &Snapshot, body: &Tuple| -> CoreResult<Patch> {
+                run_behavior(&prog, &form, &arms, self_entity, snap, body)
+            },
+        ))
     }
 }
 
@@ -409,7 +538,13 @@ fn exec_stmts(
     let mut patch = Patch::new();
     for stmt in stmts {
         match stmt {
-            Stmt::Resolve { view, args, col, op, rhs } => {
+            Stmt::Resolve {
+                view,
+                args,
+                col,
+                op,
+                rhs,
+            } => {
                 let argvals = sargs(args, env)?;
                 let q = prog.view(view, &argvals).map_err(rt_err)?;
                 let yields = prog
@@ -438,7 +573,9 @@ fn exec_stmts(
                 }
             }
             Stmt::Find { rel, args } => {
-                let rid = prog.rel_id(rel).ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+                let rid = prog
+                    .rel_id(rel)
+                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
                 let rows = snap.read(rid)?;
                 let bound: Vec<(usize, Value)> = args
                     .iter()
@@ -469,8 +606,13 @@ fn exec_stmts(
             Stmt::Assert { rel, args } => patch = patch.assert(fact(prog, rel, args, env)?),
             Stmt::Retract { rel, args } => patch = patch.retract(fact(prog, rel, args, env)?),
             Stmt::Emit { rel, args } => {
-                let rid = prog.rel_id(rel).ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-                patch = patch.emit(Message { inbox: rid, body: tuple(args, env)? });
+                let rid = prog
+                    .rel_id(rel)
+                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+                patch = patch.emit(Message {
+                    inbox: rid,
+                    body: tuple(args, env)?,
+                });
             }
         }
     }
@@ -519,6 +661,8 @@ fn fact(
     args: &[SArg],
     env: &HashMap<String, Value>,
 ) -> CoreResult<Fact> {
-    let rid = prog.rel_id(rel).ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+    let rid = prog
+        .rel_id(rel)
+        .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
     Ok(Fact::new(rid, tuple(args, env)?))
 }
