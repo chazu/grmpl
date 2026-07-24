@@ -22,7 +22,7 @@
 //! | `Negate`      | input unchanged                                     |
 //! | `Distinct`    | input unchanged                                     |
 //! | `Reduce`      | key columns `++` `[aggregate type]`                 |
-//! | `Iterate`     | LUB of `init` and `step` (with `Recur` bound)       |
+//! | `Iterate`     | fixpoint LUB of `init` and `step` (`Recur` bound)   |
 //!
 //! Along the way it rejects the type errors this layer exists to catch: a column
 //! index out of range, an equality or join-key comparison between incompatible
@@ -389,19 +389,39 @@ fn synth(
         }
         QueryIr::Recur => recur.cloned().ok_or(TypeError::RecurOutsideIterate),
         QueryIr::Iterate { init, step } => {
-            // The fixpoint is `distinct(init ∪ step(Recur))`. Seed `Recur` with
-            // the init row type, type the step under it, then take the union type.
-            // v1 iterate is single-level and monotone, so one pass is sound: the
-            // step produces same-arity rows and the LUB is the fixpoint type.
+            // The runtime fixpoint is `distinct(init ∪ step(Recur))`, so the row
+            // type is the least `t` with `t = union_ty(t_init, synth(step, t))`.
+            // We reach it by Kleene iteration, seeding `Recur` with the init row
+            // type and re-typing the step under the *widened* type each round
+            // until it stops moving.
+            //
+            // A single pass is **unsound**: a column can widen to `Any` only on a
+            // later round, once a widening it depends on has itself happened
+            // (e.g. a `step` that swaps two columns each round leaks a foreign
+            // type from one column into the other one round at a time). Iterating
+            // to the fixpoint is what makes the synthesized type admit every row
+            // the runtime can actually produce.
+            //
+            // Termination: each column only ever moves up the height-2 lattice
+            // (a concrete type → `Any`) and never back down (`union_ty`/`lub` are
+            // monotone and `t_init` is always folded back in), so the row type
+            // stabilizes in at most `arity` rounds.
             let t_init = synth(init, schemas, at, recur)?;
-            let t_step = synth(step, schemas, at, Some(&t_init))?;
-            if t_init.arity() != t_step.arity() {
-                return Err(TypeError::IterateArityMismatch {
-                    init: t_init.arity(),
-                    step: t_step.arity(),
-                });
+            let mut t = t_init.clone();
+            loop {
+                let t_step = synth(step, schemas, at, Some(&t))?;
+                if t_init.arity() != t_step.arity() {
+                    return Err(TypeError::IterateArityMismatch {
+                        init: t_init.arity(),
+                        step: t_step.arity(),
+                    });
+                }
+                let next = union_ty(&t_init, &t_step)?;
+                if next == t {
+                    return Ok(next);
+                }
+                t = next;
             }
-            union_ty(&t_init, &t_step)
         }
     }
 }

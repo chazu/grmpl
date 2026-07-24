@@ -9,3 +9,9 @@ description = "P8a value/row typing: synthesizes a row type for a core Query IR 
 grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }
+
+[dev-dependencies]
+# A concrete store to *run* lowered plans in the soundness oracle (below the
+# bright line, so test-only — mirrors grmpl-diff / grmpl-lang's own dev-deps).
+grmpl-store = { path = "../grmpl-store" }
+tempfile = "3"
