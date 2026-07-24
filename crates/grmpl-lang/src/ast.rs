@@ -26,6 +26,29 @@ pub struct Atom {
     pub args: Vec<Arg>,
 }
 
+/// An aggregate function that may head a `yield` item: `count`, `sum`, `min`,
+/// or `max`. `count` folds row *counts* (no column); the others fold a named
+/// column. `compile` lowers this to a positional [`grmpl_diff::Agg`], so a
+/// `view` carrying one of these lowers to a `Query::Reduce` (P2 aggregate
+/// yield) rather than a plain projection.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+/// The single aggregate of a `view`'s `yield` clause: a function over an
+/// optional column (`sum(points)`, `count()`). A view has at most one — the
+/// engine's `Query::Reduce` folds one aggregate per group — and its grouping
+/// columns are the *plain* identifiers of the same `yield` list.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AggYield {
+    pub func: AggFunc,
+    pub col: Option<String>,
+}
+
 /// One element of a `form` rule pattern.
 #[derive(Clone, PartialEq, Debug)]
 pub enum PAtom {
@@ -81,7 +104,18 @@ pub struct Arm {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Decl {
     Rel { name: String, cols: Vec<ColDecl> },
-    View { name: String, params: Vec<String>, atoms: Vec<Atom>, yields: Vec<String> },
+    /// A `view`. `yields` are the plain grouping/projection columns of the
+    /// `yield` clause; `agg` is the optional single aggregate (`sum(pts)`,
+    /// `count()`). With `agg == None` the view lowers to a projection (v1
+    /// behavior); with `agg == Some(_)` it groups by `yields` and lowers to a
+    /// `Query::Reduce` (P2 aggregate yield).
+    View {
+        name: String,
+        params: Vec<String>,
+        atoms: Vec<Atom>,
+        yields: Vec<String>,
+        agg: Option<AggYield>,
+    },
     Form { name: String, rules: Vec<FormRule> },
     /// An `on` handler binding executable behavior to an inbox. Its arms may be
     /// written in either surface and freely mixed: `stmt_arms` are the v1

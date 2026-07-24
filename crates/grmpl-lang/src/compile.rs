@@ -33,7 +33,7 @@ use grmpl_diff::{Agg, Query, Snapshot};
 use grmpl_pattern::{Form, Pattern, VarId};
 use grmpl_proc::Behavior;
 
-use crate::ast::{Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
+use crate::ast::{AggFunc, AggYield, Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
 use crate::concat::{ConcatArm, Schemas, Word};
 use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
 use crate::parser::parse;
@@ -65,6 +65,10 @@ struct ViewDef {
     params: Vec<String>,
     atoms: Vec<crate::ast::Atom>,
     yields: Vec<String>,
+    /// The optional single aggregate of the `yield` clause. `None` → a plain
+    /// projection view; `Some(_)` → the view groups by `yields` and lowers to a
+    /// `Query::Reduce` (P2 aggregate yield surface).
+    agg: Option<AggYield>,
 }
 
 struct OnDef {
@@ -236,6 +240,7 @@ impl Program {
                     params,
                     atoms,
                     yields,
+                    agg,
                 } => {
                     views.insert(
                         name,
@@ -243,6 +248,7 @@ impl Program {
                             params,
                             atoms,
                             yields,
+                            agg,
                         },
                     );
                 }
@@ -370,6 +376,12 @@ impl Program {
     /// predicates), joined to the accumulated plan on their shared variables,
     /// and the whole is projected onto the `yield` variables and de-duplicated.
     /// No closures are generated here — that is deferred to `lower`.
+    ///
+    /// If the `yield` clause carries an aggregate (`yield t, sum(pts)`), the
+    /// projection is instead wrapped in a [`QueryIr::Reduce`]: the plain
+    /// `yield` identifiers become the grouping key and the aggregate folds its
+    /// column. This is the text-surface counterpart of
+    /// [`reduce_view`](Self::reduce_view) and lowers to the same `Query::Reduce`.
     pub fn view_ir(&self, name: &str, args: &[Value]) -> Result<QueryIr, String> {
         let v = self
             .views
@@ -472,17 +484,47 @@ impl Program {
         }
 
         let base = acc.ok_or_else(|| format!("view `{name}` has no atoms"))?;
+        // Project the grouping columns, then (for an aggregate yield) the
+        // aggregate's column. This lays the group keys in positions
+        // `0..yields.len()` and the folded value at `yields.len()`, exactly the
+        // layout `reduce_view` produces over a plain view yielding
+        // `[group…, col]` — so the text surface and the programmatic
+        // `reduce_view`/`NamedAgg` surface lower to the same `Query::Reduce`.
+        let mut proj: Vec<&str> = v.yields.iter().map(|s| s.as_str()).collect();
+        if let Some(AggYield { col: Some(c), .. }) = &v.agg {
+            proj.push(c.as_str());
+        }
         let mut cols = Vec::new();
-        for y in &v.yields {
+        for y in &proj {
             let c = *varcol
-                .get(y)
+                .get(*y)
                 .ok_or_else(|| format!("view `{name}` yields unbound variable `{y}`"))?;
             cols.push(c);
         }
-        Ok(QueryIr::Distinct(Box::new(QueryIr::Project {
+        let projected = QueryIr::Distinct(Box::new(QueryIr::Project {
             input: Box::new(base),
             cols,
-        })))
+        }));
+        match &v.agg {
+            None => Ok(projected),
+            Some(a) => {
+                // Group by the plain columns; fold the aggregate over the column
+                // parked right after them (`Count` ignores values).
+                let key: Vec<usize> = (0..v.yields.len()).collect();
+                let agg_idx = v.yields.len();
+                let agg = match a.func {
+                    AggFunc::Count => Agg::Count,
+                    AggFunc::Sum => Agg::Sum(agg_idx),
+                    AggFunc::Min => Agg::Min(agg_idx),
+                    AggFunc::Max => Agg::Max(agg_idx),
+                };
+                Ok(QueryIr::Reduce {
+                    input: Box::new(projected),
+                    key,
+                    agg,
+                })
+            }
+        }
     }
 
     /// Aggregate over a view's yielded columns *by name*: instantiate `view`
@@ -900,7 +942,12 @@ fn pop_fact(prog: &Program, rel: &str, stack: &mut Vec<Value>) -> CoreResult<Fac
 
 impl Schemas for Program {
     fn view_shape(&self, view: &str) -> Option<(usize, usize)> {
-        self.views.get(view).map(|v| (v.params.len(), v.yields.len()))
+        self.views.get(view).map(|v| {
+            // An aggregate yield contributes one extra output column (the fold),
+            // so the reduced view's arity is the group cols plus one.
+            let out = v.yields.len() + usize::from(v.agg.is_some());
+            (v.params.len(), out)
+        })
     }
 
     fn rel_arity(&self, rel: &str) -> Option<usize> {

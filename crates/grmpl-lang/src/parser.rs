@@ -3,19 +3,25 @@
 //! ```text
 //! program := decl*
 //! decl    := "rel"  Ident "(" collist ")"
-//!          | "view" Ident "(" identlist? ")" "{" atom* "yield" identlist "}"
+//!          | "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
 //!          | "form" Ident "{" rule* "}"
 //! collist := col ("," col)*
 //! col     := Ident (":" Ident)?          // column name and optional type
 //! atom    := Ident "(" arg ("," arg)* ")"
 //! arg     := Ident | Str | Int
+//! yieldlist := yielditem ("," yielditem)*
+//! yielditem := Ident                     // a grouping / projection column
+//!            | Ident "(" Ident? ")"      // an aggregate: sum(col) / count()
+//!                                         // (at most one aggregate per view)
 //! rule    := patom+ "->" Ident "(" identlist? ")"
 //! patom   := Str | Ident
 //! ```
 
 use grmpl_core::Value;
 
-use crate::ast::{Arg, Arm, Atom, ColDecl, Decl, FormRule, MatchOp, PAtom, SArg, Stmt};
+use crate::ast::{
+    AggFunc, AggYield, Arg, Arm, Atom, ColDecl, Decl, FormRule, MatchOp, PAtom, SArg, Stmt,
+};
 use crate::concat::{ConcatArm, Word};
 use crate::lexer::{lex, Token};
 
@@ -130,9 +136,64 @@ impl Parser {
             atoms.push(self.atom()?);
         }
         self.next(); // yield
-        let yields = self.identlist()?;
+        let (yields, agg) = self.yield_clause()?;
         self.expect(&Token::RBrace)?;
-        Ok(Decl::View { name, params, atoms, yields })
+        Ok(Decl::View { name, params, atoms, yields, agg })
+    }
+
+    /// `yieldlist := yielditem ("," yielditem)*`, splitting the items into the
+    /// plain grouping columns and the (at most one) aggregate. A `yielditem`
+    /// spelled `Ident "(" Ident? ")"` is an aggregate call; a bare `Ident` is a
+    /// grouping column. A second aggregate, an unknown aggregate name, or a
+    /// wrong aggregate arity (`count` takes no column; `sum`/`min`/`max` take
+    /// one) is a parse error.
+    fn yield_clause(&mut self) -> Result<(Vec<String>, Option<AggYield>), String> {
+        let mut yields = Vec::new();
+        let mut agg: Option<AggYield> = None;
+        loop {
+            let name = self.ident()?;
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.next(); // (
+                let col = if matches!(self.peek(), Some(Token::RParen)) {
+                    None
+                } else {
+                    Some(self.ident()?)
+                };
+                self.expect(&Token::RParen)?;
+                let func = match name.as_str() {
+                    "count" => AggFunc::Count,
+                    "sum" => AggFunc::Sum,
+                    "min" => AggFunc::Min,
+                    "max" => AggFunc::Max,
+                    other => {
+                        return Err(format!(
+                            "unknown aggregate `{other}` (expected count, sum, min, or max)"
+                        ))
+                    }
+                };
+                match (func, &col) {
+                    (AggFunc::Count, Some(c)) => {
+                        return Err(format!("aggregate `count` takes no column, found `{c}`"))
+                    }
+                    (AggFunc::Sum | AggFunc::Min | AggFunc::Max, None) => {
+                        return Err(format!("aggregate `{name}` needs a column"))
+                    }
+                    _ => {}
+                }
+                if agg.is_some() {
+                    return Err("a view `yield` may contain at most one aggregate".into());
+                }
+                agg = Some(AggYield { func, col });
+            } else {
+                yields.push(name);
+            }
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok((yields, agg))
     }
 
     fn atom(&mut self) -> Result<Atom, String> {

@@ -141,8 +141,19 @@ columns (P1).
   non-monotone operator has no monotone semi-naïve maintenance.
 * **Named-column yield surface (language).** `Program::reduce_view` groups and
   folds a view's *yielded columns by name* (`NamedAgg`), lowering to
-  `Query::Reduce`. This waits on P1's named columns; a full `view … yield
-  count(…)` grammar is a follow-on (TKT filed).
+  `Query::Reduce`. This waits on P1's named columns.
+* **Aggregate yield grammar (language, TKT-106).** The text surface now spells
+  the same reduce directly in a view's `yield` clause: `view team_totals() {
+  score(p,t,pts) yield t, sum(pts) }`. The plain `yield` identifiers become the
+  grouping key and the single `count()`/`sum(c)`/`min(c)`/`max(c)` aggregate
+  folds its column, so an aggregate-carrying `view` lowers to a `Query::Reduce`
+  through the ordinary `Program::view`/`view_ir` path — observationally
+  identical to the programmatic `reduce_view`/`NamedAgg` surface. (Lexer needed
+  no change; parser `yield_clause`, `ast::{AggFunc,AggYield}`, and `view_ir`
+  carry it.) At most one aggregate per view; malformed aggregates are compile
+  errors. Known limitation inherited from the set-valued reduce: a bare
+  `count()` adds no projected column, so it counts distinct group tuples (`1`
+  per group) — a multiset/row `count` is left to a follow-on.
 
 ### Acceptance
 
@@ -155,6 +166,10 @@ columns (P1).
 * A `Reduce` placed inside an `Iterate` is rejected at evaluation (tested).
 * `reduce_view` folds named columns and errors on unknown column/view names
   (tested).
+* The `yield` aggregate grammar (TKT-106) lowers to *exactly* the same result
+  as the programmatic `reduce_view`/`NamedAgg` surface, and its output is
+  independent of source-commit order — both checked each round by a seeded
+  randomized-churn law oracle (`crates/grmpl-lang/tests/aggregate_yield.rs`).
 
 ### Start here
 
@@ -166,9 +181,9 @@ Oracle template: `crates/grmpl-diff/tests/reduce_stream.rs`.
 
 ### Not in this phase
 
-Per-key incremental aggregate state (P13), aggregates inside recursion, richer
-aggregates (average/distinct-count/user-defined), and a parser grammar for
-aggregate yields in `view` (follow-on ticket).
+Per-key incremental aggregate state (P13), aggregates inside recursion, and
+richer aggregates (average/distinct-count/multiset-row-count/user-defined). The
+parser grammar for aggregate yields in `view` landed in TKT-106.
 
 ---
 
