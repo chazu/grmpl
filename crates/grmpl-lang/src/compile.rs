@@ -26,12 +26,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grmpl_core::{
-    Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, RelId, Result as CoreResult,
-    Schema, SchemaCatalog, Tuple, Ty, Value,
+    Authority, Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, RelId,
+    Result as CoreResult, Schema, SchemaCatalog, Tuple, TraceStore, Ty, Value,
 };
 use grmpl_diff::{Agg, Query, Snapshot};
 use grmpl_pattern::{Form, Pattern, VarId};
-use grmpl_proc::Behavior;
+use grmpl_proc::{Behavior, CommitOutcome, OnWatch};
 
 use crate::ast::{AggFunc, AggYield, Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
 use crate::concat::{ConcatArm, Schemas, Word};
@@ -78,12 +78,29 @@ struct OnDef {
     concat_arms: Vec<ConcatArm>,
 }
 
+/// The static wiring of an `on watch` declaration (P5). It names the watched
+/// `view` and the three relations the pump touches; the runtime identities the
+/// source cannot name (view args, the cursor-key/target entities, the pump
+/// authority) are supplied at lowering time by [`Program::on_watch`]. Keyed by
+/// view name — v1 allows at most one `on watch` per view.
+struct WatchDef {
+    inbox: String,
+    cursor: String,
+    seqs: String,
+    /// The `including current` opt-in: `true` lowers to
+    /// [`OnWatch::install_including_current`] (deliver the current view once),
+    /// `false` to the skip-initial default [`OnWatch::install`].
+    including_current: bool,
+}
+
 /// A compiled program: relation schemas, views, forms, and on-handlers.
 pub struct Program {
     rels: HashMap<String, RelInfo>,
     views: HashMap<String, ViewDef>,
     forms: HashMap<String, Vec<crate::ast::FormRule>>,
     ons: HashMap<String, OnDef>,
+    /// `on watch` reactive handlers, keyed by watched view name.
+    watches: HashMap<String, WatchDef>,
 }
 
 /// How a `compile` run assigns a [`RelId`] to each declared relation. The two
@@ -205,6 +222,7 @@ impl Program {
         let mut views = HashMap::new();
         let mut forms = HashMap::new();
         let mut ons = HashMap::new();
+        let mut watches = HashMap::new();
 
         for decl in decls {
             match decl {
@@ -270,6 +288,26 @@ impl Program {
                         },
                     );
                 }
+                Decl::OnWatch {
+                    view,
+                    inbox,
+                    cursor,
+                    seqs,
+                    including_current,
+                } => {
+                    if watches.contains_key(&view) {
+                        return Err(format!("view `{view}` is watched twice"));
+                    }
+                    watches.insert(
+                        view,
+                        WatchDef {
+                            inbox,
+                            cursor,
+                            seqs,
+                            including_current,
+                        },
+                    );
+                }
             }
         }
         let prog = Program {
@@ -277,6 +315,7 @@ impl Program {
             views,
             forms,
             ons,
+            watches,
         };
         // "Declared stack effects first": statically check every concatenative
         // arm's cell arithmetic now, so a malformed point-free body fails at
@@ -644,6 +683,90 @@ impl Program {
     /// `grmpl_proc::OnWatch`.
     pub fn watch_view(&self, name: &str, args: &[Value]) -> Result<Comp, String> {
         Ok(Comp::Watch(self.view_ir(name, args)?))
+    }
+
+    /// Whether the `on watch` over `view` opted into `including current`, or
+    /// `None` if no `on watch` names that view. `true` means its lowering
+    /// installs with [`OnWatch::install_including_current`] (deliver the current
+    /// view once); `false` with the skip-initial default [`OnWatch::install`].
+    pub fn watch_including_current(&self, view: &str) -> Option<bool> {
+        self.watches.get(view).map(|w| w.including_current)
+    }
+
+    /// Lower an `on watch` declaration to a runnable [`grmpl_proc::OnWatch`],
+    /// binding the runtime identities the *source* does not name: the view
+    /// arguments `args`, the durable cursor-key `watch` entity, the inbox
+    /// addressee `target` entity, and the pump `authority`. The view's `Query`
+    /// and the `inbox` / `cursor` / `seqs` relation ids come from the compiled
+    /// program.
+    ///
+    /// This is a **pure lowering** — it builds the wired struct and commits
+    /// nothing. Installation (which chooses skip-initial vs `including current`)
+    /// is the caller's step; [`install_watch`](Self::install_watch) does both,
+    /// or read [`watch_including_current`](Self::watch_including_current) and call
+    /// [`OnWatch::install`] / [`OnWatch::install_including_current`] directly.
+    ///
+    /// Naming only the substrate **traits** (`TraceStore`, `SchemaCatalog`) and
+    /// core value types, this stays above the bright line: the language wires a
+    /// reactive handler without ever naming a storage or transport technology,
+    /// and the resulting `OnWatch` observes opaque `Edition`s.
+    pub fn on_watch(
+        &self,
+        view: &str,
+        args: &[Value],
+        watch: Entity,
+        target: Entity,
+        authority: Authority,
+    ) -> Result<OnWatch, String> {
+        let w = self
+            .watches
+            .get(view)
+            .ok_or_else(|| format!("no `on watch` over view `{view}`"))?;
+        let rel = |name: &str, role: &str| -> Result<RelId, String> {
+            self.rel_id(name)
+                .ok_or_else(|| format!("`on watch {view}` names undeclared {role} relation `{name}`"))
+        };
+        Ok(OnWatch {
+            view: self.view(view, args)?,
+            watch,
+            target,
+            inbox: rel(&w.inbox, "inbox")?,
+            cursor_rel: rel(&w.cursor, "cursor")?,
+            seqs: rel(&w.seqs, "seqs")?,
+            authority,
+        })
+    }
+
+    /// Lower an `on watch` and **install** it, choosing the initial-delivery mode
+    /// from the source: `including current` installs with
+    /// [`OnWatch::install_including_current`] (the current view is delivered once
+    /// on the first pump), the default with the skip-initial [`OnWatch::install`].
+    /// Returns the installed [`OnWatch`] (so the caller can [`pump`](OnWatch::pump)
+    /// it) alongside the install commit's [`CommitOutcome`].
+    ///
+    /// This is [`on_watch`](Self::on_watch) plus the one-line install branch that
+    /// the `including current` opt-in selects — the single call that turns the
+    /// text surface into a live reactive handler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_watch(
+        &self,
+        view: &str,
+        args: &[Value],
+        watch: Entity,
+        target: Entity,
+        authority: Authority,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+    ) -> Result<(OnWatch, CommitOutcome), String> {
+        let ow = self.on_watch(view, args, watch, target, authority)?;
+        let including_current = self.watches[view].including_current;
+        let outcome = if including_current {
+            ow.install_including_current(store, schemas)
+        } else {
+            ow.install(store, schemas)
+        }
+        .map_err(|e| e.to_string())?;
+        Ok((ow, outcome))
     }
 
     /// Name the computation of *parsing* with a declared `form`: its [`FormIr`]

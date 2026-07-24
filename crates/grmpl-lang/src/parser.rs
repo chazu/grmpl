@@ -5,6 +5,8 @@
 //! decl    := "rel"  Ident "(" collist ")"
 //!          | "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
 //!          | "form" Ident "{" rule* "}"
+//!          | "on" "watch" Ident ("including" "current")? "{" watchbind* "}"
+//! watchbind := ("inbox" | "cursor" | "seqs") Ident
 //! collist := col ("," col)*
 //! col     := Ident (":" Ident)?          // column name and optional type
 //! atom    := Ident "(" arg ("," arg)* ")"
@@ -258,6 +260,12 @@ impl Parser {
 
     fn on_decl(&mut self) -> Result<Decl, String> {
         self.next(); // on
+        // `on watch <view> { … }` — the reactive-handler surface — shares the
+        // `on` keyword with the message-handler `on <inbox> parse <form> { … }`,
+        // disambiguated by the `watch` keyword immediately after `on`.
+        if self.is_ident("watch") {
+            return self.on_watch_decl();
+        }
         let inbox = self.ident()?;
         match self.ident()?.as_str() {
             "parse" => {}
@@ -291,6 +299,66 @@ impl Parser {
             form,
             stmt_arms,
             word_arms,
+        })
+    }
+
+    /// `on watch <view> ("including" "current")? "{" ("inbox"|"cursor"|"seqs")
+    /// Ident … "}"` — a reactive handler over a maintained view. `on` and the
+    /// `watch` keyword are already consumed. Each of the three relation bindings
+    /// must appear exactly once; order is free.
+    fn on_watch_decl(&mut self) -> Result<Decl, String> {
+        self.next(); // watch
+        let view = self.ident()?;
+        let including_current = if self.is_ident("including") {
+            self.next(); // including
+            match self.ident()?.as_str() {
+                "current" => {}
+                other => {
+                    return Err(format!("expected `current` after `including`, found `{other}`"))
+                }
+            }
+            true
+        } else {
+            false
+        };
+        self.expect(&Token::LBrace)?;
+        let mut inbox: Option<String> = None;
+        let mut cursor: Option<String> = None;
+        let mut seqs: Option<String> = None;
+        let set = |slot: &mut Option<String>, rel: String, key: &str| -> Result<(), String> {
+            if slot.is_some() {
+                return Err(format!("on-watch binding `{key}` set twice"));
+            }
+            *slot = Some(rel);
+            Ok(())
+        };
+        while !matches!(self.peek(), Some(Token::RBrace)) {
+            if self.peek().is_none() {
+                return Err("unterminated on-watch body".into());
+            }
+            let key = self.ident()?;
+            let rel = self.ident()?;
+            match key.as_str() {
+                "inbox" => set(&mut inbox, rel, "inbox")?,
+                "cursor" => set(&mut cursor, rel, "cursor")?,
+                "seqs" => set(&mut seqs, rel, "seqs")?,
+                other => {
+                    return Err(format!(
+                        "unknown on-watch binding `{other}` (expected inbox, cursor, or seqs)"
+                    ))
+                }
+            }
+        }
+        self.next(); // }
+        let inbox = inbox.ok_or("on-watch missing `inbox` binding")?;
+        let cursor = cursor.ok_or("on-watch missing `cursor` binding")?;
+        let seqs = seqs.ok_or("on-watch missing `seqs` binding")?;
+        Ok(Decl::OnWatch {
+            view,
+            inbox,
+            cursor,
+            seqs,
+            including_current,
         })
     }
 
