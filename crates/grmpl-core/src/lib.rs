@@ -21,7 +21,7 @@ pub use authority::{Authority, KeyRange, Scope};
 pub use error::{Error, Result};
 pub use fact::Fact;
 pub use patch::{CursorMove, Message, Patch};
-pub use store::{EditionStore, TraceStore};
+pub use store::{Catalog, EditionStore, TraceStore};
 pub use transport::Transport;
 pub use time::{Diff, Edition, Time, Update};
 pub use value::{DomainId, Entity, RelId, Tuple, Value};

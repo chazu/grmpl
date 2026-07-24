@@ -8,7 +8,6 @@ members = [
     "crates/grmpl-pattern",
     "crates/grmpl-lang",
     "crates/grmpl-transport",
-    "examples",
 ]
 
 [workspace.package]

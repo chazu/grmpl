@@ -1,10 +1,23 @@
 //! Canonical serialization of core values and messages.
 //!
 //! This is *value* serialization (turning `Value`/`Tuple`/`Message` into bytes),
-//! not storage layout — the on-disk physical encoding stays in `grmpl-store`.
-//! It lives here so every crate that must put a `Message` on a wire (the
-//! transport, the cross-domain router) shares one encoding. Pure and
-//! dependency-free. `message = inbox(u32, BE) || encoded_tuple(body)`.
+//! not storage layout — but it is the *one* value/tuple encoding for the whole
+//! system. Every framing that must put values on a byte channel builds on the
+//! shared `encode_tuple`/`decode_tuple` here: the transport and cross-domain
+//! router frame a `Message`, and `grmpl-store` frames an on-disk record around
+//! this same tuple codec (it no longer keeps a private copy). Pure and
+//! dependency-free.
+//!
+//! ## Format version
+//!
+//! Every serialized artifact — a `message`, a store `record` — begins with a
+//! single [`FORMAT_VERSION`] byte. Decoders reject any other version loudly
+//! (`Error::Codec`) rather than silently misreading an evolved layout. Bump the
+//! constant whenever the tag set or framing changes so old bytes fail fast; the
+//! byte is checked by the shared [`read_version`] helper.
+//!
+//! * `message = version(1) || inbox(u32, BE) || encoded_tuple(body)`
+//! * `encoded_tuple = arity(u32, BE) || value*`
 
 use std::sync::Arc;
 
@@ -12,27 +25,53 @@ use crate::error::{Error, Result};
 use crate::patch::Message;
 use crate::value::{Entity, RelId, Tuple, Value};
 
+/// The wire/on-disk format version. Prefixes every serialized artifact. Bump
+/// on any change to the tag set or framing so stale bytes are rejected rather
+/// than misread. All framings (`message`, store `record`) share this byte.
+pub const FORMAT_VERSION: u8 = 1;
+
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
 const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TUPLE: u8 = 5;
 
+/// Push the leading [`FORMAT_VERSION`] byte. Every encoder starts here.
+pub fn push_version(out: &mut Vec<u8>) {
+    out.push(FORMAT_VERSION);
+}
+
+/// Validate the leading format-version byte and return the offset just past it
+/// (always 1). Errors loudly on an unknown version or an empty buffer. Every
+/// decoder starts here so the version check lives in exactly one place.
+pub fn read_version(bytes: &[u8]) -> Result<usize> {
+    match bytes.first() {
+        Some(&FORMAT_VERSION) => Ok(1),
+        Some(other) => Err(Error::Codec(format!(
+            "unsupported format version {other} (expected {FORMAT_VERSION})"
+        ))),
+        None => Err(Error::Codec("empty buffer (no format version)".into())),
+    }
+}
+
 pub fn encode_message(m: &Message) -> Vec<u8> {
     let mut out = Vec::new();
+    push_version(&mut out);
     out.extend_from_slice(&m.inbox.0.to_be_bytes());
     encode_tuple(&m.body, &mut out);
     out
 }
 
 pub fn decode_message(bytes: &[u8]) -> Result<Message> {
-    if bytes.len() < 4 {
-        return Err(Error::Codec("message shorter than inbox header".into()));
-    }
+    let mut pos = read_version(bytes)?;
+    let inbox_bytes = bytes
+        .get(pos..pos + 4)
+        .ok_or_else(|| Error::Codec("message shorter than inbox header".into()))?;
     let mut buf = [0u8; 4];
-    buf.copy_from_slice(&bytes[..4]);
+    buf.copy_from_slice(inbox_bytes);
     let inbox = RelId(u32::from_be_bytes(buf));
-    let (body, pos) = decode_tuple(bytes, 4)?;
+    pos += 4;
+    let (body, pos) = decode_tuple(bytes, pos)?;
     if pos != bytes.len() {
         return Err(Error::Codec("trailing bytes after message body".into()));
     }
@@ -133,4 +172,35 @@ fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     buf.copy_from_slice(slice);
     *pos = end;
     Ok(u64::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_roundtrips_and_is_version_prefixed() {
+        let m = Message {
+            inbox: RelId(42),
+            body: Tuple::from([Value::Int(7), Value::text("hi"), Value::Bool(true)]),
+        };
+        let bytes = encode_message(&m);
+        assert_eq!(bytes[0], FORMAT_VERSION, "artifact must lead with the version byte");
+        assert_eq!(decode_message(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn decode_rejects_unknown_version() {
+        let mut bytes = encode_message(&Message {
+            inbox: RelId(1),
+            body: Tuple::from([Value::Int(0)]),
+        });
+        bytes[0] = FORMAT_VERSION.wrapping_add(1);
+        assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_version_rejects_empty() {
+        assert!(read_version(&[]).is_err());
+    }
 }
