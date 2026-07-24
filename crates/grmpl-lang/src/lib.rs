@@ -7,8 +7,11 @@
 //! specialized syntax for relational views and structural patterns, not a
 //! privileged engine.
 //!
-//! `on` (which binds executable behavior) stays a programmatic construction in
-//! v1, since it needs an action/expression sublanguage.
+//! `on` binds executable behavior, in either of two coexisting surfaces over the
+//! same effect plumbing: a statement body (`match Tag(v) { resolve … / assert …
+//! }`) or a P11 **concatenative** point-free body (`match Tag(v) [ … ]`, see
+//! [`concat`]). View bodies keep their named logic variables; the handler words
+//! carry declared stack effects.
 //!
 //! ```text
 //! rel located(thing, place)
@@ -27,10 +30,12 @@
 
 pub mod ast;
 pub mod compile;
+pub mod concat;
 pub mod ir;
 pub mod lexer;
 pub mod parser;
 
 pub use compile::{NamedAgg, Program};
+pub use concat::{ConcatArm, Schemas, StackEffect, Word};
 pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};
 pub use parser::parse;

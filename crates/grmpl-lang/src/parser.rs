@@ -13,7 +13,10 @@
 //! patom   := Str | Ident
 //! ```
 
+use grmpl_core::Value;
+
 use crate::ast::{Arg, Arm, Atom, ColDecl, Decl, FormRule, MatchOp, PAtom, SArg, Stmt};
+use crate::concat::{ConcatArm, Word};
 use crate::lexer::{lex, Token};
 
 pub fn parse(src: &str) -> Result<Vec<Decl>, String> {
@@ -201,18 +204,37 @@ impl Parser {
         }
         let form = self.ident()?;
         self.expect(&Token::LBrace)?;
-        let mut arms = Vec::new();
+        let mut stmt_arms = Vec::new();
+        let mut word_arms = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
                 return Err("unterminated on-handler".into());
             }
-            arms.push(self.arm()?);
+            // Each arm is `match Tag(vars)` followed by either a `{ stmt* }`
+            // statement body (v1) or a `[ word* ]` concatenative body (P11);
+            // the two surfaces coexist in one handler.
+            let (tag, vars) = self.arm_header()?;
+            match self.peek() {
+                Some(Token::LBrace) => stmt_arms.push(self.stmt_arm(tag, vars)?),
+                Some(Token::LBracket) => word_arms.push(self.word_arm(tag, vars)?),
+                other => {
+                    return Err(format!(
+                        "expected `{{` (statement arm) or `[` (concatenative arm), found {other:?}"
+                    ))
+                }
+            }
         }
         self.next(); // }
-        Ok(Decl::On { inbox, form, arms })
+        Ok(Decl::On {
+            inbox,
+            form,
+            stmt_arms,
+            word_arms,
+        })
     }
 
-    fn arm(&mut self) -> Result<Arm, String> {
+    /// `match Tag ( identlist? )` — the shared head of both arm surfaces.
+    fn arm_header(&mut self) -> Result<(String, Vec<String>), String> {
         match self.ident()?.as_str() {
             "match" => {}
             other => return Err(format!("expected `match`, found `{other}`")),
@@ -225,6 +247,10 @@ impl Parser {
             self.identlist()?
         };
         self.expect(&Token::RParen)?;
+        Ok((tag, vars))
+    }
+
+    fn stmt_arm(&mut self, tag: String, vars: Vec<String>) -> Result<Arm, String> {
         self.expect(&Token::LBrace)?;
         let mut stmts = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
@@ -235,6 +261,70 @@ impl Parser {
         }
         self.next(); // }
         Ok(Arm { tag, vars, stmts })
+    }
+
+    /// `[ word* ]` — a point-free concatenative arm body.
+    fn word_arm(&mut self, tag: String, vars: Vec<String>) -> Result<ConcatArm, String> {
+        self.expect(&Token::LBracket)?;
+        let mut words = Vec::new();
+        while !matches!(self.peek(), Some(Token::RBracket)) {
+            if self.peek().is_none() {
+                return Err("unterminated concatenative arm".into());
+            }
+            words.push(self.word()?);
+        }
+        self.next(); // ]
+        Ok(ConcatArm { tag, vars, words })
+    }
+
+    /// Parse one concatenative [`Word`]. Keyword words (`self`, the shufflers,
+    /// and the effect seam) are recognized by name; a bare string/int is a
+    /// literal push. The seam words consume a fixed number of *immediate*
+    /// operands from the token stream (a view/relation name, a column, a match
+    /// op, a key count) — their stack operands come at runtime, not here.
+    fn word(&mut self) -> Result<Word, String> {
+        match self.next() {
+            Some(Token::Str(s)) => Ok(Word::Lit(Value::text(&s))),
+            Some(Token::Int(n)) => Ok(Word::Lit(Value::Int(n))),
+            Some(Token::Ident(kw)) => match kw.as_str() {
+                "self" => Ok(Word::SelfEntity),
+                "dup" => Ok(Word::Dup),
+                "drop" => Ok(Word::Drop),
+                "swap" => Ok(Word::Swap),
+                "over" => Ok(Word::Over),
+                "rot" => Ok(Word::Rot),
+                "nip" => Ok(Word::Nip),
+                "tuck" => Ok(Word::Tuck),
+                "dup2" => Ok(Word::TwoDup),
+                "drop2" => Ok(Word::TwoDrop),
+                "resolve" => {
+                    let view = self.ident()?;
+                    let col = self.ident()?;
+                    let op = match self.next() {
+                        Some(Token::Eq) => MatchOp::Exact,
+                        Some(Token::Tilde) => MatchOp::Word,
+                        other => return Err(format!("expected `=` or `~`, found {other:?}")),
+                    };
+                    Ok(Word::Resolve { view, col, op })
+                }
+                "find" => {
+                    let rel = self.ident()?;
+                    let keyn = match self.next() {
+                        Some(Token::Int(n)) if n >= 0 => n as usize,
+                        other => {
+                            return Err(format!("`find` needs a key count, found {other:?}"))
+                        }
+                    };
+                    Ok(Word::Find { rel, keyn })
+                }
+                "expect" => Ok(Word::Expect(self.ident()?)),
+                "assert" => Ok(Word::Assert(self.ident()?)),
+                "retract" => Ok(Word::Retract(self.ident()?)),
+                "emit" => Ok(Word::Emit(self.ident()?)),
+                other => Err(format!("unknown word `{other}`")),
+            },
+            other => Err(format!("expected a word, found {other:?}")),
+        }
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {

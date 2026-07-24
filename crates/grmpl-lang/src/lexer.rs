@@ -9,6 +9,8 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket, // [
+    RBracket, // ]
     Comma,
     Colon, // :
     Arrow, // ->
@@ -33,6 +35,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             ')' => { out.push(Token::RParen); i += 1; }
             '{' => { out.push(Token::LBrace); i += 1; }
             '}' => { out.push(Token::RBrace); i += 1; }
+            '[' => { out.push(Token::LBracket); i += 1; }
+            ']' => { out.push(Token::RBracket); i += 1; }
             ',' => { out.push(Token::Comma); i += 1; }
             ':' => { out.push(Token::Colon); i += 1; }
             '=' => { out.push(Token::Eq); i += 1; }

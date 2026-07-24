@@ -334,3 +334,51 @@ fn static_authority_matches_commit_boundary_under_random_domains() {
         }
     }
 }
+
+/// P11 coexistence: effect inference is **surface-agnostic**. A concatenative
+/// (point-free) handler and the equivalent statement handler infer the same
+/// effect row — the same `writes` and `sends` — because both name their write
+/// relations the same way. A handler that mixes the two surfaces infers their
+/// union.
+#[test]
+fn concatenative_and_statement_arms_infer_the_same_effects() {
+    const STMT: &str = r#"
+        rel a(x)
+        rel b(x)
+        rel d(process)
+        form cmd { "wa" -> Wa()  "wc" -> Wc() }
+        on inbox parse cmd {
+            match Wa() { assert a(self) }
+            match Wc() { retract b(self)  emit d(self) }
+        }
+    "#;
+    // Same handler, point-free: `self assert a`, `self retract b`, `self emit d`.
+    // (The concatenative `emit` pops the inbox relation's full arity, so `d` is
+    // one-column here; the inferred `sends` set is identical either way.)
+    const CONCAT: &str = r#"
+        rel a(x)
+        rel b(x)
+        rel d(process)
+        form cmd { "wa" -> Wa()  "wc" -> Wc() }
+        on inbox parse cmd {
+            match Wa() [ self assert a ]
+            match Wc() [ self retract b  self emit d ]
+        }
+    "#;
+
+    let stmt = Program::compile(STMT, 1).unwrap();
+    let concat = Program::compile(CONCAT, 1).unwrap();
+
+    let row_stmt = infer_handler_effects(&stmt, "inbox").unwrap();
+    let row_concat = infer_handler_effects(&concat, "inbox").unwrap();
+
+    // Relation ids line up (same declaration order), so the rows are equal.
+    assert_eq!(row_stmt.writes().collect::<Vec<_>>(), row_concat.writes().collect::<Vec<_>>());
+    assert_eq!(row_stmt.sends().collect::<Vec<_>>(), row_concat.sends().collect::<Vec<_>>());
+    // Concretely: writes = {a, b}, sends = {d}.
+    assert_eq!(
+        row_concat.writes().collect::<Vec<_>>(),
+        vec![rid(&concat, "a"), rid(&concat, "b")]
+    );
+    assert_eq!(row_concat.sends().collect::<Vec<_>>(), vec![rid(&concat, "d")]);
+}
