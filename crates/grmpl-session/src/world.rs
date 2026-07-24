@@ -33,6 +33,18 @@ pub const INBOX: RelId = RelId(10);
 pub const CURSOR: RelId = RelId(11);
 /// Outbound text `(player, text)` — what a client is told.
 pub const TELL: RelId = RelId(20);
+/// Reactive on-watch activation inbox `(target, seq, body)`; `body = (diff,
+/// row)` (see [`grmpl_proc::activation_body`]). Kept distinct from the command
+/// [`INBOX`] so the player [`Process`](grmpl_proc::Process) never drains view
+/// activations as if they were commands.
+pub const WATCH_INBOX: RelId = RelId(21);
+/// Durable on-watch cursor `(watch, edition)` — the pump's exactly-once guard.
+pub const WATCH_CURSOR: RelId = RelId(22);
+/// Shared per-`(inbox, target)` seq counter for [`WATCH_INBOX`].
+pub const WATCH_SEQS: RelId = RelId(23);
+/// Durable delivery cursor `(watch, next_seq)` — how far the socket has drained
+/// [`WATCH_INBOX`]. A reconnecting client resumes from this row.
+pub const WATCH_DELIVERY: RelId = RelId(24);
 /// Single-row entity-id counter `(next: Int)`.
 pub const ENTITY_SEQ: RelId = RelId(30);
 
@@ -56,6 +68,23 @@ pub fn world_authority() -> Authority {
             Scope::whole(PLAYER),
             Scope::whole(CURSOR),
             Scope::whole(ENTITY_SEQ),
+        ],
+    )
+}
+
+/// The authority the reactive machinery commits under: the on-watch pump
+/// (materializing view deltas into [`WATCH_INBOX`] and advancing
+/// [`WATCH_CURSOR`], allocating seqs from [`WATCH_SEQS`]) and the socket drain
+/// (advancing [`WATCH_DELIVERY`]). It owns only the four reactive relations —
+/// separate from [`world_authority`], since a view firing writes no world fact.
+pub fn watch_authority() -> Authority {
+    Authority::new(
+        DomainId(1),
+        vec![
+            Scope::whole(WATCH_INBOX),
+            Scope::whole(WATCH_CURSOR),
+            Scope::whole(WATCH_SEQS),
+            Scope::whole(WATCH_DELIVERY),
         ],
     )
 }
