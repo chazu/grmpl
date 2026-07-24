@@ -82,16 +82,112 @@ pub struct Program {
     ons: HashMap<String, OnDef>,
 }
 
+/// How a `compile` run assigns a [`RelId`] to each declared relation. The two
+/// implementations are the two id-allocation policies: [`SeqAlloc`] hands out
+/// ids sequentially from a base (declaration order *is* the id order), while
+/// [`CatalogAlloc`] resolves each name against a durable [`Catalog`] so an id,
+/// once bound, is recovered on reopen no matter where the `rel` now sits in the
+/// source — the TKT-90 stability property.
+trait RelAlloc {
+    /// The id for `name`, allocating (and, for the catalog, durably binding) a
+    /// fresh one if this is the first time the name is seen.
+    fn assign(&mut self, name: &str) -> Result<RelId, String>;
+}
+
+/// Sequential allocation from a base — the catalog-free policy. `next` is the
+/// id the *next* fresh relation receives.
+struct SeqAlloc {
+    next: u32,
+}
+
+impl RelAlloc for SeqAlloc {
+    fn assign(&mut self, _name: &str) -> Result<RelId, String> {
+        let id = RelId(self.next);
+        self.next += 1;
+        Ok(id)
+    }
+}
+
+/// Catalog-backed allocation: an already-bound name resolves to its durable id;
+/// an unbound name is assigned a fresh id *above every id already in the
+/// catalog* and registered on the spot, so the binding survives the reopen and
+/// no fresh id ever collides with an existing one.
+struct CatalogAlloc<'a> {
+    catalog: &'a dyn Catalog,
+    /// The id the next *fresh* (unbound) relation receives — kept above every
+    /// id in the catalog and above every id handed out earlier in this run.
+    next: u32,
+}
+
+impl<'a> CatalogAlloc<'a> {
+    fn new(catalog: &'a dyn Catalog, rel_base: u32) -> Result<Self, String> {
+        let highest = catalog
+            .entries()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|(_, id)| id.0)
+            .max();
+        // Fresh ids start at `rel_base`, but never at or below an id already
+        // bound — otherwise a new relation could shadow an existing one.
+        let next = match highest {
+            Some(h) => rel_base.max(h + 1),
+            None => rel_base,
+        };
+        Ok(Self { catalog, next })
+    }
+}
+
+impl RelAlloc for CatalogAlloc<'_> {
+    fn assign(&mut self, name: &str) -> Result<RelId, String> {
+        if let Some(id) = self.catalog.rel_id(name).map_err(|e| e.to_string())? {
+            return Ok(id);
+        }
+        let id = RelId(self.next);
+        self.next += 1;
+        self.catalog.register(name, id).map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+}
+
 impl Program {
     /// Parse and compile source text. `rel`s are assigned `RelId`s sequentially
     /// starting at `rel_base`, so callers can align a store's relations with it.
+    /// Ids follow **declaration order**; to instead recover stable ids across
+    /// reopens from a durable catalog, use
+    /// [`compile_with_catalog`](Self::compile_with_catalog).
     pub fn compile(src: &str, rel_base: u32) -> Result<Program, String> {
+        Program::compile_alloc(src, &mut SeqAlloc { next: rel_base })
+    }
+
+    /// Parse and compile `src`, resolving each relation's `RelId` through the
+    /// durable [`Catalog`] instead of from declaration order. A name already
+    /// bound in `catalog` keeps its id; a name not yet bound is assigned a fresh
+    /// id (above every id in the catalog, at least `rel_base`) and **registered
+    /// on the spot**, so recompiling the same world after a reopen — even with
+    /// the `rel` declarations reordered or new ones interleaved — yields the
+    /// same id for every previously-seen relation. This is the stability
+    /// property TKT-72's catalog was built for: physical ids no longer depend on
+    /// source layout. Schemas are still recorded separately via
+    /// [`register_schemas`](Self::register_schemas).
+    pub fn compile_with_catalog(
+        src: &str,
+        catalog: &dyn Catalog,
+        rel_base: u32,
+    ) -> Result<Program, String> {
+        let mut alloc = CatalogAlloc::new(catalog, rel_base)?;
+        Program::compile_alloc(src, &mut alloc)
+    }
+
+    /// The shared compile body, parameterized over the id-allocation policy
+    /// ([`SeqAlloc`] vs [`CatalogAlloc`]). Everything else — parsing, duplicate
+    /// checks, column typing, concatenative stack-effect checking — is identical
+    /// regardless of where ids come from.
+    fn compile_alloc(src: &str, alloc: &mut dyn RelAlloc) -> Result<Program, String> {
         let decls = parse(src)?;
         let mut rels = HashMap::new();
         let mut views = HashMap::new();
         let mut forms = HashMap::new();
         let mut ons = HashMap::new();
-        let mut next_id = rel_base;
 
         for decl in decls {
             match decl {
@@ -119,14 +215,8 @@ impl Program {
                         };
                         columns.push(Column::new(c.name.clone(), ty));
                     }
-                    rels.insert(
-                        name,
-                        RelInfo {
-                            id: RelId(next_id),
-                            columns,
-                        },
-                    );
-                    next_id += 1;
+                    let id = alloc.assign(&name)?;
+                    rels.insert(name, RelInfo { id, columns });
                 }
                 Decl::View {
                     name,
@@ -231,8 +321,13 @@ impl Program {
     /// relation's arity/types. Relations are registered in a stable order (by
     /// id) so the effect is deterministic.
     ///
-    /// Id allocation still uses the compile-time `rel_base`; *consuming* the
-    /// catalog to recover stable ids across reopens is a follow-on (TKT-90).
+    /// The `name → RelId` binding is idempotent, so this composes cleanly with
+    /// [`compile_with_catalog`](Self::compile_with_catalog): if the program was
+    /// compiled against the same catalog, every id already matches and the
+    /// `register` calls here are no-ops that only add the schemas. If it was
+    /// compiled with [`compile`](Self::compile) (declaration-order ids), this is
+    /// the first time the catalog learns those ids — but from then on they are
+    /// stable, so a later `compile_with_catalog` recovers them.
     pub fn register_schemas(
         &self,
         catalog: &dyn Catalog,
