@@ -17,7 +17,7 @@ pub use alloc::Alloc;
 pub use commit::{check_schema, commit_patch, commit_patch_checked, CommitOutcome};
 pub use domain::{outbox_len, Domain};
 pub use gc::{consolidate_to, min_watch_cursor};
-pub use process::{enqueue, inbox_fact, Behavior, Prepared, Process};
+pub use process::{enqueue, enqueue_seq, inbox_fact, seed_seq, Behavior, Prepared, Process};
 pub use replay::{record_run, replay_from, Step};
 pub use schedule::{timer_row, ClockDriver, Scheduler, SeqAlloc};
 pub use watch::{activation_body, decode_activation, OnWatch};

@@ -31,6 +31,10 @@ pub const PLAYER: RelId = RelId(8);
 pub const INBOX: RelId = RelId(10);
 /// Inbox cursor `(player, next_seq)`.
 pub const CURSOR: RelId = RelId(11);
+/// Per-player [`INBOX`] seq counter `(player, next_seq)`, allocated through the
+/// durable, race-safe [`SeqAlloc`](grmpl_proc::SeqAlloc). Replaces the P3 interim
+/// single-writer scheme (deriving the seq from the inbox's own max).
+pub const INBOX_SEQ: RelId = RelId(12);
 /// Outbound text `(player, text)` — what a client is told.
 pub const TELL: RelId = RelId(20);
 /// Reactive on-watch activation inbox `(target, seq, body)`; `body = (diff,

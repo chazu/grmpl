@@ -11,12 +11,13 @@
 //! * crash *after* commit → the cursor already advanced, the message is skipped.
 
 use grmpl_core::{
-    Authority, CursorMove, Edition, Entity, Fact, Patch, Result, RelId, SchemaCatalog, TraceStore,
-    Tuple, Value,
+    Authority, CursorMove, Diff, Edition, Entity, Error, Fact, Patch, Result, RelId, SchemaCatalog,
+    TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
 
 use crate::commit::{commit_patch, CommitOutcome};
+use crate::SeqAlloc;
 
 /// A pure handler: `Snapshot × message-body → Patch` (Replay law — deterministic
 /// in its inputs; wall-clock and randomness must arrive as message data).
@@ -164,6 +165,62 @@ pub fn enqueue(
         Value::Tuple(body.0.clone()),
     ]);
     store.commit(&[(inbox, tuple, 1)])
+}
+
+/// Seed the seq counter for `process` in `seqs` once, on an un-raced path (e.g.
+/// the single spawn commit that creates the process), so its first
+/// [`enqueue_seq`] allocates fully race-safe. Idempotent — a no-op once the
+/// counter row exists.
+pub fn seed_seq(store: &dyn TraceStore, seqs: RelId, process: Entity) -> Result<()> {
+    let alloc = SeqAlloc::read(store, seqs, vec![Value::Ent(process)])?;
+    let patch = alloc.seed(Patch::new());
+    if !patch.asserts.is_empty() {
+        let updates: Vec<(RelId, Tuple, Diff)> =
+            patch.asserts.iter().map(|f| (f.rel, f.tuple.clone(), 1)).collect();
+        store.commit(&updates)?;
+    }
+    Ok(())
+}
+
+/// Append a message to `process`'s slice of `inbox` at the next monotonic seq,
+/// drawn from the durable, race-safe [`SeqAlloc`] over `seqs` (keyed by
+/// `process`). This is the concurrency-safe replacement for the P3 interim
+/// scheme [`enqueue`] used behind: concurrent appends to the same key resolve to
+/// **distinct, strictly increasing** seqs — a lost race re-reads the counter and
+/// retries against the winner. Seed the key once on an un-raced path
+/// ([`seed_seq`]); the first allocation has no counter row to precondition on.
+/// Returns the seq assigned.
+///
+/// Like [`enqueue`] this is the authless "sender" side (a message may cross
+/// authority domains), so it commits through the store's guarded `commit_if`
+/// directly rather than an authority-checked patch.
+pub fn enqueue_seq(
+    store: &dyn TraceStore,
+    inbox: RelId,
+    seqs: RelId,
+    process: Entity,
+    body: Tuple,
+) -> Result<i64> {
+    for _ in 0..256 {
+        let mut alloc = SeqAlloc::read(store, seqs, vec![Value::Ent(process)])?;
+        let seq = alloc.fresh();
+        let patch = alloc.seal(Patch::new().assert(inbox_fact(inbox, process, seq, body.clone())));
+
+        let preconditions: Vec<(RelId, Tuple)> =
+            patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();
+        let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
+        for f in &patch.asserts {
+            updates.push((f.rel, f.tuple.clone(), 1));
+        }
+        for f in &patch.retracts {
+            updates.push((f.rel, f.tuple.clone(), -1));
+        }
+
+        if store.commit_if(&preconditions, &updates)?.is_some() {
+            return Ok(seq);
+        }
+    }
+    Err(Error::Store("inbox seq allocation did not settle within retry cap".into()))
 }
 
 // Re-export so tests can build inbox facts without duplicating the layout.
