@@ -10,4 +10,8 @@ grmpl-core = { workspace = true }
 
 [dev-dependencies]
 grmpl-store = { path = "../grmpl-store" }
+# Test-only: the state-mode consolidation law (P9c §4a) asserts that a
+# consolidated window really does feed the *existing* `&[Value]` pattern engine.
+# Dev-only by design — `grmpl-diff` must not depend on the algebra in prod.
+grmpl-pattern = { path = "../grmpl-pattern" }
 tempfile = "3"
