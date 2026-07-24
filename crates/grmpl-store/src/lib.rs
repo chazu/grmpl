@@ -68,6 +68,11 @@ fn map_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
+/// One physical row of a [`FjallStore::canonical_dump`]: `(keyspace, key,
+/// value)`, all raw bytes. Two stores are bit-identical iff their dumps
+/// (sorted vectors of these) are equal.
+pub type DumpRow = (String, Vec<u8>, Vec<u8>);
+
 /// A fjall-backed trace store for a single authority domain.
 pub struct FjallStore {
     db: Database,
@@ -107,6 +112,72 @@ impl FjallStore {
             current: Mutex::new(current),
             watermark: Mutex::new(watermark),
         })
+    }
+
+    /// Fork the whole domain into a new store rooted at `path` (P10 **forks
+    /// v1**).
+    ///
+    /// Copies every relation keyspace (`rel_*`) and the `__meta` keyspace — the
+    /// edition clock, the consolidation watermark, the name→`RelId` catalog and
+    /// the schema registry — verbatim, so the fork is **bit-identical** to this
+    /// store at the moment of the copy (`canonical_dump` agrees) and evolves
+    /// independently thereafter. Cost is **O(domain)**: the physical size of the
+    /// store (per-relation checkpoints plus the live tail), not O(history) — a
+    /// consolidated store forks in proportion to its *state*, not its past.
+    ///
+    /// The copy is taken under the edition lock, so it is a consistent cut: no
+    /// commit lands between reading one keyspace and the next.
+    ///
+    /// **Deferred to P15 (fork identity / clock semantics).** The fork inherits
+    /// this store's edition numbering and catalog ids unchanged — it is a plain
+    /// *copy*, not a re-baselined child. Whether a fork receives a fresh domain
+    /// identity, how its clock relates to the parent's, and cross-fork merge are
+    /// all P15 concerns; v1 is deliberately the flat O(domain) copy, stated
+    /// plainly.
+    pub fn fork(&self, path: impl AsRef<Path>) -> Result<FjallStore> {
+        // Hold the edition lock for the whole copy so it is a consistent cut
+        // (no commit interleaves). Lock order current → rels, as in `commit`.
+        let _current = self.current.lock().unwrap();
+        let dest = Database::builder(path.as_ref()).open().map_err(map_err)?;
+        for name in self.db.list_keyspace_names() {
+            let name = name.as_ref();
+            let src = self.db.keyspace(name, KeyspaceCreateOptions::default).map_err(map_err)?;
+            let dst = dest.keyspace(name, KeyspaceCreateOptions::default).map_err(map_err)?;
+            let mut batch = dest.batch();
+            for kv in src.iter() {
+                let (k, v) = kv.into_inner().map_err(map_err)?;
+                batch.insert(&dst, k.as_ref().to_vec(), v.as_ref().to_vec());
+            }
+            batch.commit().map_err(map_err)?;
+        }
+        dest.persist(PersistMode::SyncAll).map_err(map_err)?;
+        drop(dest);
+        // Reopen through the normal path so the fork's edition/watermark caches
+        // are seeded from its copied `__meta`, exactly like any other store.
+        FjallStore::open(path)
+    }
+
+    /// A canonical, fully-ordered dump of the entire physical store — every
+    /// keyspace, key and value — for replay / fork verification.
+    ///
+    /// Two stores are **bit-identical** iff their dumps are equal: the value
+    /// bytes are the `grmpl_core::wire` records (a single deterministic codec)
+    /// and the keys are `edition || counter`, so equal dumps witness equal
+    /// editions down to the byte. Used by the P10 tests to assert that replaying
+    /// a session reproduces the world exactly and that a fork copies it exactly.
+    /// O(domain).
+    pub fn canonical_dump(&self) -> Result<Vec<DumpRow>> {
+        let mut out = Vec::new();
+        for name in self.db.list_keyspace_names() {
+            let name = name.as_ref().to_string();
+            let ks = self.db.keyspace(&name, KeyspaceCreateOptions::default).map_err(map_err)?;
+            for kv in ks.iter() {
+                let (k, v) = kv.into_inner().map_err(map_err)?;
+                out.push((name.clone(), k.as_ref().to_vec(), v.as_ref().to_vec()));
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     fn keyspace_for(&self, rel: RelId) -> Result<fjall::Keyspace> {

@@ -59,9 +59,9 @@ impl Process {
         Ok(0)
     }
 
-    /// The message body at inbox position `seq`, if present.
-    fn message_at(&self, store: &dyn TraceStore, seq: i64) -> Result<Option<Tuple>> {
-        let at = store.current();
+    /// The message body at inbox position `seq` **as-of edition `at`**, if
+    /// present.
+    fn message_at(&self, store: &dyn TraceStore, seq: i64, at: Edition) -> Result<Option<Tuple>> {
         for (t, d) in store.read_at(self.inbox, at)? {
             let s = t.as_slice();
             if d > 0
@@ -76,22 +76,40 @@ impl Process {
         Ok(None)
     }
 
+    /// Build the patch this process proposes for the message at inbox position
+    /// `seq`, reading the world **as-of edition `at`**, with the cursor advance
+    /// attached — exactly the patch a step committing against edition `at`
+    /// proposes. `None` if no message sits at `seq` as-of `at`.
+    ///
+    /// This is the **replay primitive** (P10): because the behavior is pure in
+    /// `(Snapshot, body)` and both are recovered from committed data, re-deriving
+    /// a historical step's patch against its as-of edition reproduces it exactly
+    /// (the Replay law). [`prepare`](Self::prepare) is just this at
+    /// `(position, current)`; [`replay_from`](crate::replay::replay_from) calls
+    /// it at each consumed message's historical edition.
+    pub fn patch_at(&self, store: &dyn TraceStore, seq: i64, at: Edition) -> Result<Option<Patch>> {
+        let body = match self.message_at(store, seq, at)? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let snap = Snapshot::new(store, at);
+        let mut patch = (self.behavior)(&snap, &body)?;
+        patch.cursor_advance = Some(CursorMove {
+            rel: self.cursor_rel,
+            retract: if seq > 0 { Some(cursor_tuple(self.entity, seq)) } else { None },
+            assert: cursor_tuple(self.entity, seq + 1),
+        });
+        Ok(Some(patch))
+    }
+
     /// Build the patch for the next pending message (with its cursor advance)
     /// without committing. `None` if the inbox is idle.
     pub fn prepare(&self, store: &dyn TraceStore) -> Result<Option<Prepared>> {
         let pos = self.position(store)?;
-        let body = match self.message_at(store, pos)? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let snap = Snapshot::at_current(store);
-        let mut patch = (self.behavior)(&snap, &body)?;
-        patch.cursor_advance = Some(CursorMove {
-            rel: self.cursor_rel,
-            retract: if pos > 0 { Some(cursor_tuple(self.entity, pos)) } else { None },
-            assert: cursor_tuple(self.entity, pos + 1),
-        });
-        Ok(Some(Prepared { seq: pos, patch }))
+        match self.patch_at(store, pos, store.current())? {
+            Some(patch) => Ok(Some(Prepared { seq: pos, patch })),
+            None => Ok(None),
+        }
     }
 
     /// Process at most one pending message, committing atomically under
