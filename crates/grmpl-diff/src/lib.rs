@@ -6,6 +6,7 @@
 //! depends only on `grmpl-core`'s `TraceStore` trait — never on fjall.
 
 pub mod multiset;
+pub mod parse_stream;
 pub mod query;
 pub mod recursive;
 pub mod snapshot;
@@ -13,6 +14,7 @@ pub mod watch;
 pub mod window;
 
 pub use multiset::Multiset;
+pub use parse_stream::{ParseStream, WindowParser};
 pub use query::{
     eval_delta, eval_snapshot, eval_snapshot_with, eval_with, eval_with_recur, Agg, Arrangements,
     MapFn, Pred, Query,
