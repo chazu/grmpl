@@ -27,8 +27,10 @@
 
 pub mod ast;
 pub mod compile;
+pub mod ir;
 pub mod lexer;
 pub mod parser;
 
 pub use compile::{NamedAgg, Program};
+pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};
 pub use parser::parse;
