@@ -15,6 +15,7 @@ use grmpl_core::{
     Authority, DomainId, EditionStore, Entity, Fact, Message, Patch, RelId, Result, Scope,
     TraceStore, Tuple, Value,
 };
+use grmpl_core::NoSchemas;
 use grmpl_diff::{Query, Snapshot};
 use grmpl_pattern::{Bindings, Form, Pattern, Rule, VarId};
 use grmpl_proc::{enqueue, Behavior, CommitOutcome, Process};
@@ -197,7 +198,7 @@ fn take_lamp_end_to_end_with_observer() {
 
     // The player process runs it: parse → resolve → commit.
     let player = player_process(PLAYER);
-    let outcome = player.step(&store).unwrap();
+    let outcome = player.step(&store, &NoSchemas).unwrap();
     assert!(matches!(outcome, Some(CommitOutcome::Committed(_))), "the take committed");
 
     let cur = store.current();
@@ -241,7 +242,7 @@ fn taking_something_not_present_replies_without_changing_the_world() {
     .unwrap();
 
     let player = player_process(PLAYER);
-    player.step(&store).unwrap();
+    player.step(&store, &NoSchemas).unwrap();
 
     let cur = store.current();
     // The lamp is untouched; a "don't see that" reply was told.

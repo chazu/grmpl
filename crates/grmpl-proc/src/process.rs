@@ -11,7 +11,8 @@
 //! * crash *after* commit → the cursor already advanced, the message is skipped.
 
 use grmpl_core::{
-    Authority, CursorMove, Edition, Entity, Fact, Patch, Result, RelId, TraceStore, Tuple, Value,
+    Authority, CursorMove, Edition, Entity, Fact, Patch, Result, RelId, SchemaCatalog, TraceStore,
+    Tuple, Value,
 };
 use grmpl_diff::Snapshot;
 
@@ -93,20 +94,32 @@ impl Process {
         Ok(Some(Prepared { seq: pos, patch }))
     }
 
-    /// Process at most one pending message, committing atomically. `None` if
-    /// idle; `Some(outcome)` otherwise (a `Rejected` outcome leaves the cursor
-    /// unmoved so the message is retried).
-    pub fn step(&self, store: &dyn TraceStore) -> Result<Option<CommitOutcome>> {
+    /// Process at most one pending message, committing atomically under
+    /// `schemas` (commit-boundary arity/type enforcement — pass
+    /// [`grmpl_core::NoSchemas`] to opt out). `None` if idle; `Some(outcome)`
+    /// otherwise (a `Rejected` outcome leaves the cursor unmoved so the message
+    /// is retried).
+    pub fn step(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+    ) -> Result<Option<CommitOutcome>> {
         match self.prepare(store)? {
-            Some(prepared) => Ok(Some(commit_patch(store, &prepared.patch, &self.authority)?)),
+            Some(prepared) => {
+                Ok(Some(commit_patch(store, schemas, &prepared.patch, &self.authority)?))
+            }
             None => Ok(None),
         }
     }
 
     /// Drain the inbox until idle. Returns how many messages were committed.
-    pub fn run_to_idle(&self, store: &dyn TraceStore) -> Result<usize> {
+    pub fn run_to_idle(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+    ) -> Result<usize> {
         let mut n = 0;
-        while let Some(outcome) = self.step(store)? {
+        while let Some(outcome) = self.step(store, schemas)? {
             match outcome {
                 CommitOutcome::Committed(_) => n += 1,
                 // A rejected message cannot make progress on this pass; stop to

@@ -8,6 +8,6 @@ pub mod commit;
 pub mod domain;
 pub mod process;
 
-pub use commit::{commit_patch, CommitOutcome};
+pub use commit::{check_schema, commit_patch, CommitOutcome};
 pub use domain::{outbox_len, Domain};
 pub use process::{enqueue, inbox_fact, Behavior, Prepared, Process};

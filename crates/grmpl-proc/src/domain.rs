@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 
 use grmpl_core::{
-    Authority, Diff, DomainId, Edition, Error, Message, Patch, RelId, Result, TraceStore, Tuple,
-    Transport, Value,
+    Authority, Diff, DomainId, Edition, Error, Message, Patch, RelId, Result, SchemaCatalog,
+    TraceStore, Tuple, Transport, Value,
 };
 
-use crate::commit::CommitOutcome;
+use crate::commit::{check_schema, CommitOutcome};
 
 /// Envelope on the wire: `seq(i64, BE) || encoded_message`.
 fn encode_envelope(seq: i64, m: &Message) -> Vec<u8> {
@@ -83,7 +83,14 @@ impl<'a> Domain<'a> {
     }
 
     /// Commit a patch, routing remote emits into the durable outbox atomically.
-    pub fn commit(&self, patch: &Patch, authority: &Authority) -> Result<CommitOutcome> {
+    /// Enforces `schemas` at the commit boundary (pass [`grmpl_core::NoSchemas`]
+    /// to opt out of arity/type checking).
+    pub fn commit(
+        &self,
+        patch: &Patch,
+        authority: &Authority,
+        schemas: &dyn SchemaCatalog,
+    ) -> Result<CommitOutcome> {
         // Authority law: world writes must be owned.
         for f in patch.asserts.iter().chain(patch.retracts.iter()) {
             if !authority.permits(f) {
@@ -93,6 +100,9 @@ impl<'a> Domain<'a> {
                 )));
             }
         }
+
+        // Schema law (P1): world writes must conform to their registered schema.
+        check_schema(schemas, patch.asserts.iter().chain(patch.retracts.iter()))?;
 
         let preconditions: Vec<(RelId, Tuple)> =
             patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();

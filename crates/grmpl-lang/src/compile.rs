@@ -1,6 +1,11 @@
 //! Lowering the AST to core constructors.
 //!
-//! * `rel`  → a relation schema (name → `RelId` + columns).
+//! * `rel`  → a relation schema (name → `RelId` + **named, typed columns**).
+//!   The optional `col: Ty` annotation lowers to a `grmpl_core::Ty`; an
+//!   unannotated column defaults to the permissive `Ty::Any`. A compiled
+//!   program can hand each relation's `Schema` to a durable `SchemaCatalog`
+//!   (see [`Program::register_schemas`]) so the commit boundary enforces
+//!   arity/type. Column *names* drive resolution in `view`/`on`.
 //! * `view` → a `Query`: the conjunctive body is planned left-to-right, joining
 //!   each atom to the accumulated relation on their shared variables, then
 //!   projecting the `yield` variables and de-duplicating. Literals and repeated
@@ -12,7 +17,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grmpl_core::{Entity, Error, Fact, Message, Patch, Result as CoreResult, RelId, Tuple, Value};
+use grmpl_core::{
+    Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, Result as CoreResult, RelId,
+    Schema, SchemaCatalog, Tuple, Ty, Value,
+};
 use grmpl_diff::{Query, Snapshot};
 use grmpl_pattern::{Bindings, Form, Pattern, Rule, VarId};
 use grmpl_proc::Behavior;
@@ -22,7 +30,13 @@ use crate::parser::parse;
 
 struct RelInfo {
     id: RelId,
-    arity: usize,
+    columns: Vec<Column>,
+}
+
+impl RelInfo {
+    fn arity(&self) -> usize {
+        self.columns.len()
+    }
 }
 
 struct ViewDef {
@@ -61,7 +75,27 @@ impl Program {
                     if rels.contains_key(&name) {
                         return Err(format!("relation `{name}` declared twice"));
                     }
-                    rels.insert(name, RelInfo { id: RelId(next_id), arity: cols.len() });
+                    let mut columns = Vec::with_capacity(cols.len());
+                    for c in &cols {
+                        if columns.iter().any(|col: &Column| col.name == c.name) {
+                            return Err(format!(
+                                "relation `{name}` has a duplicate column `{}`",
+                                c.name
+                            ));
+                        }
+                        let ty = match &c.ty {
+                            None => Ty::Any,
+                            Some(t) => Ty::parse(t).ok_or_else(|| {
+                                format!(
+                                    "relation `{name}` column `{}` has unknown type `{t}` \
+                                     (expected Ent, Int, Text, Bool, Tuple, or Any)",
+                                    c.name
+                                )
+                            })?,
+                        };
+                        columns.push(Column::new(c.name.clone(), ty));
+                    }
+                    rels.insert(name, RelInfo { id: RelId(next_id), columns });
                     next_id += 1;
                 }
                 Decl::View { name, params, atoms, yields } => {
@@ -88,6 +122,46 @@ impl Program {
         self.rels.get(name).map(|r| r.id)
     }
 
+    /// The declared, named, typed columns of a relation, in order.
+    pub fn rel_columns(&self, name: &str) -> Option<&[Column]> {
+        self.rels.get(name).map(|r| r.columns.as_slice())
+    }
+
+    /// The `Schema` (named, typed columns) of a declared relation.
+    pub fn schema(&self, name: &str) -> Option<Schema> {
+        self.rels.get(name).map(|r| Schema::new(r.columns.clone()))
+    }
+
+    /// Named-column resolution: the tuple position of column `col` in relation
+    /// `rel`, or `None` if either is undeclared. This is the primitive that
+    /// turns a column *name* into an index for `view`/`on`.
+    pub fn resolve_column(&self, rel: &str, col: &str) -> Option<usize> {
+        self.rels.get(rel).and_then(|r| r.columns.iter().position(|c| c.name == col))
+    }
+
+    /// Register every declared relation into the durable registry: bind its
+    /// `name → RelId` in `catalog` and record its `Schema` in `schemas`,
+    /// effective as-of `at`. After this, the commit boundary enforces each
+    /// relation's arity/types. Relations are registered in a stable order (by
+    /// id) so the effect is deterministic.
+    ///
+    /// Id allocation still uses the compile-time `rel_base`; *consuming* the
+    /// catalog to recover stable ids across reopens is a follow-on (TKT-90).
+    pub fn register_schemas(
+        &self,
+        catalog: &dyn Catalog,
+        schemas: &dyn SchemaCatalog,
+        at: Edition,
+    ) -> CoreResult<()> {
+        let mut rels: Vec<(&String, &RelInfo)> = self.rels.iter().collect();
+        rels.sort_by_key(|(_, r)| r.id.0);
+        for (name, info) in rels {
+            catalog.register(name, info.id)?;
+            schemas.put_schema(info.id, &Schema::new(info.columns.clone()), at)?;
+        }
+        Ok(())
+    }
+
     /// Instantiate a view as a `Query`, binding its parameters to `args`.
     pub fn view(&self, name: &str, args: &[Value]) -> Result<Query, String> {
         let v = self.views.get(name).ok_or_else(|| format!("no view `{name}`"))?;
@@ -110,11 +184,11 @@ impl Program {
                 .rels
                 .get(&atom.rel)
                 .ok_or_else(|| format!("view `{name}` uses undeclared relation `{}`", atom.rel))?;
-            if atom.args.len() != info.arity {
+            if atom.args.len() != info.arity() {
                 return Err(format!(
                     "`{}` has arity {} but was used with {} args",
                     atom.rel,
-                    info.arity,
+                    info.arity(),
                     atom.args.len()
                 ));
             }
@@ -153,7 +227,7 @@ impl Program {
                         varcol.insert(vn.clone(), *pos);
                     }
                     acc = Some(q);
-                    width = info.arity;
+                    width = info.arity();
                 }
                 Some(prev) => {
                     let mut lk = Vec::new();
@@ -168,7 +242,7 @@ impl Program {
                     for (vn, apos) in &local_first {
                         varcol.entry(vn.clone()).or_insert(width + *apos);
                     }
-                    width += info.arity;
+                    width += info.arity();
                 }
             }
         }

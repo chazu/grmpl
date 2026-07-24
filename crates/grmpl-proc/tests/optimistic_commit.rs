@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use grmpl_core::{
     Authority, DomainId, Edition, EditionStore, Entity, Fact, Patch, Scope, TraceStore, Tuple, Value,
 };
+use grmpl_core::NoSchemas;
 use grmpl_proc::{commit_patch, CommitOutcome};
 use grmpl_store::FjallStore;
 
@@ -51,7 +52,7 @@ fn concurrent_takers_exactly_one_wins() {
             let auth = &auth;
             let winners = &winners;
             s.spawn(move || {
-                if let CommitOutcome::Committed(_) = commit_patch(store, &take_lamp(p), auth).unwrap() {
+                if let CommitOutcome::Committed(_) = commit_patch(store, &NoSchemas, &take_lamp(p), auth).unwrap() {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
             });
@@ -88,15 +89,15 @@ fn loser_is_rejected_and_retry_has_no_effect() {
     let auth = world_authority();
 
     // Both built from edition 1. First wins.
-    let out1 = commit_patch(&store, &take_lamp(1), &auth).unwrap();
+    let out1 = commit_patch(&store, &NoSchemas, &take_lamp(1), &auth).unwrap();
     assert_eq!(out1, CommitOutcome::Committed(Edition(2)));
 
     // Second's precondition (lamp in room) no longer holds → no effect.
-    let out2 = commit_patch(&store, &take_lamp(2), &auth).unwrap();
+    let out2 = commit_patch(&store, &NoSchemas, &take_lamp(2), &auth).unwrap();
     assert_eq!(out2, CommitOutcome::Rejected);
 
     // A naive retry of the same patch still fails — the world moved on.
-    let retry = commit_patch(&store, &take_lamp(2), &auth).unwrap();
+    let retry = commit_patch(&store, &NoSchemas, &take_lamp(2), &auth).unwrap();
     assert_eq!(retry, CommitOutcome::Rejected);
 
     // Player 1 holds the lamp; player 2 never did.
@@ -113,6 +114,6 @@ fn write_outside_authority_is_rejected() {
     // Authority owns only HELD, not LOCATED.
     let auth = Authority::new(DomainId(1), vec![Scope::whole(HELD)]);
     let patch = Patch::new().retract(located(LAMP, ROOM)).assert(held(1, LAMP));
-    let err = commit_patch(&store, &patch, &auth).unwrap_err();
+    let err = commit_patch(&store, &NoSchemas, &patch, &auth).unwrap_err();
     assert!(matches!(err, grmpl_core::Error::Authority(_)));
 }

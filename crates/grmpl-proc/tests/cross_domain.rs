@@ -9,6 +9,7 @@ use grmpl_core::{
     Authority, DomainId, EditionStore, Entity, Fact, Message, Patch, RelId, Scope, TraceStore,
     Tuple, Value,
 };
+use grmpl_core::NoSchemas;
 use grmpl_proc::{outbox_len, Domain};
 use grmpl_store::FjallStore;
 use grmpl_transport::InProcessNet;
@@ -70,7 +71,7 @@ fn remote_emit_is_outboxed_shipped_and_applied_once() {
     let db = domain_b(&store_b, &tx_b);
 
     // A commits: world change is local, the emit is routed to B's outbox.
-    da.commit(&wave_to_b(), &a_authority()).unwrap();
+    da.commit(&wave_to_b(), &a_authority(), &NoSchemas).unwrap();
 
     // The message is NOT yet in B; it sits in A's durable outbox.
     assert!(store_b.read_at(B_INBOX, store_b.current()).unwrap().is_empty());
@@ -127,8 +128,8 @@ fn two_remote_emits_get_distinct_seqs() {
     let db = domain_b(&store_b, &tx_b);
 
     // Two separate commits, each emitting to B.
-    da.commit(&wave_to_b(), &a_authority()).unwrap();
-    da.commit(&wave_to_b(), &a_authority()).unwrap();
+    da.commit(&wave_to_b(), &a_authority(), &NoSchemas).unwrap();
+    da.commit(&wave_to_b(), &a_authority(), &NoSchemas).unwrap();
     assert_eq!(outbox_len(&store_a, A_OUTBOX, store_a.current()).unwrap(), 2);
 
     da.flush_outbox().unwrap();

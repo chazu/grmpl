@@ -7,6 +7,7 @@ use grmpl_core::{
     Authority, DomainId, EditionStore, Entity, Fact, Patch, RelId, Result, Scope, TraceStore,
     Tuple, Value,
 };
+use grmpl_core::NoSchemas;
 use grmpl_diff::Snapshot;
 use grmpl_proc::{enqueue, Behavior, CommitOutcome, Process};
 use grmpl_store::FjallStore;
@@ -75,7 +76,7 @@ fn crash_after_commit_processes_each_message_exactly_once() {
         let proc = make_process(tally_behavior());
 
         // Process exactly one message, then "crash" (drop the store).
-        let out = proc.step(&store).unwrap();
+        let out = proc.step(&store, &NoSchemas).unwrap();
         assert!(matches!(out, Some(CommitOutcome::Committed(_))));
         assert_eq!(proc.position(&store).unwrap(), 1);
     }
@@ -84,13 +85,13 @@ fn crash_after_commit_processes_each_message_exactly_once() {
     // not reprocessed; messages 1 and 2 complete.
     let store = FjallStore::open(dir.path()).unwrap();
     let proc = make_process(tally_behavior());
-    proc.run_to_idle(&store).unwrap();
+    proc.run_to_idle(&store, &NoSchemas).unwrap();
 
     assert_eq!(receipts(&store), expected_receipts());
     assert_eq!(proc.position(&store).unwrap(), 3);
 
     // Re-draining is a no-op (idle) — no duplicates.
-    assert_eq!(proc.run_to_idle(&store).unwrap(), 0);
+    assert_eq!(proc.run_to_idle(&store, &NoSchemas).unwrap(), 0);
     assert_eq!(receipts(&store), expected_receipts());
 }
 
@@ -113,7 +114,7 @@ fn crash_before_commit_loses_nothing_and_duplicates_nothing() {
     // inbox drains, each message recorded exactly once.
     let store = FjallStore::open(dir.path()).unwrap();
     let proc = make_process(tally_behavior());
-    proc.run_to_idle(&store).unwrap();
+    proc.run_to_idle(&store, &NoSchemas).unwrap();
 
     assert_eq!(receipts(&store), expected_receipts());
     assert_eq!(proc.position(&store).unwrap(), 3);
@@ -133,6 +134,6 @@ fn behavior_writing_outside_authority_is_rejected() {
         cursor_rel: CURSOR,
         behavior: tally_behavior(),
     };
-    let err = proc.step(&store).unwrap_err();
+    let err = proc.step(&store, &NoSchemas).unwrap_err();
     assert!(matches!(err, grmpl_core::Error::Authority(_)));
 }

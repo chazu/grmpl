@@ -10,6 +10,7 @@ pub enum Token {
     LBrace,
     RBrace,
     Comma,
+    Colon, // :
     Arrow, // ->
     Eq,    // =
     Tilde, // ~
@@ -33,6 +34,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             '{' => { out.push(Token::LBrace); i += 1; }
             '}' => { out.push(Token::RBrace); i += 1; }
             ',' => { out.push(Token::Comma); i += 1; }
+            ':' => { out.push(Token::Colon); i += 1; }
             '=' => { out.push(Token::Eq); i += 1; }
             '~' => { out.push(Token::Tilde); i += 1; }
             '-' if i + 1 < bytes.len() && bytes[i + 1] == '>' => {

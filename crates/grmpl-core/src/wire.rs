@@ -18,11 +18,19 @@
 //!
 //! * `message = version(1) || inbox(u32, BE) || encoded_tuple(body)`
 //! * `encoded_tuple = arity(u32, BE) || value*`
+//! * `schema  = version(1) || ncols(u32, BE) || column*`
+//!   where `column = ty_tag(1) || namelen(u32, BE) || name_utf8`
+//!
+//! The schema framing is a P1 addition; it shares the same [`FORMAT_VERSION`]
+//! byte and (being greenfield — no schema bytes predate it) starts at v1. It
+//! uses a *separate* `Ty` tag namespace from the value tags below; changing
+//! either the value tags or the schema `Ty` tags bumps [`FORMAT_VERSION`].
 
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::patch::Message;
+use crate::schema::{Column, Schema, Ty};
 use crate::value::{Entity, RelId, Tuple, Value};
 
 /// The wire/on-disk format version. Prefixes every serialized artifact. Bump
@@ -35,6 +43,73 @@ const TAG_INT: u8 = 2;
 const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TUPLE: u8 = 5;
+
+// Column-type tags — a *separate* namespace from the value tags above, used
+// only inside the schema framing. Bump FORMAT_VERSION if these change.
+const TY_ENT: u8 = 1;
+const TY_INT: u8 = 2;
+const TY_TEXT: u8 = 3;
+const TY_BOOL: u8 = 4;
+const TY_TUPLE: u8 = 5;
+const TY_ANY: u8 = 6;
+
+fn ty_tag(t: Ty) -> u8 {
+    match t {
+        Ty::Ent => TY_ENT,
+        Ty::Int => TY_INT,
+        Ty::Text => TY_TEXT,
+        Ty::Bool => TY_BOOL,
+        Ty::Tuple => TY_TUPLE,
+        Ty::Any => TY_ANY,
+    }
+}
+
+fn ty_from_tag(tag: u8) -> Result<Ty> {
+    Ok(match tag {
+        TY_ENT => Ty::Ent,
+        TY_INT => Ty::Int,
+        TY_TEXT => Ty::Text,
+        TY_BOOL => Ty::Bool,
+        TY_TUPLE => Ty::Tuple,
+        TY_ANY => Ty::Any,
+        other => return Err(Error::Codec(format!("unknown column-type tag {other}"))),
+    })
+}
+
+/// `schema = version(1) || ncols(u32, BE) || [ ty_tag(1) || namelen(u32, BE) || name ]*`.
+pub fn encode_schema(schema: &Schema) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_version(&mut out);
+    out.extend_from_slice(&(schema.columns.len() as u32).to_be_bytes());
+    for col in &schema.columns {
+        out.push(ty_tag(col.ty));
+        out.extend_from_slice(&(col.name.len() as u32).to_be_bytes());
+        out.extend_from_slice(col.name.as_bytes());
+    }
+    out
+}
+
+pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
+    let mut pos = read_version(bytes)?;
+    let ncols = read_u32(bytes, &mut pos)? as usize;
+    let mut columns = Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        let tag = *bytes.get(pos).ok_or_else(|| Error::Codec("unexpected end (ty tag)".into()))?;
+        pos += 1;
+        let ty = ty_from_tag(tag)?;
+        let len = read_u32(bytes, &mut pos)? as usize;
+        let end = pos + len;
+        let slice =
+            bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (column name)".into()))?;
+        let name = std::str::from_utf8(slice).map_err(|e| Error::Codec(e.to_string()))?.to_string();
+        pos = end;
+        columns.push(Column { name, ty });
+    }
+    if pos != bytes.len() {
+        return Err(Error::Codec("trailing bytes after schema".into()));
+    }
+    Ok(Schema::new(columns))
+}
 
 /// Push the leading [`FORMAT_VERSION`] byte. Every encoder starts here.
 pub fn push_version(out: &mut Vec<u8>) {
@@ -202,5 +277,33 @@ mod tests {
     #[test]
     fn read_version_rejects_empty() {
         assert!(read_version(&[]).is_err());
+    }
+
+    #[test]
+    fn schema_roundtrips_and_is_version_prefixed() {
+        let s = Schema::new(vec![
+            Column::new("thing", Ty::Ent),
+            Column::new("since", Ty::Int),
+            Column::new("label", Ty::Text),
+            Column::new("flag", Ty::Bool),
+            Column::new("body", Ty::Tuple),
+            Column::new("free", Ty::Any),
+        ]);
+        let bytes = encode_schema(&s);
+        assert_eq!(bytes[0], FORMAT_VERSION, "schema must lead with the version byte");
+        assert_eq!(decode_schema(&bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn empty_schema_roundtrips() {
+        let s = Schema::new(vec![]);
+        assert_eq!(decode_schema(&encode_schema(&s)).unwrap(), s);
+    }
+
+    #[test]
+    fn decode_schema_rejects_unknown_version() {
+        let mut bytes = encode_schema(&Schema::new(vec![Column::new("a", Ty::Int)]));
+        bytes[0] = FORMAT_VERSION.wrapping_add(1);
+        assert!(decode_schema(&bytes).is_err());
     }
 }

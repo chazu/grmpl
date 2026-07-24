@@ -8,6 +8,7 @@ use std::sync::Arc;
 use grmpl_core::{
     Authority, DomainId, EditionStore, Entity, RelId, Scope, TraceStore, Tuple, Value,
 };
+use grmpl_core::NoSchemas;
 use grmpl_lang::Program;
 use grmpl_proc::{enqueue, CommitOutcome, Process};
 use grmpl_store::FjallStore;
@@ -111,7 +112,7 @@ fn take_lamp_defined_entirely_in_text() {
     enqueue(&store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("lamp")])).unwrap();
 
     let player = player_process(&w);
-    let outcome = player.step(&store).unwrap();
+    let outcome = player.step(&store, &NoSchemas).unwrap();
     assert!(matches!(outcome, Some(CommitOutcome::Committed(_))));
 
     let cur = store.current();
@@ -134,7 +135,7 @@ fn taking_absent_thing_makes_no_change() {
     enqueue(&store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("sword")])).unwrap();
 
     let player = player_process(&w);
-    player.step(&store).unwrap();
+    player.step(&store, &NoSchemas).unwrap();
 
     let cur = store.current();
     // The lamp is untouched; nothing was held or told (resolve found nothing).
@@ -146,5 +147,5 @@ fn taking_absent_thing_makes_no_change() {
     assert!(store.read_at(w.held, cur).unwrap().is_empty());
     assert!(store.read_at(w.tell, cur).unwrap().is_empty());
     // But the message was consumed (cursor advanced), so re-stepping is idle.
-    assert!(player.step(&store).unwrap().is_none());
+    assert!(player.step(&store, &NoSchemas).unwrap().is_none());
 }

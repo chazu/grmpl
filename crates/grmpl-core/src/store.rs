@@ -11,6 +11,7 @@
 //! edition is allocated but not written).
 
 use crate::error::Result;
+use crate::schema::Schema;
 use crate::time::{Diff, Edition, Update};
 use crate::value::{RelId, Tuple};
 
@@ -76,4 +77,55 @@ pub trait Catalog: Send + Sync {
 
     /// The whole catalog, sorted by name — for reload and inspection.
     fn entries(&self) -> Result<Vec<(String, RelId)>>;
+}
+
+/// A durable registry of relation [`Schema`]s, keyed by [`RelId`] and
+/// **versioned by the edition** at which each version took effect.
+///
+/// **Store-API boundary decision** (mirrors [`Catalog`]). The *schema types*
+/// and the *evolution invariant* (additive-only, [`Schema::is_additive_over`])
+/// are core; the durable map is a store concern — `grmpl-store` persists each
+/// version in its `__meta` keyspace beside the catalog, under a
+/// `sch:{rel}:{edition}` key. Kept separate from [`TraceStore`] and [`Catalog`]
+/// because schema history is orthogonal to both the tuple trace and the
+/// name→id binding.
+///
+/// **Evolution law.** A relation's schema may only grow additively over
+/// editions: [`put_schema`](Self::put_schema) accepts a first schema, an
+/// idempotent re-put of the current one, or a strict additive extension at a
+/// *later* edition, and rejects any non-additive change ([`Error::Schema`]).
+/// Recording the introducing edition is what lets [`schema_at`](Self::schema_at)
+/// answer as-of queries (needed before P6 exposes as-of reads).
+pub trait SchemaCatalog: Send + Sync {
+    /// Record the schema for `rel`, effective as-of `at`. The first call binds
+    /// the initial schema. A later call must supply either the identical schema
+    /// (idempotent — no new version) or a strict additive extension of the
+    /// current one at an edition greater than the current version's; anything
+    /// else errors ([`Error::Schema`]).
+    fn put_schema(&self, rel: RelId, schema: &Schema, at: Edition) -> Result<()>;
+
+    /// The latest (highest-edition) schema for `rel`, or `None` if unregistered.
+    fn schema(&self, rel: RelId) -> Result<Option<Schema>>;
+
+    /// The schema in effect as-of `at`: the newest version whose introducing
+    /// edition is `≤ at`, or `None` if `rel` had no schema by then.
+    fn schema_at(&self, rel: RelId, at: Edition) -> Result<Option<Schema>>;
+}
+
+/// A no-op [`SchemaCatalog`] for callers that have no schema registry — every
+/// relation reads as unregistered, so commit-boundary enforcement is a pass
+/// (schemas are opt-in). Registering into it is an error: it has nowhere to
+/// persist.
+pub struct NoSchemas;
+
+impl SchemaCatalog for NoSchemas {
+    fn put_schema(&self, _rel: RelId, _schema: &Schema, _at: Edition) -> Result<()> {
+        Err(crate::error::Error::Store("no schema registry available".into()))
+    }
+    fn schema(&self, _rel: RelId) -> Result<Option<Schema>> {
+        Ok(None)
+    }
+    fn schema_at(&self, _rel: RelId, _at: Edition) -> Result<Option<Schema>> {
+        Ok(None)
+    }
 }
