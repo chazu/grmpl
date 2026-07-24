@@ -128,4 +128,21 @@ pub enum Decl {
         stmt_arms: Vec<Arm>,
         word_arms: Vec<crate::concat::ConcatArm>,
     },
+    /// An `on watch` reactive handler (P5): a maintained `view`'s signed deltas
+    /// are pumped, as messages, into a target process's inbox. This is the
+    /// *declarative* half — it names the watched `view` and the three relations
+    /// the pump touches (the target `inbox`, the durable watch-`cursor`, and the
+    /// shared `seqs` counter). The runtime identities the source cannot name —
+    /// the cursor-key/target entities, the view arguments, and the pump authority
+    /// — are supplied when the declaration is lowered to a `grmpl_proc::OnWatch`
+    /// (`compile.rs`). `including_current` is the opt-in that lowers to
+    /// `install_including_current` (deliver the current view once) rather than the
+    /// skip-initial default `install`.
+    OnWatch {
+        view: String,
+        inbox: String,
+        cursor: String,
+        seqs: String,
+        including_current: bool,
+    },
 }
