@@ -167,7 +167,23 @@ pub fn infer_handler_effects(prog: &Program, inbox: &str) -> Result<EffectRow, E
                     row.sends.insert(rel_id(prog, rel)?);
                 }
                 // Pushers, shufflers, reads, and preconditions: no world effect.
-                _ => {}
+                // Enumerated exhaustively (no wildcard) so a future write- or
+                // send-carrying `Word` variant forces a recompile here rather
+                // than being silently omitted from the Authority effect row.
+                Word::SelfEntity
+                | Word::Lit(_)
+                | Word::Dup
+                | Word::Drop
+                | Word::Swap
+                | Word::Over
+                | Word::Rot
+                | Word::Nip
+                | Word::Tuck
+                | Word::TwoDup
+                | Word::TwoDrop
+                | Word::Resolve { .. }
+                | Word::Find { .. }
+                | Word::Expect(_) => {}
             }
         }
     }
