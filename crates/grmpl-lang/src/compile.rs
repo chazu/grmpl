@@ -161,6 +161,13 @@ impl Program {
         self.views.get(name).map(|v| v.yields.as_slice())
     }
 
+    /// The arms of the `on` handler bound to `inbox`, or `None` if none is
+    /// declared. Exposed so P8b effect-row inference can walk a handler's write
+    /// statements (`assert`/`retract`/`emit`) without re-parsing the source.
+    pub fn on_arms(&self, inbox: &str) -> Option<&[Arm]> {
+        self.ons.get(inbox).map(|o| o.arms.as_slice())
+    }
+
     /// The `RelId` assigned to a declared relation.
     pub fn rel_id(&self, name: &str) -> Option<RelId> {
         self.rels.get(name).map(|r| r.id)
