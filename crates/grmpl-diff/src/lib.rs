@@ -20,4 +20,6 @@ pub use query::{
 pub use recursive::{IncrementalFixpoint, Maintenance};
 pub use snapshot::Snapshot;
 pub use watch::DeltaStream;
-pub use window::{consolidate_window, ConsolidatedWindow};
+pub use window::{
+    consolidate_events, consolidate_window, sliding, tumbling, window, ConsolidatedWindow, Window,
+};

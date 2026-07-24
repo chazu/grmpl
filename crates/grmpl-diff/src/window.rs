@@ -1,15 +1,34 @@
-//! State-mode window matching (P9c design §4a, §8.2) — the reduction from a
-//! signed, unbounded delta stream to the finite, ordered `&[Value]` structure
-//! the v1 pattern engine already consumes.
+//! The **windowing layer** (P9c design §3, §5, §8.3) — the reduction from a
+//! signed, unbounded delta stream to the finite, ordered structures the v1
+//! pattern engine already consumes.
 //!
 //! A pattern **never** runs over the raw live stream; it runs over a *window*, a
-//! finite, edition-bounded slice of the trace (§3). State mode is the "match the
-//! window's net contents" reading of such a window: consolidate first — fold
-//! `Σ diff` per tuple, drop zeros, sort — and hand the survivors to the existing
-//! slice engine. `+t` then `−t` **cancels before matching**, so the pattern never
-//! sees `t`. Retraction is absorbed by *arithmetic, upstream of the algebra*;
-//! nothing in `grmpl-pattern` learns about signs, and state mode therefore needs
-//! no new `MatchInput` instance at all.
+//! finite, edition-bounded slice of the trace (§3). Windowing is precisely that
+//! reduction, and it is what recovers termination for free: inside a fixed
+//! window the progress measure is the remaining delta count, finite by
+//! construction. Liveness (the poll/advance loop) stays outside the algebra.
+//!
+//! This module owns both halves:
+//!
+//! * **The window grammar** ([`Window`], [`tumbling`], [`sliding`]) — pure
+//!   edition arithmetic over the half-open interval `(from, to]`, and the two
+//!   materializations a window admits: an **event slice**
+//!   ([`Window::events`], raw [`Update`]s in commit order, event mode §4b) or a
+//!   **consolidated tuple-set** ([`Window::consolidate`], state mode §4a).
+//! * **State-mode consolidation** ([`consolidate_window`],
+//!   [`ConsolidatedWindow`]) — the snapshot-anchored net contents, described
+//!   below.
+//!
+//! State mode is the "match the window's net contents" reading of a window:
+//! consolidate first — fold `Σ diff` per tuple, drop zeros, sort — and hand the
+//! survivors to the existing slice engine. `+t` then `−t` **cancels before
+//! matching**, so the pattern never sees `t`. Retraction is absorbed by
+//! *arithmetic, upstream of the algebra*; nothing in `grmpl-pattern` learns
+//! about signs, and state mode therefore needs no new `MatchInput` instance at
+//! all. Event mode instead *reifies* the sign into the matched value
+//! (`grmpl_pattern::{reify_delta, DeltaInput}`) — which is why this module hands
+//! back a plain `Vec<Update>` and never names the algebra: the bright line runs
+//! between them, and `grmpl-diff` depends only on the [`TraceStore`] **trait**.
 //!
 //! # Snapshot anchoring (the correctness trap)
 //!
@@ -43,12 +62,199 @@
 //!
 //! Both edition doors of the P6 watermark apply unchanged: `from` below the
 //! consolidation horizon is rejected by the store rather than answered from
-//! truncated history, inherited for free from `eval_delta`/`eval_snapshot`.
+//! truncated history, inherited for free from `eval_delta`/`eval_snapshot` and
+//! (for event mode) from `scan_updates` itself.
+//!
+//! # What is *not* here
+//!
+//! Windows are **edition-bounded only** (§5). Session windows (gap-based) and
+//! count windows (last N updates) are explicitly **deferred**: a count window
+//! needs a counter cursor over commit order, which `Update` does not carry.
+//! `iter`, the fixpoint sub-coordinate of `Time`, is not a window axis either —
+//! it is internal to `Iterate`.
 
-use grmpl_core::{Diff, Edition, Result, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, Error, RelId, Result, TraceStore, Tuple, Update, Value};
 
 use crate::multiset::{self, Multiset};
 use crate::query::{eval_delta, eval_snapshot, Query};
+
+/// An **edition-bounded window**: the half-open edition interval `(from, to]`,
+/// aligned exactly with [`TraceStore::scan_updates`] and [`eval_delta`] — no new
+/// primitive and no new ordering (design §5).
+///
+/// A window is a pure *value*: constructing one touches no store. It is the
+/// bound that makes matching legal at all (§3), and it materializes two ways:
+///
+/// * [`events`](Self::events) — the **event slice**: raw [`Update`]s of one
+///   relation in commit order `(edition, counter)`, ready for
+///   `grmpl_pattern::DeltaInput` (event mode, §4b).
+/// * [`consolidate`](Self::consolidate) — the **consolidated tuple-set**: the
+///   snapshot-anchored net contents of a query, ready for the `&[Value]` slice
+///   engine (state mode, §4a).
+///
+/// The two are *not* interchangeable readings of the same bytes: the event slice
+/// is what the window *did*, in order, signs included; the consolidated set is
+/// what the window *left*, anchored against the world at `from`. They agree
+/// exactly on the degenerate snapshot window `(Edition::ZERO, E]`, where the
+/// anchor is the empty world — see [`consolidate_events`].
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Window {
+    from: Edition,
+    to: Edition,
+}
+
+impl Window {
+    /// The window `(from, to]`. `from` must not exceed `to` — an inverted
+    /// interval is an ill-formed plan, not an empty one ([`Error::Query`]).
+    pub fn new(from: Edition, to: Edition) -> Result<Window> {
+        if from > to {
+            return Err(Error::Query(format!(
+                "window bounds inverted: from {} is after to {}",
+                from.0, to.0
+            )));
+        }
+        Ok(Window { from, to })
+    }
+
+    /// The exclusive lower bound (the anchor edition).
+    pub fn from(&self) -> Edition {
+        self.from
+    }
+
+    /// The inclusive upper bound.
+    pub fn to(&self) -> Edition {
+        self.to
+    }
+
+    /// How many editions the window spans (`to − from`); zero for an empty
+    /// window. This is the count of *editions in scope*, not of updates — a
+    /// single edition may carry any number of updates.
+    pub fn span(&self) -> u64 {
+        self.to.0 - self.from.0
+    }
+
+    /// The window covers no edition (`from == to`), so every materialization of
+    /// it is empty.
+    pub fn is_empty(&self) -> bool {
+        self.from == self.to
+    }
+
+    /// Is edition `e` in scope? `from < e ≤ to` — exclusive at the anchor,
+    /// inclusive at the far end, exactly as `scan_updates` reads it. This is the
+    /// membership predicate the tumbling-partition and sliding-coverage laws are
+    /// stated over.
+    pub fn contains(&self, e: Edition) -> bool {
+        self.from < e && e <= self.to
+    }
+
+    /// **Event-mode materialization** (§4b): `rel`'s raw updates whose edition
+    /// lies in the window, in **commit order** `(edition, counter)` — the exact
+    /// order they were written, guaranteed by the [`TraceStore::scan_updates`]
+    /// contract, so no scan order leaks into a match. Feed it to
+    /// `grmpl_pattern::DeltaInput`, which reifies each update's sign into the
+    /// matched value.
+    ///
+    /// Event mode is **per base relation** by construction: only raw updates
+    /// carry the per-edition commit order a log-structured match needs, and a
+    /// derived `Query`'s delta is a consolidated multiset with no order at all.
+    pub fn events(&self, store: &dyn TraceStore, rel: RelId) -> Result<Vec<Update>> {
+        store.scan_updates(rel, self.from, self.to)
+    }
+
+    /// **State-mode materialization** (§4a): the snapshot-anchored net contents
+    /// of `q` over this window. See [`consolidate_window`].
+    pub fn consolidate(&self, q: &Query, store: &dyn TraceStore) -> Result<ConsolidatedWindow> {
+        consolidate_window(q, store, self.from, self.to)
+    }
+}
+
+/// The window `(from, to]` — the free-function spelling of [`Window::new`],
+/// which is how the design writes it (`window(from, to)`, §8.3).
+pub fn window(from: Edition, to: Edition) -> Result<Window> {
+    Window::new(from, to)
+}
+
+/// **Tumbling** windows of `size` editions covering `(from, to]`: the disjoint
+/// consecutive sequence `(from, from+size]`, `(from+size, from+2·size]`, … with
+/// the last window clamped to `to` (design §5).
+///
+/// Every edition in `(from, to]` lies in **exactly one** window — no loss, no
+/// duplication, no overlap — so the windows partition the range and the union of
+/// their contents is the whole range's contents. An empty range yields no
+/// windows; `size` must be positive.
+pub fn tumbling(from: Edition, to: Edition, size: u64) -> Result<Vec<Window>> {
+    sliding(from, to, size, size)
+}
+
+/// **Sliding** windows of `size` editions advancing by `step`, covering
+/// `(from, to]`: window *k* is `(from + k·step, from + k·step + size]`, clamped
+/// at `to`, for every *k* whose anchor is still below `to` (design §5).
+///
+/// `step` must be positive and **must not exceed `size`**. `step < size` is the
+/// sliding case proper (consecutive windows overlap by `size − step` editions);
+/// `step == size` degenerates to [`tumbling`]. A `step > size` would leave
+/// editions in no window at all — a gap grammar, which is not one of the shapes
+/// §5 admits — so it is rejected as an ill-formed plan rather than silently
+/// dropping updates.
+///
+/// Because the tail windows are clamped, an update at edition `e` is in window
+/// *k* exactly when `from + k·step < e ≤ from + k·step + size`: clamping never
+/// changes membership, only where a window stops.
+pub fn sliding(from: Edition, to: Edition, size: u64, step: u64) -> Result<Vec<Window>> {
+    if size == 0 {
+        return Err(Error::Query("window size must be positive".into()));
+    }
+    if step == 0 {
+        return Err(Error::Query("window step must be positive".into()));
+    }
+    if step > size {
+        return Err(Error::Query(format!(
+            "sliding step {step} exceeds window size {size}: editions between windows would \
+             fall in no window (gap windows are not an edition-bounded window shape)"
+        )));
+    }
+    if from > to {
+        return Err(Error::Query(format!(
+            "window bounds inverted: from {} is after to {}",
+            from.0, to.0
+        )));
+    }
+    let mut out = Vec::new();
+    let mut anchor = from.0;
+    while anchor < to.0 {
+        // Saturating so a size or step near `u64::MAX` clamps to `to` instead of
+        // wrapping into an inverted window.
+        let end = anchor.saturating_add(size).min(to.0);
+        out.push(Window { from: Edition(anchor), to: Edition(end) });
+        match anchor.checked_add(step) {
+            Some(next) => anchor = next,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Fold an **event slice** into a consolidated, tuple-sorted, zero-free
+/// `Vec<(Tuple, Diff)>`: the window's own deltas summed per tuple.
+///
+/// This is the *unanchored* fold — "what the window did", the arithmetic §4a
+/// warns about taking for the window's contents. It equals the state-mode
+/// [`consolidate_window`] only where the anchor contributes nothing: on the
+/// snapshot window `(Edition::ZERO, E]`, or for tuples the world did not already
+/// hold at `from`. In general
+///
+/// ```text
+///   consolidate_window(rel, from, to)  =  strip_zeros( snapshot(rel, from) + consolidate_events(events) )
+/// ```
+///
+/// restricted to the touched tuples — which is exactly why state-mode windows
+/// are snapshot-anchored and this function is *not* the state-mode reading. It
+/// exists so the relation between the two materializations is expressible (and
+/// testable) rather than folklore.
+pub fn consolidate_events(updates: &[Update]) -> Vec<(Tuple, Diff)> {
+    let m = multiset::from_pairs(updates.iter().map(|u| (u.tuple.clone(), u.diff)));
+    multiset::to_sorted_vec(&m)
+}
 
 /// The snapshot-anchored net contents of one edition window: what a state-mode
 /// pattern match sees, and nothing else.
