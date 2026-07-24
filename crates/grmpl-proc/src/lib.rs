@@ -8,8 +8,10 @@ pub mod alloc;
 pub mod commit;
 pub mod domain;
 pub mod process;
+pub mod schedule;
 
 pub use alloc::Alloc;
 pub use commit::{check_schema, commit_patch, CommitOutcome};
 pub use domain::{outbox_len, Domain};
 pub use process::{enqueue, inbox_fact, Behavior, Prepared, Process};
+pub use schedule::{timer_row, ClockDriver, Scheduler, SeqAlloc};

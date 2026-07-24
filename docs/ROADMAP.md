@@ -218,12 +218,62 @@ websocket transport, reactive push of `watch` output to clients (P5).
 
 ---
 
+## P4 — Scheduling & simulation time (landed)
+
+A patch can schedule a future message, and simulation time and randomness enter
+the world only as committed data — so replay is exact (DESIGN.md §2.2: the three
+times stay separate; wall/simulation time ride as `Value`s, never as engine
+coordinates). Prerequisite for P10 replay.
+
+### Work
+
+* **`Patch.scheduled` → durable timer rows** (`grmpl-core::Scheduled`, folded in
+  `grmpl-proc::commit_patch` and `Domain::commit`). A scheduled entry lands as a
+  durable timer row in the *same atomic commit* as the patch's effects, subject
+  to the same Authority and Schema laws as any world write.
+* **Durable, race-safe per-key seq allocator** (`grmpl-proc::SeqAlloc`),
+  generalizing the P3 interim single-writer `Domain.outseq`. The counter advance
+  is folded into the committing patch *with a precondition on the present counter
+  row*, so two commits racing the same key resolve to exactly one winner and the
+  loser retries against the winner's value. (The one unguarded case — the very
+  first allocation of a key, when there is no row to precondition on — is seeded
+  once on an un-raced path with `SeqAlloc::seed`.)
+* **Atomic fire commit** (`grmpl-proc::Scheduler::fire_due`). Each due timer is
+  delivered by one `commit_if` **preconditioned on the timer row**: retract the
+  timer and append the inbox message (at an allocated seq) in one batch. The
+  timer-row precondition is the exactly-once guard — the first fire retracts the
+  row, so a racing driver or a post-crash retry is rejected, never duplicated.
+* **Wall-clock / randomness driver** (`grmpl-proc::ClockDriver`). The single
+  sanctioned home for nondeterminism: it samples the wall clock and randomness
+  and commits them as ordinary *data* rows `(seq, wall_ms, rand)`. Firing reads
+  `now` from the committed sample, and behaviors read time / random rolls from
+  the trace — so replaying the same samples reproduces the identical world.
+
+### Acceptance
+
+`crates/grmpl-proc/tests/schedule.rs`: schedule → fire delivers exactly once at
+the seeded seq and retracts the timer (M5 weight-1 witness); two patches racing
+the same timer row yield exactly one winner; the guarded `SeqAlloc` hands out
+contiguous unique seqs under a racing allocation; the clock driver records
+samples as data. A randomized-churn law oracle (24 seeds) schedules timers at
+random due times, advances a committed clock, fires after every sample, and
+checks the delivered inbox against an independent model *and* against a second
+replay run each round (exactly-once, due-ordered, contiguous seqs, deterministic
+replay).
+
+### Not in this phase
+
+Reactive push of fired messages to clients (P5); wiring the session layer's
+inbox-seq onto `SeqAlloc` (the generalization exists; the session swap is a
+follow-on); replay & forks over the recorded samples (P10).
+
+---
+
 ## Later phases
 
 Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
-* **P4 — Scheduling & simulation time.**
 * **P5 — Reactive handlers (`on watch`).**
 * **P6 — History:** as-of, retention, GC.
 * **P7 — Core IR** (CBPV split reified).

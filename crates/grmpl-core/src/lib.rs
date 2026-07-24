@@ -21,7 +21,7 @@ pub mod wire;
 pub use authority::{Authority, KeyRange, Scope};
 pub use error::{Error, Result};
 pub use fact::Fact;
-pub use patch::{CursorMove, Message, Patch};
+pub use patch::{CursorMove, Message, Patch, Scheduled};
 pub use schema::{Column, Schema, Ty};
 pub use store::{Catalog, EditionStore, NoSchemas, SchemaCatalog, TraceStore};
 pub use transport::Transport;
