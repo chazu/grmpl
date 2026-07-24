@@ -10,6 +10,7 @@ members = [
     "crates/grmpl-type",
     "crates/grmpl-transport",
     "crates/grmpl-session",
+    "crates/grmpl-bench",
 ]
 
 [workspace.package]
