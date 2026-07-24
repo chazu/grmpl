@@ -6,7 +6,7 @@
 //! Committing it is a computation (see `grmpl-proc`).
 
 use crate::fact::Fact;
-use crate::value::{RelId, Tuple};
+use crate::value::{Entity, RelId, Tuple};
 
 /// An outbound message: a body appended to a target inbox relation. In v1 the
 /// target is named by its inbox `RelId` directly (single authority domain); in
@@ -14,6 +14,29 @@ use crate::value::{RelId, Tuple};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Message {
     pub inbox: RelId,
+    pub body: Tuple,
+}
+
+/// A message scheduled for a future **simulation time** (DESIGN.md §2.2:
+/// simulation time is not an engine coordinate — it rides as a `Value`).
+///
+/// A scheduled entry lands, in the *same atomic commit* as the patch that
+/// carries it, as a durable row in the timer relation `timers`. A later
+/// scheduling driver fires it — exactly once, race-safe — when simulation time
+/// reaches `due`, appending `body` to `inbox` addressed to `target`
+/// (grmpl-proc `Scheduler`). Nothing here reads a clock: `due` is committed
+/// data, so replay reproduces the same firing (Replay law).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Scheduled {
+    /// The durable timer relation this entry is recorded into.
+    pub timers: RelId,
+    /// The simulation time at or after which the timer becomes due.
+    pub due: i64,
+    /// The inbox the fired message is appended to.
+    pub inbox: RelId,
+    /// The process the fired message is addressed to (inbox key).
+    pub target: Entity,
+    /// The fired message body.
     pub body: Tuple,
 }
 
@@ -36,6 +59,9 @@ pub struct Patch {
     pub asserts: Vec<Fact>,
     pub retracts: Vec<Fact>,
     pub emits: Vec<Message>,
+    /// Timers recorded durably (as timer rows) in this same atomic commit; a
+    /// scheduling driver fires them later (P4).
+    pub scheduled: Vec<Scheduled>,
     pub cursor_advance: Option<CursorMove>,
 }
 
@@ -59,6 +85,11 @@ impl Patch {
     }
     pub fn emit(mut self, msg: Message) -> Patch {
         self.emits.push(msg);
+        self
+    }
+    /// Record a timer, durably, in the same commit as this patch's effects.
+    pub fn schedule(mut self, s: Scheduled) -> Patch {
+        self.scheduled.push(s);
         self
     }
     pub fn advance_cursor(mut self, mv: CursorMove) -> Patch {

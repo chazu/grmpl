@@ -91,8 +91,15 @@ impl<'a> Domain<'a> {
         authority: &Authority,
         schemas: &dyn SchemaCatalog,
     ) -> Result<CommitOutcome> {
+        // Scheduled timers land as durable world writes in this same commit.
+        let sched: Vec<grmpl_core::Fact> = patch
+            .scheduled
+            .iter()
+            .map(|s| grmpl_core::Fact::new(s.timers, crate::schedule::timer_row(s)))
+            .collect();
+
         // Authority law: world writes must be owned.
-        for f in patch.asserts.iter().chain(patch.retracts.iter()) {
+        for f in patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()) {
             if !authority.permits(f) {
                 return Err(Error::Authority(format!(
                     "write to relation {:?} outside authority domain {:?}",
@@ -102,7 +109,10 @@ impl<'a> Domain<'a> {
         }
 
         // Schema law (P1): world writes must conform to their registered schema.
-        check_schema(schemas, patch.asserts.iter().chain(patch.retracts.iter()))?;
+        check_schema(
+            schemas,
+            patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
+        )?;
 
         let preconditions: Vec<(RelId, Tuple)> =
             patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();
@@ -119,6 +129,9 @@ impl<'a> Domain<'a> {
                 updates.push((cm.rel, old.clone(), -1));
             }
             updates.push((cm.rel, cm.assert.clone(), 1));
+        }
+        for f in &sched {
+            updates.push((f.rel, f.tuple.clone(), 1));
         }
 
         // Partition emits into local inbox writes and durable outbox rows.

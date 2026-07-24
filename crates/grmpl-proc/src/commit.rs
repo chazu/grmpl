@@ -49,8 +49,16 @@ pub fn commit_patch(
     patch: &Patch,
     authority: &Authority,
 ) -> Result<CommitOutcome> {
+    // Scheduled timers land as durable world writes (timer rows) in this same
+    // commit, so they are subject to the Authority and Schema laws too.
+    let sched: Vec<Fact> = patch
+        .scheduled
+        .iter()
+        .map(|s| Fact::new(s.timers, crate::schedule::timer_row(s)))
+        .collect();
+
     // Authority law: every asserted/retracted world fact must be owned.
-    for f in patch.asserts.iter().chain(patch.retracts.iter()) {
+    for f in patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()) {
         if !authority.permits(f) {
             return Err(Error::Authority(format!(
                 "write to relation {:?} outside authority domain {:?}",
@@ -62,7 +70,10 @@ pub fn commit_patch(
     // Schema law (P1): every asserted/retracted world fact must conform to its
     // relation's registered schema (arity + column types). Beside the Authority
     // check so no world write bypasses either.
-    check_schema(schemas, patch.asserts.iter().chain(patch.retracts.iter()))?;
+    check_schema(
+        schemas,
+        patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
+    )?;
 
     let preconditions: Vec<(RelId, Tuple)> = patch
         .preconditions
@@ -82,6 +93,9 @@ pub fn commit_patch(
     }
     for m in &patch.emits {
         updates.push((m.inbox, m.body.clone(), 1));
+    }
+    for f in &sched {
+        updates.push((f.rel, f.tuple.clone(), 1));
     }
     if let Some(cm) = &patch.cursor_advance {
         if let Some(old) = &cm.retract {
