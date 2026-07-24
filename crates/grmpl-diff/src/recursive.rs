@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use grmpl_core::{Edition, RelId, Result, TraceStore, Tuple};
+use grmpl_core::{Diff, Edition, RelId, Result, TraceStore, Tuple};
 
 use crate::multiset::Multiset;
 use crate::query::{eval_snapshot, eval_with, eval_with_recur, Query};
@@ -87,8 +87,17 @@ fn subtract_in_place(a: &mut Multiset, remove: &Multiset) {
 }
 
 /// `new − old` as signed set deltas (`+1` added, `-1` removed).
-fn set_difference(new: &Multiset, old: &Multiset) -> Multiset {
-    let mut d = Multiset::new();
+///
+/// Generic in the key so the *one* definition serves both maintainers: the
+/// recursive view diffs its fixpoint (`K = Tuple`), and the parse stream diffs
+/// its match-set (`K = Value`, see [`crate::parse_stream`]). Both are
+/// boundary-recompute strategies whose emitted delta is exactly this set
+/// difference — the composition P9c §6 calls for — so neither reimplements it.
+pub(crate) fn set_difference<K: Clone + Eq + std::hash::Hash>(
+    new: &HashMap<K, Diff>,
+    old: &HashMap<K, Diff>,
+) -> HashMap<K, Diff> {
+    let mut d = HashMap::new();
     for t in new.keys() {
         if !old.contains_key(t) {
             d.insert(t.clone(), 1);
