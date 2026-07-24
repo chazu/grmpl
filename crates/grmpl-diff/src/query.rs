@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grmpl_core::{Diff, Edition, Result, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, Error, Result, RelId, TraceStore, Tuple, Value};
 
 use crate::multiset::{self, Multiset};
 
@@ -18,6 +18,22 @@ use crate::multiset::{self, Multiset};
 pub type MapFn = Arc<dyn Fn(&Tuple) -> Tuple + Send + Sync>;
 /// A pure tuple→bool predicate.
 pub type Pred = Arc<dyn Fn(&Tuple) -> bool + Send + Sync>;
+
+/// An aggregate for [`Query::Reduce`]. `Sum`/`Min`/`Max` name the input column
+/// they fold over; `Count` ignores cell values. Aggregates run over the *set*
+/// boundary of the input (present, positive-weight tuples), the only sensible
+/// reading for `Min`/`Max`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Agg {
+    /// Number of present input tuples in the group.
+    Count,
+    /// Σ of the `i64` in the named column over the group (non-`Int` cells add 0).
+    Sum(usize),
+    /// Least `Value` in the named column over the group (total `Value` order).
+    Min(usize),
+    /// Greatest `Value` in the named column over the group (total `Value` order).
+    Max(usize),
+}
 
 /// An immutable query plan.
 #[derive(Clone)]
@@ -35,6 +51,12 @@ pub enum Query {
     Union(Box<Query>, Box<Query>),
     Negate(Box<Query>),
     Distinct(Box<Query>),
+    /// Group `input` by `key` columns and fold each group with `agg` — a
+    /// non-linear boundary recompute (DESIGN.md §3, the "reduce / aggregate"
+    /// row). The result is `key-columns ++ [aggregate]`, one weight-1 tuple per
+    /// non-empty group. Stateless in v1 (per-key incremental state is P13); not
+    /// permitted inside an `Iterate`.
+    Reduce { input: Box<Query>, key: Arc<[usize]>, agg: Agg },
     /// Reference to the enclosing `Iterate`'s current value (the recursion
     /// variable). Only meaningful inside an `Iterate`'s `step`.
     Recur,
@@ -77,6 +99,12 @@ impl Query {
     }
     pub fn distinct(self) -> Query {
         Query::Distinct(Box::new(self))
+    }
+    /// Group by `key` columns and fold each group with `agg` (a non-linear
+    /// boundary, like `distinct`). The result is `key-columns ++ [aggregate]`.
+    /// Aggregates are not permitted inside an `Iterate`.
+    pub fn reduce(self, key: impl Into<Arc<[usize]>>, agg: Agg) -> Query {
+        Query::Reduce { input: Box::new(self), key: key.into(), agg }
     }
     /// The recursion variable, for use inside a `step`.
     pub fn recur() -> Query {
@@ -142,6 +170,70 @@ fn distinct_snapshot(input: &Multiset) -> Multiset {
         .filter(|(_, d)| **d > 0)
         .map(|(t, _)| (t.clone(), 1))
         .collect()
+}
+
+/// The non-linear `reduce` boundary at one edition: partition the present
+/// (positive-weight) input tuples by their `key` columns and fold each group
+/// with `agg`, emitting one weight-1 output tuple per non-empty group as
+/// `key-columns ++ [aggregate]`. Like `distinct`, it consumes the *set* boundary
+/// of its input (weights collapse to presence). The result is independent of
+/// input iteration order: distinct keys yield distinct output tuples, and every
+/// fold is order-invariant (`Count`, `Min`, `Max`, and wrapping `Sum`).
+fn reduce_snapshot(input: &Multiset, key_cols: &[usize], agg: &Agg) -> Multiset {
+    let mut groups: HashMap<Vec<Value>, Vec<Tuple>> = HashMap::new();
+    for (t, d) in input {
+        if *d > 0 {
+            groups.entry(key(t, key_cols)).or_default().push(t.clone());
+        }
+    }
+    let mut out = Multiset::new();
+    for (mut row, members) in groups {
+        row.push(fold_agg(&members, agg));
+        multiset::add(&mut out, Tuple::new(row), 1);
+    }
+    out
+}
+
+/// Fold a non-empty group of tuples into a single aggregate value.
+fn fold_agg(members: &[Tuple], agg: &Agg) -> Value {
+    match *agg {
+        Agg::Count => Value::Int(members.len() as i64),
+        Agg::Sum(c) => {
+            let s = members.iter().fold(0i64, |acc, t| {
+                acc.wrapping_add(match &t.as_slice()[c] {
+                    Value::Int(n) => *n,
+                    _ => 0,
+                })
+            });
+            Value::Int(s)
+        }
+        // A group is only created when it has ≥1 member, so `min`/`max` hold.
+        Agg::Min(c) => {
+            members.iter().map(|t| t.as_slice()[c].clone()).min().expect("non-empty group")
+        }
+        Agg::Max(c) => {
+            members.iter().map(|t| t.as_slice()[c].clone()).max().expect("non-empty group")
+        }
+    }
+}
+
+/// True if `q` contains a `Reduce` anywhere below it. Aggregates are forbidden
+/// inside an `Iterate`, whose recursive fixpoint requires a monotone, linear
+/// step; this powers that check.
+fn contains_reduce(q: &Query) -> bool {
+    match q {
+        Query::Reduce { .. } => true,
+        Query::Rel(_) | Query::Recur => false,
+        Query::Map { input, .. }
+        | Query::Filter { input, .. }
+        | Query::Project { input, .. } => contains_reduce(input),
+        Query::Negate(a) | Query::Distinct(a) => contains_reduce(a),
+        Query::Shared(inner) => contains_reduce(inner),
+        Query::Join { left, right, .. } | Query::Union(left, right) => {
+            contains_reduce(left) || contains_reduce(right)
+        }
+        Query::Iterate { init, step } => contains_reduce(init) || contains_reduce(step),
+    }
 }
 
 // ---- evaluation ----------------------------------------------------------
@@ -249,8 +341,19 @@ fn eval_inner(
         }
         Query::Negate(a) => negate(&eval_inner(a, store, at, recur, overrides, arr)?),
         Query::Distinct(a) => distinct_snapshot(&eval_inner(a, store, at, recur, overrides, arr)?),
+        Query::Reduce { input, key, agg } => {
+            let child = eval_inner(input, store, at, recur, overrides, arr)?;
+            reduce_snapshot(&child, key, agg)
+        }
         Query::Recur => recur.cloned().unwrap_or_default(),
         Query::Iterate { init, step } => {
+            // Aggregates are non-linear, so a recursive fixpoint over them has no
+            // monotone semi-naïve maintenance (P13 territory) — reject them here.
+            if contains_reduce(init) || contains_reduce(step) {
+                return Err(Error::Query(
+                    "Reduce (aggregate) is not permitted inside Iterate".into(),
+                ));
+            }
             // Least fixpoint of R = distinct(init ∪ step(R)) over a finite
             // domain, so iteration terminates (R grows monotonically as a set).
             let init_val = eval_inner(init, store, at, None, overrides, arr)?;
@@ -342,6 +445,17 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
             // Non-linear: recompute the boundary at each end and difference.
             let to_set = distinct_snapshot(&eval_snapshot(a, store, to)?);
             let from_set = distinct_snapshot(&eval_snapshot(a, store, from)?);
+            let mut out = to_set;
+            multiset::merge(&mut out, &negate(&from_set));
+            multiset::strip_zeros(&mut out);
+            out
+        }
+        Query::Reduce { input, key, agg } => {
+            // Non-linear, like `distinct`: recompute the aggregate boundary at
+            // each end and difference. Stateless — per-key incremental state
+            // (recompute only changed keys, DESIGN.md §3) is P13.
+            let to_set = reduce_snapshot(&eval_snapshot(input, store, to)?, key, agg);
+            let from_set = reduce_snapshot(&eval_snapshot(input, store, from)?, key, agg);
             let mut out = to_set;
             multiset::merge(&mut out, &negate(&from_set));
             multiset::strip_zeros(&mut out);

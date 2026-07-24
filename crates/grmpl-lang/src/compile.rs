@@ -21,12 +21,24 @@ use grmpl_core::{
     Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, Result as CoreResult, RelId,
     Schema, SchemaCatalog, Tuple, Ty, Value,
 };
-use grmpl_diff::{Query, Snapshot};
+use grmpl_diff::{Agg, Query, Snapshot};
 use grmpl_pattern::{Bindings, Form, Pattern, Rule, VarId};
 use grmpl_proc::Behavior;
 
 use crate::ast::{Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
 use crate::parser::parse;
+
+/// An aggregate named by *column* — the P1 named-column surface for
+/// [`Program::reduce_view`]. `Sum`/`Min`/`Max` name a yielded column; `Count`
+/// ignores values. Resolved to a positional [`grmpl_diff::Agg`] against the
+/// view's `yield` list.
+#[derive(Clone, PartialEq, Debug)]
+pub enum NamedAgg {
+    Count,
+    Sum(String),
+    Min(String),
+    Max(String),
+}
 
 struct RelInfo {
     id: RelId,
@@ -256,6 +268,41 @@ impl Program {
             cols.push(c);
         }
         Ok(base.project(cols).distinct())
+    }
+
+    /// Aggregate over a view's yielded columns *by name*: instantiate `view`
+    /// with `args`, group by the named `group` columns, and fold `agg` over its
+    /// (optional) named column. The resulting `Query` yields the grouping
+    /// columns followed by the aggregate. This is the P1 named-column surface for
+    /// aggregates — column names resolve against the view's `yield` list, so it
+    /// depends on P1's named columns. Errors if any name is not yielded.
+    pub fn reduce_view(
+        &self,
+        view: &str,
+        args: &[Value],
+        group: &[&str],
+        agg: NamedAgg,
+    ) -> Result<Query, String> {
+        let base = self.view(view, args)?;
+        let yields =
+            self.view_yields(view).ok_or_else(|| format!("no view `{view}`"))?.to_vec();
+        let idx = |col: &str| -> Result<usize, String> {
+            yields
+                .iter()
+                .position(|y| y == col)
+                .ok_or_else(|| format!("view `{view}` yields no column `{col}`"))
+        };
+        let mut key = Vec::with_capacity(group.len());
+        for g in group {
+            key.push(idx(g)?);
+        }
+        let agg = match agg {
+            NamedAgg::Count => Agg::Count,
+            NamedAgg::Sum(c) => Agg::Sum(idx(&c)?),
+            NamedAgg::Min(c) => Agg::Min(idx(&c)?),
+            NamedAgg::Max(c) => Agg::Max(idx(&c)?),
+        };
+        Ok(base.reduce(key, agg))
     }
 
     /// Build a parser from a declared `form`.

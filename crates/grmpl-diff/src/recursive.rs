@@ -63,6 +63,7 @@ fn collect_rels(q: &Query, out: &mut Vec<RelId>) {
         | Query::Filter { input, .. }
         | Query::Project { input, .. } => collect_rels(input, out),
         Query::Negate(a) | Query::Distinct(a) => collect_rels(a, out),
+        Query::Reduce { input, .. } => collect_rels(input, out),
         Query::Join { left, right, .. } | Query::Union(left, right) => {
             collect_rels(left, out);
             collect_rels(right, out);

@@ -115,12 +115,68 @@ reopens (the language still assigns ids from `rel_base`) is a follow-on
 
 ---
 
+## P2 — Reduce / aggregates
+
+Add grouped aggregation to the differential engine: a `Reduce` operator that
+groups its input by key columns and folds each group with an aggregate
+(`Count`/`Sum`/`Min`/`Max`), so views can yield derived measures over typed
+columns (P1).
+
+### Work
+
+* **`Reduce` operator (core engine).** `Query::Reduce { input, key, agg }` with
+  `Agg` = `Count | Sum(col) | Min(col) | Max(col)` (grmpl-diff). Snapshot
+  semantics group the *set boundary* of the input (present, positive-weight
+  tuples — the only sensible reading for `Min`/`Max`, consistent with
+  `distinct`) by `key` and emit one weight-1 tuple per non-empty group as
+  `key-columns ++ [aggregate]`. Deterministic regardless of input scan order:
+  distinct keys yield distinct outputs and every fold is order-invariant.
+* **Stateless boundary-recompute delta.** `Reduce` is non-linear, so its delta
+  over `(from, to]` is `reduce(input@to) − reduce(input@from)` — the same
+  recompute-on-change rule as `distinct`. Per-key incremental state (recompute
+  only the keys whose groups changed, `DESIGN.md` §3) is deferred to P13.
+* **Threaded through the engine.** `collect_rels`, `eval_with`/`eval_inner`
+  (Shared + Recur contexts), and `eval_delta` all handle `Reduce`. Aggregates
+  are **rejected inside `Iterate`** (`Error::Query`): a recursive fixpoint over a
+  non-monotone operator has no monotone semi-naïve maintenance.
+* **Named-column yield surface (language).** `Program::reduce_view` groups and
+  folds a view's *yielded columns by name* (`NamedAgg`), lowering to
+  `Query::Reduce`. This waits on P1's named columns; a full `view … yield
+  count(…)` grammar is a follow-on (TKT filed).
+
+### Acceptance
+
+* `cargo build`, `cargo test`, `cargo clippy` all green on the whole workspace.
+* The snapshot–stream law (`initial + Σ deltas = find(current)`) holds for every
+  aggregate under randomized assert/retract churn, including group creation,
+  update, and emptying (last member retracted) — checked against an independent
+  model that recomputes each aggregate from the present base directly (a genuine
+  law oracle, not self-consistency).
+* A `Reduce` placed inside an `Iterate` is rejected at evaluation (tested).
+* `reduce_view` folds named columns and errors on unknown column/view names
+  (tested).
+
+### Start here
+
+`crates/grmpl-diff/src/query.rs` (`Agg`, `Reduce`, `reduce_snapshot`,
+`eval_delta`), `crates/grmpl-diff/src/recursive.rs` (`collect_rels`),
+`crates/grmpl-core/src/error.rs` (`Error::Query`),
+`crates/grmpl-lang/src/compile.rs` (`NamedAgg`, `reduce_view`).
+Oracle template: `crates/grmpl-diff/tests/reduce_stream.rs`.
+
+### Not in this phase
+
+Per-key incremental aggregate state (P13), aggregates inside recursion, richer
+aggregates (average/distinct-count/user-defined), and a parser grammar for
+aggregate yields in `view` (follow-on ticket).
+
+---
+
 ## Later phases
 
 Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
-* **P2 — Reduce / aggregates.**
 * **P3 — Client sessions & world construction.**
 * **P4 — Scheduling & simulation time.**
 * **P5 — Reactive handlers (`on watch`).**

@@ -15,6 +15,10 @@ pub enum Error {
     Schema(String),
     /// An optimistic commit's precondition no longer held (DESIGN.md §5.2).
     PreconditionFailed,
+    /// A dataflow plan is ill-formed — e.g. a non-linear operator such as
+    /// `Reduce` (an aggregate) placed inside a recursive `Iterate`, whose
+    /// fixpoint requires a monotone, linear step (grmpl-diff P2).
+    Query(String),
     /// A physical (de)serialization failure below the line.
     Codec(String),
 }
@@ -26,6 +30,7 @@ impl fmt::Display for Error {
             Error::Authority(s) => write!(f, "authority violation: {s}"),
             Error::Schema(s) => write!(f, "schema violation: {s}"),
             Error::PreconditionFailed => write!(f, "precondition failed"),
+            Error::Query(s) => write!(f, "invalid query: {s}"),
             Error::Codec(s) => write!(f, "codec error: {s}"),
         }
     }
