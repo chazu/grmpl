@@ -16,11 +16,19 @@ pub enum Value {
     Text(Arc<str>),
     Bool(bool),
     Tuple(Arc<[Value]>),
+    /// An opaque, ordered byte string. The input for `form` over byte
+    /// sequences (P9): a `Pattern` runs over its bytes via
+    /// `grmpl_pattern::BytesInput`. Structural — identity is by content.
+    Bytes(Arc<[u8]>),
 }
 
 impl Value {
     pub fn text(s: impl AsRef<str>) -> Value {
         Value::Text(Arc::from(s.as_ref()))
+    }
+
+    pub fn bytes(b: impl AsRef<[u8]>) -> Value {
+        Value::Bytes(Arc::from(b.as_ref()))
     }
 }
 

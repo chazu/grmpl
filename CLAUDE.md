@@ -69,7 +69,7 @@ through the trait without ever naming the storage engine.
 ### Relation schemas (`grmpl-core::schema`, `SchemaCatalog`)
 
 Every relation may carry a **schema**: an ordered list of named, typed columns
-(`Ty` = `Ent`/`Int`/`Text`/`Bool`/`Tuple`/`Any`). Like the catalog, the schema
+(`Ty` = `Ent`/`Int`/`Text`/`Bool`/`Tuple`/`Bytes`/`Any`). Like the catalog, the schema
 types and the invariant logic (`Schema::check`, `Schema::is_additive_over`) are
 **core**; the durable registry is a **store** concern — `grmpl-store` persists
 each version in `__meta` under `sch:{rel}{edition}` keys, **versioned by the

@@ -36,13 +36,14 @@ use crate::value::{Entity, RelId, Tuple, Value};
 /// The wire/on-disk format version. Prefixes every serialized artifact. Bump
 /// on any change to the tag set or framing so stale bytes are rejected rather
 /// than misread. All framings (`message`, store `record`) share this byte.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
 const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TUPLE: u8 = 5;
+const TAG_BYTES: u8 = 6;
 
 // Column-type tags — a *separate* namespace from the value tags above, used
 // only inside the schema framing. Bump FORMAT_VERSION if these change.
@@ -52,6 +53,7 @@ const TY_TEXT: u8 = 3;
 const TY_BOOL: u8 = 4;
 const TY_TUPLE: u8 = 5;
 const TY_ANY: u8 = 6;
+const TY_BYTES: u8 = 7;
 
 fn ty_tag(t: Ty) -> u8 {
     match t {
@@ -60,6 +62,7 @@ fn ty_tag(t: Ty) -> u8 {
         Ty::Text => TY_TEXT,
         Ty::Bool => TY_BOOL,
         Ty::Tuple => TY_TUPLE,
+        Ty::Bytes => TY_BYTES,
         Ty::Any => TY_ANY,
     }
 }
@@ -71,6 +74,7 @@ fn ty_from_tag(tag: u8) -> Result<Ty> {
         TY_TEXT => Ty::Text,
         TY_BOOL => Ty::Bool,
         TY_TUPLE => Ty::Tuple,
+        TY_BYTES => Ty::Bytes,
         TY_ANY => Ty::Any,
         other => return Err(Error::Codec(format!("unknown column-type tag {other}"))),
     })
@@ -197,6 +201,11 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) {
                 encode_value(e, out);
             }
         }
+        Value::Bytes(b) => {
+            out.push(TAG_BYTES);
+            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            out.extend_from_slice(b);
+        }
     }
 }
 
@@ -226,6 +235,13 @@ fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
                 pos = next;
             }
             Ok((Value::Tuple(Arc::from(vals)), pos))
+        }
+        TAG_BYTES => {
+            let len = read_u32(bytes, &mut pos)? as usize;
+            let end = pos + len;
+            let slice =
+                bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (bytes)".into()))?;
+            Ok((Value::Bytes(Arc::from(slice)), end))
         }
         other => Err(Error::Codec(format!("unknown value tag {other}"))),
     }
@@ -257,7 +273,12 @@ mod tests {
     fn message_roundtrips_and_is_version_prefixed() {
         let m = Message {
             inbox: RelId(42),
-            body: Tuple::from([Value::Int(7), Value::text("hi"), Value::Bool(true)]),
+            body: Tuple::from([
+                Value::Int(7),
+                Value::text("hi"),
+                Value::Bool(true),
+                Value::bytes([0u8, 1, 255, 128]),
+            ]),
         };
         let bytes = encode_message(&m);
         assert_eq!(bytes[0], FORMAT_VERSION, "artifact must lead with the version byte");
@@ -287,6 +308,7 @@ mod tests {
             Column::new("label", Ty::Text),
             Column::new("flag", Ty::Bool),
             Column::new("body", Ty::Tuple),
+            Column::new("blob", Ty::Bytes),
             Column::new("free", Ty::Any),
         ]);
         let bytes = encode_schema(&s);

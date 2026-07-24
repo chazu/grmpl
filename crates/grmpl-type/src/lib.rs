@@ -121,6 +121,7 @@ pub fn value_ty(v: &Value) -> Ty {
         Value::Text(_) => Ty::Text,
         Value::Bool(_) => Ty::Bool,
         Value::Tuple(_) => Ty::Tuple,
+        Value::Bytes(_) => Ty::Bytes,
     }
 }
 
