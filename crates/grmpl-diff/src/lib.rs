@@ -10,6 +10,7 @@ pub mod query;
 pub mod recursive;
 pub mod snapshot;
 pub mod watch;
+pub mod window;
 
 pub use multiset::Multiset;
 pub use query::{
@@ -19,3 +20,4 @@ pub use query::{
 pub use recursive::{IncrementalFixpoint, Maintenance};
 pub use snapshot::Snapshot;
 pub use watch::DeltaStream;
+pub use window::{consolidate_window, ConsolidatedWindow};
