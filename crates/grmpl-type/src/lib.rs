@@ -47,6 +47,16 @@
 //! granularity, statically. See [`check_handler_authority`]. Key-ranges stay
 //! checked at the commit boundary.
 //!
+//! ## CALM monotonicity (P8c)
+//!
+//! The [`calm`] module classifies a plan along the axis the CALM theorem makes
+//! load-bearing: is it **monotone** (its output set only grows as its inputs
+//! grow)? A monotone plan reads coordination-free across a domain boundary; a
+//! non-monotone one may retract an already-observed row. [`classify`] reads the
+//! answer straight off the IR — a plan is monotone iff it contains no `Negate`
+//! and no `Reduce` — and reports the [`Blocker`]s otherwise. Inference-only, with
+//! a runtime falsification oracle in the tests.
+//!
 //! ## Bright line
 //!
 //! This crate is **above the line** (`DESIGN.md` §1): it depends only on the
@@ -60,8 +70,10 @@ use grmpl_core::{Edition, RelId, Schema, SchemaCatalog, Ty, Value};
 use grmpl_diff::Agg;
 use grmpl_lang::{Comp, PredExpr, QueryIr, RowExpr};
 
+pub mod calm;
 pub mod effect;
 
+pub use calm::{classify, Blocker, Monotonicity};
 pub use effect::{
     check_authority, check_handler_authority, infer_handler_effects, EffectError, EffectRow,
 };
