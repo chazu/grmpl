@@ -54,6 +54,46 @@ pub trait TraceStore: EditionStore {
     /// Raw updates for a relation whose edition lies in `(from, to]` — the
     /// `watch` delta primitive (used from M2 on).
     fn scan_updates(&self, rel: RelId, from: Edition, to: Edition) -> Result<Vec<Update>>;
+
+    /// The consolidation **watermark** (P6 history/GC). Every edition ≤ this has
+    /// been folded into per-relation checkpoints and its raw updates discarded,
+    /// so no intermediate as-of state below it survives. This is the floor of
+    /// the four **edition doors**:
+    ///
+    /// * [`read_at`](Self::read_at) *at* an edition below it, and
+    /// * [`scan_updates`](Self::scan_updates) *from* an edition below it,
+    ///
+    /// are rejected with [`Error::Store`](crate::Error::Store) rather than
+    /// answered from truncated history — and the two *computed* doors that build
+    /// on them, `grmpl_diff::eval_delta` and the reactive watch-cursor pump,
+    /// inherit the same guard for free (they bottom out at `read_at`/
+    /// `scan_updates`). A store that retains full history reports
+    /// [`Edition::ZERO`], so no door ever closes.
+    fn watermark(&self) -> Edition {
+        Edition::ZERO
+    }
+
+    /// Consolidate history up to `up_to` (clamped to
+    /// [`current`](EditionStore::current) — the future is never consolidated):
+    /// fold each relation's updates at editions ≤ the new watermark into a
+    /// single durable checkpoint, delete the folded raw updates, and persist the
+    /// new watermark — **atomically**, so a crash leaves either the old horizon
+    /// or the new one, never a half-truncated trace. Returns the new watermark,
+    /// which is **monotonic** (never below the current one; a `up_to` at or
+    /// below it is a no-op). This is what turns the O(history) as-of read into
+    /// an O(checkpoint + tail) one.
+    ///
+    /// **Retention safety is the caller's.** Consolidating past a frontier a
+    /// live reader still scans *from* — most importantly the minimum durable
+    /// watch cursor — strands that reader below the watermark; its next read
+    /// then errors at the door rather than silently losing updates. The store
+    /// cannot see those frontiers (they live above the bright line, as ordinary
+    /// trace rows), so the GC *policy* that clamps `up_to` to the minimum
+    /// durable watch cursor lives above it (`grmpl_proc::gc`). A store that
+    /// retains full history may leave this a no-op.
+    fn consolidate(&self, _up_to: Edition) -> Result<Edition> {
+        Ok(self.watermark())
+    }
 }
 
 /// A durable directory mapping interned relation *names* to their [`RelId`].

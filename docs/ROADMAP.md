@@ -321,12 +321,80 @@ state (P13).
 
 ---
 
+## P6 — History: as-of, retention, GC (landed)
+
+The store is an append-only edition log, so as-of reads already work; the
+premise here **differs from DESIGN.md §4.1**, which imagined leaning on fjall's
+MVCC snapshots + lazy compaction (and so "kept only the latest edition live,
+no as-of below the compaction horizon"). Instead every update is a durable
+`(edition, counter)` row we own, so as-of reads are exact *by construction* —
+and retention becomes an **explicit consolidation watermark** we manage, not a
+side effect of the KV engine's GC.
+
+### Work
+
+* **Consolidation watermark** (`grmpl-store`, persisted in `__meta` under
+  `watermark`). `TraceStore::consolidate(up_to)` folds each relation's history
+  at editions ≤ the new watermark (clamped to `current`) into a **checkpoint**
+  — the consolidated `(tuple, diff)` state stored in the reserved `edition = 0`
+  key range of the relation's own keyspace (disjoint from every real update,
+  which starts at edition 1) — **deletes** the folded raw rows, and bumps the
+  watermark, all in **one atomic `batch()`** (crash-safe: old horizon or new,
+  never half-cut). Monotonic: a horizon at or below the current watermark is a
+  no-op.
+* **O(history) → O(checkpoint + tail).** An as-of `read_at(at)` is now
+  `checkpoint + tail(watermark, at]`, and `scan_updates(from, ..)` is just the
+  tail — the collapsed history is physically gone, not scanned. (Proven
+  white-box by counting keyspace rows after a consolidate.)
+* **The watermark as an ERROR at all four edition doors.** `read_at` *at* an
+  edition below the watermark, and `scan_updates` *from* below it, return
+  `Error::Store` — the intermediate state has been discarded, so they answer
+  loudly rather than wrongly. The two computed doors, `grmpl-diff::eval_delta`
+  and the reactive watch-cursor pump, inherit the guard for free (they bottom
+  out at `read_at`/`scan_updates`). A store retaining full history reports
+  `Edition::ZERO`, so no door ever closes.
+* **Never past the minimum durable watch cursor** (`grmpl-proc::gc`). The store
+  cannot see watch cursors (ordinary trace rows, above the bright line), so the
+  GC *policy* lives above it: `min_watch_cursor` reads the least live cursor,
+  and `consolidate_to` clamps the requested horizon to it before consolidating.
+  This keeps every installed `on watch` pumpable; consolidating *past* a cursor
+  (bypassing the policy) is exactly what trips its pump at the door.
+* **`find q at E` with schema-at-edition.** A `Snapshot` pinned at `E` already
+  evaluates `find q at E`; it now also reports the column schema *in force at
+  E* via `Snapshot::schema` (P1 `schema_at`), under the same watermark floor —
+  an as-of read sees the typing of its own era.
+
+### Acceptance
+
+`crates/grmpl-store/tests/history.rs`: a randomized-churn law oracle (32 seeds)
+interleaves random commits with random consolidations and, after every step,
+checks against an independent full-history model that every `read_at`/
+`scan_updates` at or above the watermark is byte-identical to un-GC'd history,
+that both doors **error** below the watermark, and that the watermark is
+monotonic and ≤ `current`; plus corner tests for reopen durability (watermark +
+checkpoint persist) and the clamp/no-op cases. A white-box unit test counts
+keyspace rows to prove `consolidate` truncates to checkpoint + tail.
+`crates/grmpl-proc/tests/gc.rs`: `consolidate_to` never passes the minimum
+durable watch cursor and keeps watches pumpable; consolidating past a cursor
+trips the edition door; a randomized oracle (24 seeds) confirms the clamp over
+arbitrary cursor configurations. `crates/grmpl-diff/tests/find_at.rs`: `find q
+at E` and `Snapshot::schema` are both as-of the pinned edition and both survive
+consolidation / error below the watermark.
+
+### Not in this phase
+
+Replay & forks over the checkpoints (P10 — a checkpoint is a fork point, but the
+fork/replay machinery is deferred); a background GC scheduler / retention policy
+driver (the mechanism and the safe `consolidate_to` entry point are here; *when*
+to call them is an operational concern); per-relation retention windows.
+
+---
+
 ## Later phases
 
 Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
-* **P6 — History:** as-of, retention, GC.
 * **P7 — Core IR** (CBPV split reified).
 * **P8 — Typing:** value/row types, effect rows, CALM.
 * **P9 — Pattern algebra:** inputs, printing, streams.
