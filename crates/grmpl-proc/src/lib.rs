@@ -14,7 +14,7 @@ pub mod schedule;
 pub mod watch;
 
 pub use alloc::Alloc;
-pub use commit::{check_schema, commit_patch, CommitOutcome};
+pub use commit::{check_schema, commit_patch, commit_patch_checked, CommitOutcome};
 pub use domain::{outbox_len, Domain};
 pub use gc::{consolidate_to, min_watch_cursor};
 pub use process::{enqueue, inbox_fact, Behavior, Prepared, Process};

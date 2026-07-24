@@ -9,7 +9,8 @@
 //! retries against the new edition.
 
 use grmpl_core::{
-    Authority, Diff, Edition, Error, Fact, Patch, Result, RelId, SchemaCatalog, TraceStore, Tuple,
+    Authority, BehaviorChecker, Diff, Edition, Error, Fact, NoBehaviorCheck, Patch, Result, RelId,
+    SchemaCatalog, TraceStore, Tuple,
 };
 
 /// Commit-boundary schema enforcement (P1), applied beside the Authority check:
@@ -43,9 +44,36 @@ pub enum CommitOutcome {
 /// Attempt to commit `patch` under `authority`, enforcing `schemas` at the
 /// commit boundary. Pass [`grmpl_core::NoSchemas`] to opt out of schema
 /// enforcement.
+///
+/// This is [`commit_patch_checked`] with the no-op [`NoBehaviorCheck`]: it does
+/// not re-check stored code. Use `commit_patch_checked` with a real
+/// [`BehaviorChecker`] (e.g. `grmpl_type::EffectChecker`) to enforce the P12
+/// commit-boundary re-check when a patch may install behaviors.
 pub fn commit_patch(
     store: &dyn TraceStore,
     schemas: &dyn SchemaCatalog,
+    patch: &Patch,
+    authority: &Authority,
+) -> Result<CommitOutcome> {
+    commit_patch_checked(store, schemas, &NoBehaviorCheck, patch, authority)
+}
+
+/// Attempt to commit `patch` under `authority`, enforcing `schemas` **and**
+/// re-checking any stored code the patch installs via `checker` (P12 — behaviors
+/// as relations). For every asserted fact carrying a [`Value::Code`] cell,
+/// `checker` re-runs the P8b effect/authority check on the decoded behavior; a
+/// failure rejects the whole commit with [`Error::Authority`] *before* the
+/// atomic `commit_if`, so no edition is allocated (the patch–edition law holds).
+/// This is the commit boundary the ROADMAP's P12 "committing a behavior re-runs
+/// the effect/authority checker" clause names. Pass [`NoBehaviorCheck`] to opt
+/// out (that is exactly [`commit_patch`]).
+///
+/// [`Value::Code`]: grmpl_core::Value::Code
+/// [`BehaviorChecker`]: grmpl_core::BehaviorChecker
+pub fn commit_patch_checked(
+    store: &dyn TraceStore,
+    schemas: &dyn SchemaCatalog,
+    checker: &dyn BehaviorChecker,
     patch: &Patch,
     authority: &Authority,
 ) -> Result<CommitOutcome> {
@@ -74,6 +102,14 @@ pub fn commit_patch(
         schemas,
         patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
     )?;
+
+    // P12 code law: any behavior this patch installs (a `Value::Code` cell in an
+    // asserted fact) is re-checked against `authority` before it can be stored.
+    // A relation-level authority violation in the stored code rejects the whole
+    // commit here, before `commit_if` — so unsafe live code never lands.
+    for f in &patch.asserts {
+        checker.check_fact(f, authority)?;
+    }
 
     let preconditions: Vec<(RelId, Tuple)> = patch
         .preconditions

@@ -597,10 +597,31 @@ fn run_concat(
     snap: &Snapshot,
     parts: &[Value],
 ) -> CoreResult<Option<Patch>> {
-    let mut stack: Vec<Value> = parts[1..].to_vec();
+    // Seed the stack with the constructor arguments (`parts[0]` is the tag) and
+    // run the shared word executor — the same one a stored behavior runs, so a
+    // concat arm and an equivalent stored behavior build an identical patch.
+    exec_words(prog, &arm.words, self_entity, snap, parts[1..].to_vec())
+}
+
+/// Execute a point-free [`Word`] body over an initial value `stack`, building a
+/// patch. This is the sole word interpreter: [`run_concat`] seeds it with a
+/// handler arm's constructor arguments, and P12 stored-behavior dispatch
+/// (`crate::behavior`) seeds it with a message's columns. `Ok(None)` means a
+/// `resolve`/`find` matched nothing — the body makes no change.
+///
+/// The `match` over [`Word`] is exhaustive (no wildcard): a new word variant
+/// forces this interpreter — and the effect/authority walk that must agree with
+/// it — to be revisited rather than silently mis-run.
+pub(crate) fn exec_words(
+    prog: &Program,
+    words: &[Word],
+    self_entity: Entity,
+    snap: &Snapshot,
+    mut stack: Vec<Value>,
+) -> CoreResult<Option<Patch>> {
     let mut patch = Patch::new();
 
-    for word in &arm.words {
+    for word in words {
         match word {
             Word::SelfEntity => stack.push(Value::Ent(self_entity)),
             Word::Lit(v) => stack.push(v.clone()),

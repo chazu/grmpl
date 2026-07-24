@@ -29,12 +29,17 @@
 //! ```
 
 pub mod ast;
+pub mod behavior;
 pub mod compile;
 pub mod concat;
 pub mod ir;
 pub mod lexer;
 pub mod parser;
 
+pub use behavior::{
+    decode_behavior, dispatch, encode_behavior, implemented_behaviors, implements_ir,
+    select_behavior, StoredBehavior,
+};
 pub use compile::{NamedAgg, Program};
 pub use concat::{ConcatArm, Schemas, StackEffect, Word};
 pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};

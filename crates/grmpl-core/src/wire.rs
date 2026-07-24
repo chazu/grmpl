@@ -36,7 +36,7 @@ use crate::value::{Entity, RelId, Tuple, Value};
 /// The wire/on-disk format version. Prefixes every serialized artifact. Bump
 /// on any change to the tag set or framing so stale bytes are rejected rather
 /// than misread. All framings (`message`, store `record`) share this byte.
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -44,6 +44,9 @@ const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TUPLE: u8 = 5;
 const TAG_BYTES: u8 = 6;
+// P12: a code-carrying value (serialized behavior IR). Opaque bytes here — the
+// IR framing lives in `grmpl-lang` and rides the same [`FORMAT_VERSION`] byte.
+const TAG_CODE: u8 = 7;
 
 // Column-type tags — a *separate* namespace from the value tags above, used
 // only inside the schema framing. Bump FORMAT_VERSION if these change.
@@ -54,6 +57,7 @@ const TY_BOOL: u8 = 4;
 const TY_TUPLE: u8 = 5;
 const TY_ANY: u8 = 6;
 const TY_BYTES: u8 = 7;
+const TY_CODE: u8 = 8;
 
 fn ty_tag(t: Ty) -> u8 {
     match t {
@@ -63,6 +67,7 @@ fn ty_tag(t: Ty) -> u8 {
         Ty::Bool => TY_BOOL,
         Ty::Tuple => TY_TUPLE,
         Ty::Bytes => TY_BYTES,
+        Ty::Code => TY_CODE,
         Ty::Any => TY_ANY,
     }
 }
@@ -75,6 +80,7 @@ fn ty_from_tag(tag: u8) -> Result<Ty> {
         TY_BOOL => Ty::Bool,
         TY_TUPLE => Ty::Tuple,
         TY_BYTES => Ty::Bytes,
+        TY_CODE => Ty::Code,
         TY_ANY => Ty::Any,
         other => return Err(Error::Codec(format!("unknown column-type tag {other}"))),
     })
@@ -175,7 +181,11 @@ pub fn decode_tuple(bytes: &[u8], mut pos: usize) -> Result<(Tuple, usize)> {
     Ok((Tuple(Arc::from(vals)), pos))
 }
 
-fn encode_value(v: &Value, out: &mut Vec<u8>) {
+/// Encode a single [`Value`] onto `out` (no leading version byte — the caller's
+/// framing supplies it). Public so other framings built on the *one* value
+/// encoding can embed values: `grmpl-lang`'s behavior-IR codec reuses this for
+/// the literals inside a stored behavior rather than duplicating value tags.
+pub fn encode_value(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Ent(e) => {
             out.push(TAG_ENT);
@@ -206,10 +216,18 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
         }
+        Value::Code(b) => {
+            out.push(TAG_CODE);
+            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            out.extend_from_slice(b);
+        }
     }
 }
 
-fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
+/// Decode a single [`Value`] at `pos` (no leading version byte — the caller's
+/// framing consumed it). The public counterpart of [`encode_value`], for
+/// framings that embed values (see that function).
+pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
     let tag = *bytes.get(pos).ok_or_else(|| Error::Codec("unexpected end (tag)".into()))?;
     pos += 1;
     match tag {
@@ -242,6 +260,13 @@ fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
             let slice =
                 bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (bytes)".into()))?;
             Ok((Value::Bytes(Arc::from(slice)), end))
+        }
+        TAG_CODE => {
+            let len = read_u32(bytes, &mut pos)? as usize;
+            let end = pos + len;
+            let slice =
+                bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (code)".into()))?;
+            Ok((Value::Code(Arc::from(slice)), end))
         }
         other => Err(Error::Codec(format!("unknown value tag {other}"))),
     }
@@ -278,6 +303,7 @@ mod tests {
                 Value::text("hi"),
                 Value::Bool(true),
                 Value::bytes([0u8, 1, 255, 128]),
+                Value::code([9u8, 8, 7, 0, 255]),
             ]),
         };
         let bytes = encode_message(&m);
@@ -309,6 +335,7 @@ mod tests {
             Column::new("flag", Ty::Bool),
             Column::new("body", Ty::Tuple),
             Column::new("blob", Ty::Bytes),
+            Column::new("code", Ty::Code),
             Column::new("free", Ty::Any),
         ]);
         let bytes = encode_schema(&s);

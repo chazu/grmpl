@@ -75,7 +75,8 @@ pub mod effect;
 
 pub use calm::{classify, Blocker, Monotonicity};
 pub use effect::{
-    check_authority, check_handler_authority, infer_handler_effects, EffectError, EffectRow,
+    check_authority, check_handler_authority, check_stored_behavior_authority,
+    infer_handler_effects, infer_stored_behavior_effects, EffectChecker, EffectError, EffectRow,
 };
 
 /// A **row type**: the ordered value types of a relation's columns. It is the
@@ -122,6 +123,7 @@ pub fn value_ty(v: &Value) -> Ty {
         Value::Bool(_) => Ty::Bool,
         Value::Tuple(_) => Ty::Tuple,
         Value::Bytes(_) => Ty::Bytes,
+        Value::Code(_) => Ty::Code,
     }
 }
 

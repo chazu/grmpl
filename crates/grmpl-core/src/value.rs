@@ -20,6 +20,15 @@ pub enum Value {
     /// sequences (P9): a `Pattern` runs over its bytes via
     /// `grmpl_pattern::BytesInput`. Structural — identity is by content.
     Bytes(Arc<[u8]>),
+    /// A **code-carrying** value: the serialized bytes of a P7 IR *behavior*
+    /// (P12 — behaviors as relations). The bytes are opaque to the core (which
+    /// names no IR — the bright line): only `grmpl-lang` encodes/decodes them
+    /// (`grmpl_lang::behavior`). It is a *distinct* variant from [`Value::Bytes`]
+    /// precisely so it can carry a distinct schema type ([`crate::Ty::Code`]) and
+    /// so the commit boundary knows which cells hold live code to re-check
+    /// (`grmpl_core::BehaviorChecker`). Structural — identity is by content
+    /// (byte order), so it is deterministically `Ord`/`Hash`/`Eq` like any value.
+    Code(Arc<[u8]>),
 }
 
 impl Value {
@@ -29,6 +38,12 @@ impl Value {
 
     pub fn bytes(b: impl AsRef<[u8]>) -> Value {
         Value::Bytes(Arc::from(b.as_ref()))
+    }
+
+    /// Wrap serialized behavior IR bytes as a code-carrying value (P12). The
+    /// bytes are produced by `grmpl_lang::behavior::encode_behavior`.
+    pub fn code(b: impl AsRef<[u8]>) -> Value {
+        Value::Code(Arc::from(b.as_ref()))
     }
 }
 

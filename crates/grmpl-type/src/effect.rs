@@ -47,9 +47,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use grmpl_core::{Authority, RelId};
+use grmpl_core::{Authority, BehaviorChecker, Error as CoreError, Fact, RelId, Value};
 use grmpl_lang::ast::Stmt;
-use grmpl_lang::{Program, Word};
+use grmpl_lang::{Program, StoredBehavior, Word};
 
 /// The inferred **effect row** of an `on` handler: the relations it may write,
 /// at relation granularity, split by write kind. Both sets are deterministically
@@ -159,35 +159,45 @@ pub fn infer_handler_effects(prog: &Program, inbox: &str) -> Result<EffectRow, E
     let concat_arms = prog.on_concat_arms(inbox).unwrap_or(&[]);
     for arm in concat_arms {
         for word in &arm.words {
-            match word {
-                Word::Assert(rel) | Word::Retract(rel) => {
-                    row.writes.insert(rel_id(prog, rel)?);
-                }
-                Word::Emit(rel) => {
-                    row.sends.insert(rel_id(prog, rel)?);
-                }
-                // Pushers, shufflers, reads, and preconditions: no world effect.
-                // Enumerated exhaustively (no wildcard) so a future write- or
-                // send-carrying `Word` variant forces a recompile here rather
-                // than being silently omitted from the Authority effect row.
-                Word::SelfEntity
-                | Word::Lit(_)
-                | Word::Dup
-                | Word::Drop
-                | Word::Swap
-                | Word::Over
-                | Word::Rot
-                | Word::Nip
-                | Word::Tuck
-                | Word::TwoDup
-                | Word::TwoDrop
-                | Word::Resolve { .. }
-                | Word::Find { .. }
-                | Word::Expect(_) => {}
-            }
+            add_word_effect(prog, word, &mut row)?;
         }
     }
     Ok(row)
+}
+
+/// Fold one point-free [`Word`]'s world effect into `row`: `assert`/`retract`
+/// are writes, `emit` is a send, everything else is a read/precondition/shuffle
+/// with no world effect. The one interpreter of a word's *effect*, shared by
+/// concatenative `on`-handler arms ([`infer_handler_effects`]) and P12 stored
+/// behaviors ([`infer_stored_behavior_effects`]) so the two never diverge.
+///
+/// The `match` is exhaustive (no wildcard): a future write- or send-carrying
+/// `Word` variant forces a recompile here rather than being silently omitted
+/// from the Authority effect row.
+fn add_word_effect(prog: &Program, word: &Word, row: &mut EffectRow) -> Result<(), EffectError> {
+    match word {
+        Word::Assert(rel) | Word::Retract(rel) => {
+            row.writes.insert(rel_id(prog, rel)?);
+        }
+        Word::Emit(rel) => {
+            row.sends.insert(rel_id(prog, rel)?);
+        }
+        Word::SelfEntity
+        | Word::Lit(_)
+        | Word::Dup
+        | Word::Drop
+        | Word::Swap
+        | Word::Over
+        | Word::Rot
+        | Word::Nip
+        | Word::Tuck
+        | Word::TwoDup
+        | Word::TwoDrop
+        | Word::Resolve { .. }
+        | Word::Find { .. }
+        | Word::Expect(_) => {}
+    }
+    Ok(())
 }
 
 fn rel_id(prog: &Program, rel: &str) -> Result<RelId, EffectError> {
@@ -233,4 +243,80 @@ pub fn check_handler_authority(
     let effects = infer_handler_effects(prog, inbox)?;
     check_authority(&effects, authority)?;
     Ok(effects)
+}
+
+// ---- P12: stored behaviors (behaviors as relations) ---------------------
+
+/// Infer the [`EffectRow`] of a **stored** behavior (P12): its point-free body
+/// is walked exactly as a concatenative handler arm's is (shared
+/// [`add_word_effect`]), so a behavior installed as data and the same words
+/// written inline in an `on` handler infer the identical write set. The guard
+/// (message-pattern) reads only; it contributes no effect.
+pub fn infer_stored_behavior_effects(
+    prog: &Program,
+    behavior: &StoredBehavior,
+) -> Result<EffectRow, EffectError> {
+    let mut row = EffectRow::default();
+    for word in &behavior.body {
+        add_word_effect(prog, word, &mut row)?;
+    }
+    Ok(row)
+}
+
+/// Infer a stored behavior's effect row and check its writes against `authority`
+/// at relation granularity — the P8b check, re-run on **committed** code. This
+/// is what makes installing a behavior safe: the same guarantee an inline
+/// handler gets statically, a stored behavior gets at the commit that installs
+/// it (see [`EffectChecker`]).
+pub fn check_stored_behavior_authority(
+    prog: &Program,
+    behavior: &StoredBehavior,
+    authority: &Authority,
+) -> Result<EffectRow, EffectError> {
+    let effects = infer_stored_behavior_effects(prog, behavior)?;
+    check_authority(&effects, authority)?;
+    Ok(effects)
+}
+
+/// The commit-boundary [`BehaviorChecker`] (P12): re-runs the P8b
+/// effect/authority check on every stored behavior a patch installs.
+///
+/// The commit boundary (`grmpl_proc::commit_patch_checked`) calls
+/// [`check_fact`](BehaviorChecker::check_fact) on each asserted fact; this
+/// implementation decodes every [`Value::Code`] cell to a [`StoredBehavior`] and
+/// requires its inferred write-set to lie within `authority`. Installing code
+/// that could write outside the installing domain's authority is rejected —
+/// before any edition is allocated, so the patch–edition law holds. Holds a
+/// `&Program` to resolve the relation *names* the stored words carry to
+/// [`RelId`]s.
+///
+/// [`BehaviorChecker`]: grmpl_core::BehaviorChecker
+/// [`Value::Code`]: grmpl_core::Value::Code
+pub struct EffectChecker<'a> {
+    prog: &'a Program,
+}
+
+impl<'a> EffectChecker<'a> {
+    /// A checker resolving stored relation names against `prog`.
+    pub fn new(prog: &'a Program) -> EffectChecker<'a> {
+        EffectChecker { prog }
+    }
+}
+
+impl BehaviorChecker for EffectChecker<'_> {
+    fn check_fact(&self, fact: &Fact, authority: &Authority) -> Result<(), CoreError> {
+        for cell in fact.tuple.as_slice() {
+            if let Value::Code(_) = cell {
+                let behavior = StoredBehavior::from_value(cell)
+                    .map_err(|e| CoreError::Codec(format!("stored behavior decode: {e}")))?;
+                check_stored_behavior_authority(self.prog, &behavior, authority).map_err(|e| {
+                    CoreError::Authority(format!(
+                        "stored behavior in relation {}: {e}",
+                        fact.rel.0
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }

@@ -404,7 +404,22 @@ corresponding tickets for detail.
 * **P9 — Pattern algebra:** inputs, printing, streams.
 * **P10 — Replay & forks.**
 * **P11 — Concatenative surface.**
-* **P12 — Behaviors as relations** (live code).
+* **P12 — Behaviors as relations** (live code, landed — the defining MOO
+  capability). A behavior is ordinary data: `grmpl_core::Value::Code` (opaque
+  serialized P7 IR; `Ty::Code`; `wire::FORMAT_VERSION` bumped 2→3, store record
+  reuses `wire` so it persists unchanged). `grmpl_lang::behavior::StoredBehavior`
+  is a message-pattern guard (the reified `PredExpr` — the ticket's "guards
+  restricted to the P7 reified Pred language") plus a point-free `Word` body run
+  by the *same* interpreter as an `on`-handler arm; its codec rides the shared
+  version byte in a third IR tag namespace. Dispatch is a query: `implements_ir`
+  is the recursive `implements(entity, behavior)` view (`idea.md` §3), and
+  `select_behavior` picks the least matching behavior — so redefinition is an
+  ordinary `Patch` and the next dispatch follows (the live-code law). Committing
+  a behavior re-runs the P8b effect/authority check at the commit boundary via
+  the core `BehaviorChecker` hook (`grmpl_type::EffectChecker`, wired through
+  `grmpl_proc::commit_patch_checked`; `commit_patch` = the `NoBehaviorCheck`
+  variant). Law oracles: behavior-codec round-trip, dispatch-equals-model under
+  churn, and commit-boundary-recheck ⇔ static verdict + runtime soundness.
 * **P13 — Benchmarks,** then engine statefulness.
 * **P14 — Diff generalization** (abelian groups).
 * **P15 — Distribution.**
