@@ -24,6 +24,12 @@
 //!   matched by descending and recursing.
 //! * **bytes** ([`BytesInput`]) — a `Value::Bytes` byte string, each byte
 //!   surfaced as `Value::Int(byte)` so the same literal/capture patterns apply.
+//! * **delta stream** ([`DeltaInput`]) — a finite, edition-bounded *window* of
+//!   signed updates (P9c event mode); each delta is *reified* into a
+//!   `Value::Tuple([sign, tuple, edition])` so retraction is first-class data the
+//!   same literal/capture/guard patterns match on. A pattern never runs over a
+//!   live stream — only over a materialized finite window (see
+//!   `docs/design/p9c-delta-stream-patterns.md` §3, §4b).
 //!
 //! The measure is what makes `Repeat` terminate: every iteration must strictly
 //! lower it, so an empty match can never loop forever.
@@ -31,7 +37,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grmpl_core::Value;
+use grmpl_core::{Update, Value};
 
 /// A cursor over an ordered input with a well-founded progress measure.
 ///
@@ -142,6 +148,69 @@ impl<'a> BytesInput<'a> {
 impl<'a> MatchInput for BytesInput<'a> {
     fn next(&self) -> Option<(Value, Self)> {
         self.0.split_first().map(|(b, rest)| (Value::Int(i64::from(*b)), BytesInput(rest)))
+    }
+
+    fn measure(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Reify one signed [`Update`] as the [`Value`] the event-mode pattern matches
+/// (P9c §4b): a fixed-shape 3-tuple `[sign, tuple, edition]`, where
+///
+/// * `sign` is `Value::Int(diff.signum())` — `+1` assert, `-1` retract, `0`
+///   (a net-zero delta never reaches a window, but the sign is total);
+/// * `tuple` is the update's cells wrapped as a `Value::Tuple`;
+/// * `edition` is `Value::Int(edition)` — the commit edition from `time`
+///   (`iter`, the internal fixpoint coordinate, is deliberately dropped: it is
+///   not a window axis).
+///
+/// This is exactly the [`BytesInput`] trick lifted to updates: a sign that a
+/// monotone engine cannot "un-see" is surfaced as an ordinary field, so a
+/// `Guard` filters on it and a `Bind` captures the tuple. The reification is
+/// purely in-memory over existing `Value` constructors — **no new serialized
+/// tag and no `FORMAT_VERSION` bump** (contrast `Value::Bytes`, which did add a
+/// tag). Storage never crosses into the algebra.
+pub fn reify_delta(u: &Update) -> Value {
+    Value::Tuple(Arc::from([
+        Value::Int(u.diff.signum()),
+        Value::Tuple(u.tuple.0.clone()),
+        Value::Int(u.time.edition as i64),
+    ]))
+}
+
+/// The **delta-stream** (event mode) instance: a cursor over a finite,
+/// edition-bounded *window* of signed updates (P9c §4b). Each [`Update`] is
+/// surfaced via [`reify_delta`] as a `Value::Tuple([sign, tuple, edition])`, so
+/// retraction becomes first-class data the pattern matches on and temporal / CEP
+/// patterns — "an assert of X later followed by a retract of X" detects a
+/// delete-after-insert — become expressible. The engine stays a pure, monotone,
+/// finite-sequence relation: it matches a literal event log; the sign is just a
+/// field.
+///
+/// The cursor is over an *in-memory finite slice* — it takes no `TraceStore` and
+/// names no storage. Windowing (which calls `scan_updates`) lives *above* the
+/// pattern crate and hands it a finished `&[Update]` in commit order; the bright
+/// line holds. There is intentionally **no** cursor over a live, open-ended
+/// stream — matching requires a bound, and the bound is the window (§3).
+#[derive(Clone, Copy)]
+pub struct DeltaInput<'a>(pub &'a [Update]);
+
+impl<'a> DeltaInput<'a> {
+    /// A cursor over a finite window of updates, in commit order.
+    pub fn over(window: &'a [Update]) -> DeltaInput<'a> {
+        DeltaInput(window)
+    }
+
+    /// The updates still under the cursor.
+    pub fn updates(&self) -> &'a [Update] {
+        self.0
+    }
+}
+
+impl<'a> MatchInput for DeltaInput<'a> {
+    fn next(&self) -> Option<(Value, Self)> {
+        self.0.split_first().map(|(u, rest)| (reify_delta(u), DeltaInput(rest)))
     }
 
     fn measure(&self) -> usize {
@@ -405,6 +474,103 @@ mod tests {
     #[test]
     fn ast_descend_rejects_a_leaf() {
         assert!(AstInput::descend(&Value::Int(7)).is_none());
+    }
+
+    #[test]
+    fn delta_input_reifies_sign_tuple_and_edition() {
+        use grmpl_core::{Time, Tuple, Update};
+
+        // An assert of (foo 1) at edition 5, then a retract of it at edition 7.
+        let window = [
+            Update {
+                tuple: Tuple::from([Value::text("foo"), Value::Int(1)]),
+                time: Time::input(5),
+                diff: 1,
+            },
+            Update {
+                tuple: Tuple::from([Value::text("foo"), Value::Int(1)]),
+                time: Time::input(7),
+                diff: -1,
+            },
+        ];
+
+        // The load-bearing collapse: a *multiplicity* of 3 reifies to a sign of
+        // +1, not to 3. `TraceStore::commit` takes `Diff = i64`, so a window can
+        // genuinely carry |diff| > 1; event mode surfaces the sign only. (And
+        // the sign is total: a net-zero delta reifies to 0.)
+        assert_eq!(
+            reify_delta(&Update {
+                tuple: Tuple::from([Value::Int(9)]),
+                time: Time::input(2),
+                diff: 3,
+            }),
+            Value::Tuple(Arc::from([
+                Value::Int(1),
+                Value::Tuple(Arc::from([Value::Int(9)])),
+                Value::Int(2),
+            ])),
+            "diff=+3 must reify to sign +1, not to the raw multiplicity"
+        );
+        assert_eq!(
+            reify_delta(&Update {
+                tuple: Tuple::from([Value::Int(9)]),
+                time: Time::input(2),
+                diff: -2,
+            }),
+            Value::Tuple(Arc::from([
+                Value::Int(-1),
+                Value::Tuple(Arc::from([Value::Int(9)])),
+                Value::Int(2),
+            ])),
+            "diff=-2 must reify to sign -1, not to the raw multiplicity"
+        );
+
+        // The head reifies to [ +1, (foo 1), 5 ] — sign, tuple-as-value, edition.
+        let input = DeltaInput::over(&window);
+        let (head, rest) = input.next().expect("window is non-empty");
+        assert_eq!(
+            head,
+            Value::Tuple(Arc::from([
+                Value::Int(1),
+                Value::Tuple(Arc::from([Value::text("foo"), Value::Int(1)])),
+                Value::Int(5),
+            ]))
+        );
+        assert_eq!(rest.measure(), 1, "one update consumed");
+
+        // "An assert of X followed by a retract of X" — the delete-after-insert
+        // CEP pattern from §4b, expressed in the pure algebra because the sign is
+        // just a reified field a `Guard` filters on. Bind the first delta and
+        // require its sign is +1, then bind the second and require its sign is -1.
+        let sign_is = |var: VarId, want: i64| -> Guard {
+            Arc::new(move |b: &Bindings| {
+                matches!(b.get(&var), Some(Value::Tuple(cells)) if cells[0] == Value::Int(want))
+            })
+        };
+        let assert_then_retract = Pattern::Seq(vec![
+            Pattern::Guard(Box::new(Pattern::Bind(VarId(0))), sign_is(VarId(0), 1)),
+            Pattern::Guard(Box::new(Pattern::Bind(VarId(1))), sign_is(VarId(1), -1)),
+        ]);
+        let parses = assert_then_retract.run_in(DeltaInput::over(&window));
+        assert_eq!(parses.len(), 1, "exactly one assert→retract match over the window");
+        let (b, rest) = &parses[0];
+        assert!(rest.at_end(), "the pattern consumed the whole window");
+        // The captured deltas are the edition-5 assert and the edition-7 retract
+        // — and both are about the *same* X, which is what makes this a
+        // delete-after-insert and not merely "some assert, then some retract".
+        let delta = |var: VarId| -> (Value, Value) {
+            match b.get(&var) {
+                Some(Value::Tuple(cells)) => (cells[1].clone(), cells[2].clone()),
+                _ => panic!("{var:?} binds a reified delta"),
+            }
+        };
+        let x = Value::Tuple(Arc::from([Value::text("foo"), Value::Int(1)]));
+        let (assert_x, assert_ed) = delta(VarId(0));
+        let (retract_x, retract_ed) = delta(VarId(1));
+        assert_eq!(assert_ed, Value::Int(5), "first delta is the edition-5 assert");
+        assert_eq!(retract_ed, Value::Int(7), "second delta is the edition-7 retract");
+        assert_eq!(assert_x, x, "the asserted tuple is X");
+        assert_eq!(retract_x, x, "the retracted tuple is the same X");
     }
 
     #[test]
