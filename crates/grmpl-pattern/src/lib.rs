@@ -494,6 +494,37 @@ mod tests {
             },
         ];
 
+        // The load-bearing collapse: a *multiplicity* of 3 reifies to a sign of
+        // +1, not to 3. `TraceStore::commit` takes `Diff = i64`, so a window can
+        // genuinely carry |diff| > 1; event mode surfaces the sign only. (And
+        // the sign is total: a net-zero delta reifies to 0.)
+        assert_eq!(
+            reify_delta(&Update {
+                tuple: Tuple::from([Value::Int(9)]),
+                time: Time::input(2),
+                diff: 3,
+            }),
+            Value::Tuple(Arc::from([
+                Value::Int(1),
+                Value::Tuple(Arc::from([Value::Int(9)])),
+                Value::Int(2),
+            ])),
+            "diff=+3 must reify to sign +1, not to the raw multiplicity"
+        );
+        assert_eq!(
+            reify_delta(&Update {
+                tuple: Tuple::from([Value::Int(9)]),
+                time: Time::input(2),
+                diff: -2,
+            }),
+            Value::Tuple(Arc::from([
+                Value::Int(-1),
+                Value::Tuple(Arc::from([Value::Int(9)])),
+                Value::Int(2),
+            ])),
+            "diff=-2 must reify to sign -1, not to the raw multiplicity"
+        );
+
         // The head reifies to [ +1, (foo 1), 5 ] — sign, tuple-as-value, edition.
         let input = DeltaInput::over(&window);
         let (head, rest) = input.next().expect("window is non-empty");
@@ -524,17 +555,22 @@ mod tests {
         assert_eq!(parses.len(), 1, "exactly one assert→retract match over the window");
         let (b, rest) = &parses[0];
         assert!(rest.at_end(), "the pattern consumed the whole window");
-        // The captured deltas are the edition-5 assert and the edition-7 retract.
-        let assert_ed = match b.get(&VarId(0)) {
-            Some(Value::Tuple(cells)) => cells[2].clone(),
-            _ => panic!("VarId(0) binds a reified delta"),
+        // The captured deltas are the edition-5 assert and the edition-7 retract
+        // — and both are about the *same* X, which is what makes this a
+        // delete-after-insert and not merely "some assert, then some retract".
+        let delta = |var: VarId| -> (Value, Value) {
+            match b.get(&var) {
+                Some(Value::Tuple(cells)) => (cells[1].clone(), cells[2].clone()),
+                _ => panic!("{var:?} binds a reified delta"),
+            }
         };
-        let retract_ed = match b.get(&VarId(1)) {
-            Some(Value::Tuple(cells)) => cells[2].clone(),
-            _ => panic!("VarId(1) binds a reified delta"),
-        };
+        let x = Value::Tuple(Arc::from([Value::text("foo"), Value::Int(1)]));
+        let (assert_x, assert_ed) = delta(VarId(0));
+        let (retract_x, retract_ed) = delta(VarId(1));
         assert_eq!(assert_ed, Value::Int(5), "first delta is the edition-5 assert");
         assert_eq!(retract_ed, Value::Int(7), "second delta is the edition-7 retract");
+        assert_eq!(assert_x, x, "the asserted tuple is X");
+        assert_eq!(retract_x, x, "the retracted tuple is the same X");
     }
 
     #[test]

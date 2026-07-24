@@ -18,15 +18,21 @@
 //!      the adversarial zero-consuming inner (`Seq([])`) that the measure guard
 //!      exists to stop.
 //!   3. **Cursor equivalence.** `run == run_in` and `parse == parse_in` for the
-//!      `&[Value]` instance, and the three ordered instances agree cell-for-cell
-//!      when run over the same underlying sequence of values.
+//!      `&[Value]` instance, and all four instances agree cell-for-cell when run
+//!      over the same underlying sequence of values — for `DeltaInput`, whose
+//!      window carries `Update`s rather than `Value`s, "the same sequence" is
+//!      its reification, so the window and its reified row must match. That
+//!      equivalence is the whole claim of P9c §4b: event mode is *another
+//!      cursor* over the one algebra, never a second engine.
 //!
-//! The final section is the [`DeltaInput`] oracle for TKT-113 (P9c §4b, §8.1):
-//! over a random finite window of signed updates it pins (1) well-founded
-//! progress (the termination guarantee for matching a delta window), (2)
-//! **faithful reification** — each consumed delta is exactly
-//! `Value::Tuple([sign, tuple, edition])`, in order, no loss/dup — and (3)
-//! **determinism** — the same window yields an identical reified sequence.
+//! The final section is the [`DeltaInput`]-specific oracle for TKT-113 (P9c
+//! §4b, §8.1): over a random finite window of signed updates it pins (1)
+//! well-founded progress (the termination guarantee for matching a delta
+//! window), (2) **faithful reification** — each consumed delta is exactly
+//! `Value::Tuple([sign, tuple, edition])`, in order, no loss/dup, with the
+//! *sign* (not the raw multiplicity) in the first cell — and (3)
+//! **determinism** — the same window, and any value-equal but independently
+//! *allocated* window, yields an identical reified sequence.
 //!
 //! Every assertion prints its `seed` so a failure replays directly, and a tiny
 //! xorshift64* PRNG keeps the churn reproducible with no external `rand` dep.
@@ -281,6 +287,21 @@ fn instances_agree_over_the_same_values() {
 
             assert_eq!(via_slice, via_ast, "seed {seed}: slice vs ast-forest disagree");
             assert_eq!(via_slice, via_bytes, "seed {seed}: slice vs bytes disagree");
+
+            // …and the fourth: `DeltaInput` is *just another cursor* over the
+            // same algebra (P9c §4b). A delta window carries `Update`s, not
+            // `Value`s, so the comparable "same underlying sequence" is its
+            // reification — running the pattern over the window must equal
+            // running it over that reified row through the plain slice cursor.
+            // This is what makes event mode a cursor and not a second engine:
+            // no `DeltaInput`-specific matching behaviour may exist.
+            let window = rand_window(&mut rng);
+            let reified: Vec<Value> = window.iter().map(reify_delta).collect();
+            assert_eq!(
+                project(pat.run_in(DeltaInput::over(&window))),
+                project(pat.run_in(&reified[..])),
+                "seed {seed}: delta-window vs its reified slice disagree"
+            );
         }
     }
 }
@@ -288,13 +309,22 @@ fn instances_agree_over_the_same_values() {
 // --- DeltaInput (P9c §4b event-mode) law oracle (TKT-113) --------------------
 
 /// A random signed update over the small value domain: a 1..=3-cell tuple, a
-/// non-zero sign (`+1` assert / `-1` retract), and an arbitrary edition. A
-/// window is any finite `Vec<Update>` — the laws below hold for an arbitrary
-/// slice, so the generator does not constrain order or edition monotonicity.
+/// signed `diff` in `-3..=3`, and an arbitrary edition. A window is any finite
+/// `Vec<Update>` — the laws below hold for an arbitrary slice, so the generator
+/// does not constrain order or edition monotonicity.
+///
+/// The `diff` range is deliberately **not** `{+1, -1}`: on the unit range
+/// `signum()` is the identity, so an implementation that wrote the raw `diff`
+/// verbatim would satisfy the whole oracle. `TraceStore::commit` takes
+/// `Diff = i64`, so `scan_updates` can genuinely yield a multiplicity of `+3` or
+/// `-2`, and collapsing weight to *sign* is the load-bearing semantic choice of
+/// event mode (P9c §4b) — so the generator must produce `|diff| > 1` to pin it.
+/// `0` is included because [`reify_delta`]'s contract states the sign is total
+/// at a net-zero delta.
 fn rand_update(rng: &mut Rng) -> Update {
     let arity = 1 + rng.below(3);
     let cells: Vec<Value> = (0..arity).map(|_| Value::Int(rng.below(VDOM) as i64)).collect();
-    let diff = if rng.below(2) == 0 { 1 } else { -1 };
+    let diff = rng.below(7) as i64 - 3;
     let edition = rng.next_u64() % 64;
     Update { tuple: Tuple::new(cells), time: Time::input(edition), diff }
 }
@@ -399,6 +429,25 @@ fn delta_input_reification_is_faithful_and_in_order() {
     }
 }
 
+/// A value-equal copy of a window whose tuple cells are **freshly allocated**.
+///
+/// `Update::clone` (and so `Vec<Update>::clone`) is *not* enough to test content
+/// purity: `Tuple` is `Tuple(Arc<[Value]>)`, so cloning only bumps the refcount
+/// and hands back the *same* allocation. Rebuilding through
+/// `Tuple::new(cells.to_vec())` forces a distinct backing buffer, so a
+/// reification that keyed off an address (this repo has a confirmed `Arc`
+/// pointer-identity ABA hazard on memo keys) would visibly diverge here.
+fn realloc_window(window: &[Update]) -> Vec<Update> {
+    window
+        .iter()
+        .map(|u| Update {
+            tuple: Tuple::new(u.tuple.0.to_vec()),
+            time: u.time,
+            diff: u.diff,
+        })
+        .collect()
+}
+
 /// **Law 3 — determinism.** The reified sequence is a pure function of the
 /// window: the same slice always yields the identical sequence, and a fresh
 /// window built from value-equal (but distinctly-allocated) updates yields the
@@ -414,9 +463,16 @@ fn delta_input_reified_sequence_is_deterministic() {
             let twice = drain(&window);
             assert_eq!(once, twice, "seed {seed}: same window yielded different sequences");
 
-            // A value-equal but independently-allocated clone must match too.
-            let clone = window.clone();
-            assert_eq!(once, drain(&clone), "seed {seed}: reification is not content-pure");
+            // A value-equal, independently-*allocated* window must match too.
+            let fresh = realloc_window(&window);
+            for (u, v) in window.iter().zip(&fresh) {
+                assert_eq!(u, v, "seed {seed}: realloc_window changed a value");
+                assert!(
+                    !Arc::ptr_eq(&u.tuple.0, &v.tuple.0),
+                    "seed {seed}: realloc_window must not share the cells allocation"
+                );
+            }
+            assert_eq!(once, drain(&fresh), "seed {seed}: reification is not content-pure");
         }
     }
 }
