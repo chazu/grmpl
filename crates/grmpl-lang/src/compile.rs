@@ -34,6 +34,7 @@ use grmpl_pattern::{Form, Pattern, VarId};
 use grmpl_proc::Behavior;
 
 use crate::ast::{Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
+use crate::concat::{ConcatArm, Schemas, Word};
 use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
 use crate::parser::parse;
 
@@ -68,7 +69,9 @@ struct ViewDef {
 
 struct OnDef {
     form: String,
+    /// v1 statement arms and P11 concatenative arms coexist in one handler.
     arms: Vec<Arm>,
+    concat_arms: Vec<ConcatArm>,
 }
 
 /// A compiled program: relation schemas, views, forms, and on-handlers.
@@ -143,17 +146,38 @@ impl Program {
                 Decl::Form { name, rules } => {
                     forms.insert(name, rules);
                 }
-                Decl::On { inbox, form, arms } => {
-                    ons.insert(inbox, OnDef { form, arms });
+                Decl::On {
+                    inbox,
+                    form,
+                    stmt_arms,
+                    word_arms,
+                } => {
+                    ons.insert(
+                        inbox,
+                        OnDef {
+                            form,
+                            arms: stmt_arms,
+                            concat_arms: word_arms,
+                        },
+                    );
                 }
             }
         }
-        Ok(Program {
+        let prog = Program {
             rels,
             views,
             forms,
             ons,
-        })
+        };
+        // "Declared stack effects first": statically check every concatenative
+        // arm's cell arithmetic now, so a malformed point-free body fails at
+        // compile time rather than mid-commit.
+        for on in prog.ons.values() {
+            for arm in &on.concat_arms {
+                arm.check(&prog)?;
+            }
+        }
+        Ok(prog)
     }
 
     /// The yielded column names of a view (in order).
@@ -161,11 +185,20 @@ impl Program {
         self.views.get(name).map(|v| v.yields.as_slice())
     }
 
-    /// The arms of the `on` handler bound to `inbox`, or `None` if none is
-    /// declared. Exposed so P8b effect-row inference can walk a handler's write
-    /// statements (`assert`/`retract`/`emit`) without re-parsing the source.
+    /// The statement arms of the `on` handler bound to `inbox`, or `None` if none
+    /// is declared. Exposed so P8b effect-row inference can walk a handler's
+    /// write statements (`assert`/`retract`/`emit`) without re-parsing the
+    /// source. Concatenative arms are exposed separately via
+    /// [`on_concat_arms`](Self::on_concat_arms).
     pub fn on_arms(&self, inbox: &str) -> Option<&[Arm]> {
         self.ons.get(inbox).map(|o| o.arms.as_slice())
+    }
+
+    /// The concatenative (point-free) arms of the `on` handler bound to `inbox`.
+    /// Exposed alongside [`on_arms`](Self::on_arms) so effect inference and other
+    /// passes treat both surfaces uniformly — the two coexist over one handler.
+    pub fn on_concat_arms(&self, inbox: &str) -> Option<&[ConcatArm]> {
+        self.ons.get(inbox).map(|o| o.concat_arms.as_slice())
     }
 
     /// The `RelId` assigned to a declared relation.
@@ -486,10 +519,11 @@ impl Program {
             .ok_or_else(|| format!("no on-handler for `{inbox}`"))?;
         let form = prog.form(&on.form)?;
         let arms = on.arms.clone();
+        let concat_arms = on.concat_arms.clone();
         let prog = Arc::clone(prog);
         Ok(Box::new(
             move |snap: &Snapshot, body: &Tuple| -> CoreResult<Patch> {
-                run_behavior(&prog, &form, &arms, self_entity, snap, body)
+                run_behavior(&prog, &form, &arms, &concat_arms, self_entity, snap, body)
             },
         ))
     }
@@ -499,10 +533,12 @@ fn rt_err(s: impl Into<String>) -> Error {
     Error::Codec(s.into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_behavior(
     prog: &Program,
     form: &Form,
     arms: &[Arm],
+    concat_arms: &[ConcatArm],
     self_entity: Entity,
     snap: &Snapshot,
     body: &Tuple,
@@ -531,7 +567,216 @@ fn run_behavior(
             return Ok(exec_stmts(prog, &arm.stmts, &mut env, snap)?.unwrap_or_default());
         }
     }
+    // A concatenative arm handles the same tags, over the same primitives; the
+    // two surfaces coexist in one handler.
+    for arm in concat_arms {
+        if arm.tag == tag && parts.len() == arm.vars.len() + 1 {
+            return Ok(run_concat(prog, arm, self_entity, snap, &parts)?.unwrap_or_default());
+        }
+    }
     Ok(Patch::new())
+}
+
+/// Run a concatenative arm point-free: seed the value stack with the
+/// constructor arguments, apply each word, and return the accumulated patch.
+///
+/// The seam words reuse the **exact** primitives of [`exec_stmts`] — view
+/// instantiation, least-tuple selection, `snap.read`, and the `Patch` builder —
+/// so a word arm and the equivalent statement arm build an identical patch and
+/// thus commit identical editions. As in v1, a `resolve`/`find` that matches
+/// nothing yields `None` (the arm makes no change).
+///
+/// `parts` is the parsed command `[Tag, arg0, …]`; `parts[1..]` are the initial
+/// stack. [`ConcatArm::check`] has already proved the body never underflows and
+/// consumes its stack, so a pop here is infallible in practice; the guarded
+/// [`pop`] returns a codec error rather than panicking if that ever fails.
+fn run_concat(
+    prog: &Program,
+    arm: &ConcatArm,
+    self_entity: Entity,
+    snap: &Snapshot,
+    parts: &[Value],
+) -> CoreResult<Option<Patch>> {
+    let mut stack: Vec<Value> = parts[1..].to_vec();
+    let mut patch = Patch::new();
+
+    for word in &arm.words {
+        match word {
+            Word::SelfEntity => stack.push(Value::Ent(self_entity)),
+            Word::Lit(v) => stack.push(v.clone()),
+            Word::Dup => {
+                let a = top(&stack)?.clone();
+                stack.push(a);
+            }
+            Word::Drop => {
+                pop(&mut stack)?;
+            }
+            Word::Swap => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(b);
+                stack.push(a);
+            }
+            Word::Over => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(a.clone());
+                stack.push(b);
+                stack.push(a);
+            }
+            Word::Rot => {
+                let c = pop(&mut stack)?;
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(b);
+                stack.push(c);
+                stack.push(a);
+            }
+            Word::Nip => {
+                let b = pop(&mut stack)?;
+                pop(&mut stack)?;
+                stack.push(b);
+            }
+            Word::Tuck => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(b.clone());
+                stack.push(a);
+                stack.push(b);
+            }
+            Word::TwoDup => {
+                let b = pop(&mut stack)?;
+                let a = pop(&mut stack)?;
+                stack.push(a.clone());
+                stack.push(b.clone());
+                stack.push(a);
+                stack.push(b);
+            }
+            Word::TwoDrop => {
+                pop(&mut stack)?;
+                pop(&mut stack)?;
+            }
+            Word::Resolve { view, col, op } => {
+                let params = prog
+                    .views
+                    .get(view)
+                    .map(|v| v.params.len())
+                    .ok_or_else(|| rt_err(format!("no view `{view}`")))?;
+                let key = pop(&mut stack)?;
+                let args = pop_n(&mut stack, params)?; // param0..paramN (reversed by pop_n)
+                let q = prog.view(view, &args).map_err(rt_err)?;
+                let yields = prog
+                    .view_yields(view)
+                    .ok_or_else(|| rt_err(format!("no view `{view}`")))?
+                    .to_vec();
+                let ci = yields
+                    .iter()
+                    .position(|y| y == col)
+                    .ok_or_else(|| rt_err(format!("view `{view}` has no column `{col}`")))?;
+                let rows = q.find(snap)?;
+                // Deterministic choice: the *least* matching tuple, exactly as
+                // `Stmt::Resolve` chooses.
+                let picked = rows
+                    .into_iter()
+                    .filter(|(t, _)| col_match(*op, &t.as_slice()[ci], &key))
+                    .min_by(|(a, _), (b, _)| a.cmp(b));
+                match picked {
+                    Some((t, _)) => {
+                        for i in 0..yields.len() {
+                            stack.push(t.as_slice()[i].clone());
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+            Word::Find { rel, keyn } => {
+                let rid = prog
+                    .rel_id(rel)
+                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+                let keys = pop_n(&mut stack, *keyn)?; // col0..col{keyn-1}
+                let rows = snap.read(rid)?;
+                let picked = rows
+                    .into_iter()
+                    .filter(|(t, _)| {
+                        keys.iter()
+                            .enumerate()
+                            .all(|(i, k)| t.as_slice().get(i) == Some(k))
+                    })
+                    .min_by(|(a, _), (b, _)| a.cmp(b));
+                match picked {
+                    Some((t, _)) => {
+                        for v in t.as_slice() {
+                            stack.push(v.clone());
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+            Word::Expect(rel) => {
+                let f = pop_fact(prog, rel, &mut stack)?;
+                patch = patch.expect(f);
+            }
+            Word::Assert(rel) => {
+                let f = pop_fact(prog, rel, &mut stack)?;
+                patch = patch.assert(f);
+            }
+            Word::Retract(rel) => {
+                let f = pop_fact(prog, rel, &mut stack)?;
+                patch = patch.retract(f);
+            }
+            Word::Emit(rel) => {
+                let rid = prog
+                    .rel_id(rel)
+                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+                let arity = prog.rel_columns(rel).map(|c| c.len()).unwrap_or(0);
+                let cols = pop_n(&mut stack, arity)?;
+                patch = patch.emit(Message {
+                    inbox: rid,
+                    body: Tuple::new(cols),
+                });
+            }
+        }
+    }
+    Ok(Some(patch))
+}
+
+fn top(stack: &[Value]) -> CoreResult<&Value> {
+    stack.last().ok_or_else(|| rt_err("concatenative stack underflow"))
+}
+
+fn pop(stack: &mut Vec<Value>) -> CoreResult<Value> {
+    stack.pop().ok_or_else(|| rt_err("concatenative stack underflow"))
+}
+
+/// Pop `n` cells and return them in **column order** (deepest popped = index 0),
+/// undoing the stack's last-in-first-out order.
+fn pop_n(stack: &mut Vec<Value>, n: usize) -> CoreResult<Vec<Value>> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(pop(stack)?);
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// Pop a relation's `arity` columns (in column order) into a [`Fact`].
+fn pop_fact(prog: &Program, rel: &str, stack: &mut Vec<Value>) -> CoreResult<Fact> {
+    let rid = prog
+        .rel_id(rel)
+        .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
+    let arity = prog.rel_columns(rel).map(|c| c.len()).unwrap_or(0);
+    let cols = pop_n(stack, arity)?;
+    Ok(Fact::new(rid, Tuple::new(cols)))
+}
+
+impl Schemas for Program {
+    fn view_shape(&self, view: &str) -> Option<(usize, usize)> {
+        self.views.get(view).map(|v| (v.params.len(), v.yields.len()))
+    }
+
+    fn rel_arity(&self, rel: &str) -> Option<usize> {
+        self.rels.get(rel).map(|r| r.arity())
+    }
 }
 
 /// Run an arm's statements, building a patch. `Ok(None)` means a `resolve`/`find`

@@ -49,7 +49,7 @@ use std::fmt;
 
 use grmpl_core::{Authority, RelId};
 use grmpl_lang::ast::Stmt;
-use grmpl_lang::Program;
+use grmpl_lang::{Program, Word};
 
 /// The inferred **effect row** of an `on` handler: the relations it may write,
 /// at relation granularity, split by write kind. Both sets are deterministically
@@ -125,11 +125,16 @@ impl std::error::Error for EffectError {}
 
 /// Infer the [`EffectRow`] of the `on` handler bound to `inbox`.
 ///
-/// Walks every arm's statements, resolving each `assert`/`retract`/`emit`
-/// relation name to its [`RelId`] against `prog`. `resolve`/`find`/`expect` are
-/// reads (and `expect` is a precondition), not effects, so they contribute
-/// nothing. Errors with [`EffectError::NoHandler`] if `inbox` has no handler, or
-/// [`EffectError::UndeclaredRelation`] if a write names an undeclared relation.
+/// Walks every arm — both statement arms and P11 concatenative (point-free)
+/// arms, which coexist in one handler — resolving each write's relation name to
+/// its [`RelId`] against `prog`. In either surface, `assert`/`retract` are world
+/// writes and `emit` is a send; `resolve`/`find`/`expect` (and every stack
+/// shuffler) are reads or preconditions and contribute nothing. Because both
+/// surfaces name their write relations the same way, the effect row — and the
+/// Authority guarantee it feeds — is identical whichever surface the handler is
+/// written in. Errors with [`EffectError::NoHandler`] if `inbox` has no handler,
+/// or [`EffectError::UndeclaredRelation`] if a write names an undeclared
+/// relation.
 pub fn infer_handler_effects(prog: &Program, inbox: &str) -> Result<EffectRow, EffectError> {
     let arms = prog
         .on_arms(inbox)
@@ -146,6 +151,23 @@ pub fn infer_handler_effects(prog: &Program, inbox: &str) -> Result<EffectRow, E
                 }
                 // Reads and preconditions produce no world effect.
                 Stmt::Resolve { .. } | Stmt::Find { .. } | Stmt::Expect { .. } => {}
+            }
+        }
+    }
+    // Concatenative arms name the same write relations; scan their words too so
+    // the effect row is surface-agnostic.
+    let concat_arms = prog.on_concat_arms(inbox).unwrap_or(&[]);
+    for arm in concat_arms {
+        for word in &arm.words {
+            match word {
+                Word::Assert(rel) | Word::Retract(rel) => {
+                    row.writes.insert(rel_id(prog, rel)?);
+                }
+                Word::Emit(rel) => {
+                    row.sends.insert(rel_id(prog, rel)?);
+                }
+                // Pushers, shufflers, reads, and preconditions: no world effect.
+                _ => {}
             }
         }
     }

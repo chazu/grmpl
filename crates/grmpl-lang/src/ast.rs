@@ -83,5 +83,15 @@ pub enum Decl {
     Rel { name: String, cols: Vec<ColDecl> },
     View { name: String, params: Vec<String>, atoms: Vec<Atom>, yields: Vec<String> },
     Form { name: String, rules: Vec<FormRule> },
-    On { inbox: String, form: String, arms: Vec<Arm> },
+    /// An `on` handler binding executable behavior to an inbox. Its arms may be
+    /// written in either surface and freely mixed: `stmt_arms` are the v1
+    /// statement bodies (`match Tag(v) { stmt* }`), `word_arms` are the
+    /// concatenative point-free bodies (`match Tag(v) [ word* ]`). Both lower to
+    /// the same effect plumbing (`compile.rs`).
+    On {
+        inbox: String,
+        form: String,
+        stmt_arms: Vec<Arm>,
+        word_arms: Vec<crate::concat::ConcatArm>,
+    },
 }
