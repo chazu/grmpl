@@ -7,9 +7,12 @@
 //! ## Physical layout
 //!
 //! * One fjall keyspace per relation, named `rel_{id}`.
-//! * One meta keyspace `__meta` holding the current edition under key `edition`
-//!   and the name→`RelId` catalog under keys `cat:{name}` → `RelId(4, BE)`
-//!   (the [`Catalog`] boundary — see `grmpl_core::store`).
+//! * One meta keyspace `__meta` holding the current edition under key `edition`,
+//!   the name→`RelId` catalog under keys `cat:{name}` → `RelId(4, BE)` (the
+//!   [`Catalog`] boundary), and the schema registry under keys
+//!   `sch:{rel(4, BE)}{edition(8, BE)}` → `encode_schema` bytes — one row per
+//!   schema version, versioned by the introducing edition (the
+//!   [`SchemaCatalog`] boundary). See `grmpl_core::store`.
 //! * Within a relation keyspace: `key = edition(8, BE) || counter(8, BE)`,
 //!   `value = version(1) || diff(8, LE) || encoded_tuple` (record framing in
 //!   `codec`; the version byte is `grmpl_core::wire::FORMAT_VERSION`).
@@ -27,13 +30,17 @@ use std::sync::Mutex;
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{
-    Catalog, Diff, Edition, EditionStore, Error, Result, RelId, TraceStore, Tuple, Update,
+    wire, Catalog, Diff, Edition, EditionStore, Error, Result, RelId, Schema, SchemaCatalog,
+    TraceStore, Tuple, Update,
 };
 
 const META_KS: &str = "__meta";
 const EDITION_KEY: &[u8] = b"edition";
 /// Key prefix under `__meta` for catalog entries: `cat:{name}` → `RelId(4, BE)`.
 const CAT_PREFIX: &[u8] = b"cat:";
+/// Key prefix under `__meta` for schema versions:
+/// `sch:{rel(4, BE)}{edition(8, BE)}` → `encode_schema` bytes.
+const SCH_PREFIX: &[u8] = b"sch:";
 
 fn map_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
@@ -247,6 +254,89 @@ impl Catalog for FjallStore {
         out.sort();
         Ok(out)
     }
+}
+
+impl SchemaCatalog for FjallStore {
+    fn put_schema(&self, rel: RelId, schema: &Schema, at: Edition) -> Result<()> {
+        // Compare against the current (highest-edition) version, if any.
+        if let Some((cur_edition, current)) = self.latest_schema_version(rel)? {
+            if &current == schema {
+                return Ok(()); // idempotent re-put — no new version
+            }
+            // Evolution law: additive-only, and strictly after the current
+            // version's edition (a version's edition is when it took effect).
+            if !schema.is_additive_over(&current) {
+                return Err(Error::Schema(format!(
+                    "non-additive schema change for relation {}: a new version may only \
+                     append columns to the current one",
+                    rel.0
+                )));
+            }
+            if at.0 <= cur_edition {
+                return Err(Error::Schema(format!(
+                    "schema evolution for relation {} must take effect after edition {} \
+                     (got {})",
+                    rel.0, cur_edition, at.0
+                )));
+            }
+        }
+        let mut batch = self.db.batch();
+        batch.insert(&self.meta, sch_key(rel, at.0), wire::encode_schema(schema));
+        batch.commit().map_err(map_err)?;
+        self.db.persist(PersistMode::SyncAll).map_err(map_err)?;
+        Ok(())
+    }
+
+    fn schema(&self, rel: RelId) -> Result<Option<Schema>> {
+        Ok(self.latest_schema_version(rel)?.map(|(_, s)| s))
+    }
+
+    fn schema_at(&self, rel: RelId, at: Edition) -> Result<Option<Schema>> {
+        // The newest version whose introducing edition is ≤ `at`.
+        let mut best: Option<(u64, Schema)> = None;
+        for (edition, schema) in self.schema_versions(rel)? {
+            if edition <= at.0 && best.as_ref().is_none_or(|(e, _)| edition > *e) {
+                best = Some((edition, schema));
+            }
+        }
+        Ok(best.map(|(_, s)| s))
+    }
+}
+
+impl FjallStore {
+    /// All schema versions recorded for `rel`, as `(introducing_edition, schema)`.
+    fn schema_versions(&self, rel: RelId) -> Result<Vec<(u64, Schema)>> {
+        let prefix = sch_prefix(rel);
+        let mut out = Vec::new();
+        for kv in self.meta.iter() {
+            let (k, v) = kv.into_inner().map_err(map_err)?;
+            if k.as_ref().starts_with(&prefix) {
+                let edition = u64_be(&k.as_ref()[prefix.len()..prefix.len() + 8]);
+                out.push((edition, wire::decode_schema(v.as_ref())?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The highest-edition schema version for `rel`, if any.
+    fn latest_schema_version(&self, rel: RelId) -> Result<Option<(u64, Schema)>> {
+        Ok(self.schema_versions(rel)?.into_iter().max_by_key(|(e, _)| *e))
+    }
+}
+
+/// Key prefix for every schema version of `rel`: `sch:{rel(4, BE)}`.
+fn sch_prefix(rel: RelId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(SCH_PREFIX.len() + 4);
+    k.extend_from_slice(SCH_PREFIX);
+    k.extend_from_slice(&rel.0.to_be_bytes());
+    k
+}
+
+/// Full key for one schema version: `sch:{rel(4, BE)}{edition(8, BE)}`.
+fn sch_key(rel: RelId, edition: u64) -> Vec<u8> {
+    let mut k = sch_prefix(rel);
+    k.extend_from_slice(&edition.to_be_bytes());
+    k
 }
 
 fn cat_key(name: &str) -> Vec<u8> {

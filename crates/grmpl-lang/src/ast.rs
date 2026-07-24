@@ -2,6 +2,15 @@
 //! and `form` — the declarative parts that lower directly to `Query`/`Pattern`.
 //! `on` (which binds executable behavior) remains a programmatic construction.
 
+/// A declared column of a `rel`: a name and an optional type annotation. The
+/// type is kept as its surface spelling here (e.g. `"Ent"`); `compile` maps it
+/// to a core `Ty`, defaulting an unannotated column to the permissive `Any`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ColDecl {
+    pub name: String,
+    pub ty: Option<String>,
+}
+
 /// An argument to a view atom: a variable, or a literal.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Arg {
@@ -71,7 +80,7 @@ pub struct Arm {
 /// A top-level declaration.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Decl {
-    Rel { name: String, cols: Vec<String> },
+    Rel { name: String, cols: Vec<ColDecl> },
     View { name: String, params: Vec<String>, atoms: Vec<Atom>, yields: Vec<String> },
     Form { name: String, rules: Vec<FormRule> },
     On { inbox: String, form: String, arms: Vec<Arm> },

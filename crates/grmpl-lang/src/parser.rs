@@ -2,16 +2,18 @@
 //!
 //! ```text
 //! program := decl*
-//! decl    := "rel"  Ident "(" identlist ")"
+//! decl    := "rel"  Ident "(" collist ")"
 //!          | "view" Ident "(" identlist? ")" "{" atom* "yield" identlist "}"
 //!          | "form" Ident "{" rule* "}"
+//! collist := col ("," col)*
+//! col     := Ident (":" Ident)?          // column name and optional type
 //! atom    := Ident "(" arg ("," arg)* ")"
 //! arg     := Ident | Str | Int
 //! rule    := patom+ "->" Ident "(" identlist? ")"
 //! patom   := Str | Ident
 //! ```
 
-use crate::ast::{Arg, Arm, Atom, Decl, FormRule, MatchOp, PAtom, SArg, Stmt};
+use crate::ast::{Arg, Arm, Atom, ColDecl, Decl, FormRule, MatchOp, PAtom, SArg, Stmt};
 use crate::lexer::{lex, Token};
 
 pub fn parse(src: &str) -> Result<Vec<Decl>, String> {
@@ -79,9 +81,30 @@ impl Parser {
         self.next(); // rel
         let name = self.ident()?;
         self.expect(&Token::LParen)?;
-        let cols = self.identlist()?;
+        let cols = self.collist()?;
         self.expect(&Token::RParen)?;
         Ok(Decl::Rel { name, cols })
+    }
+
+    /// `collist := col ("," col)*` where `col := Ident (":" Ident)?`.
+    fn collist(&mut self) -> Result<Vec<ColDecl>, String> {
+        let mut out = vec![self.col_decl()?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.next();
+            out.push(self.col_decl()?);
+        }
+        Ok(out)
+    }
+
+    fn col_decl(&mut self) -> Result<ColDecl, String> {
+        let name = self.ident()?;
+        let ty = if matches!(self.peek(), Some(Token::Colon)) {
+            self.next(); // :
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        Ok(ColDecl { name, ty })
     }
 
     fn view_decl(&mut self) -> Result<Decl, String> {

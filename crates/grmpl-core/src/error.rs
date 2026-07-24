@@ -10,6 +10,9 @@ pub enum Error {
     Store(String),
     /// A patch tried to write outside its authority domain (Authority law).
     Authority(String),
+    /// A write violated its relation's schema — wrong arity or column type — or
+    /// a schema evolution was not additive (P1 relation schemas).
+    Schema(String),
     /// An optimistic commit's precondition no longer held (DESIGN.md §5.2).
     PreconditionFailed,
     /// A physical (de)serialization failure below the line.
@@ -21,6 +24,7 @@ impl fmt::Display for Error {
         match self {
             Error::Store(s) => write!(f, "store error: {s}"),
             Error::Authority(s) => write!(f, "authority violation: {s}"),
+            Error::Schema(s) => write!(f, "schema violation: {s}"),
             Error::PreconditionFailed => write!(f, "precondition failed"),
             Error::Codec(s) => write!(f, "codec error: {s}"),
         }

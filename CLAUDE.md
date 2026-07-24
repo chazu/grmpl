@@ -66,6 +66,28 @@ bound, never silently changes (rebinding to a different id is an error). The
 durable map is a store concern — the language resolves stable ids across reopens
 through the trait without ever naming the storage engine.
 
+### Relation schemas (`grmpl-core::schema`, `SchemaCatalog`)
+
+Every relation may carry a **schema**: an ordered list of named, typed columns
+(`Ty` = `Ent`/`Int`/`Text`/`Bool`/`Tuple`/`Any`). Like the catalog, the schema
+types and the invariant logic (`Schema::check`, `Schema::is_additive_over`) are
+**core**; the durable registry is a **store** concern — `grmpl-store` persists
+each version in `__meta` under `sch:{rel}{edition}` keys, **versioned by the
+edition** it took effect (so `schema_at` answers as-of queries).
+
+* **Additive-only evolution.** A relation's schema may only *grow*: a new
+  version must be a prefix-superset of the current one (existing columns
+  unchanged, only appended) at a strictly later edition. Any other change is
+  `Error::Schema`. A re-put of the identical schema is idempotent.
+* **Commit-boundary enforcement.** Beside the Authority check in `commit_patch`
+  and `Domain::commit`, every asserted/retracted world fact whose relation has a
+  registered schema must conform (arity + column types). Schemas are **opt-in**:
+  an unregistered relation is unchecked. Enforcement takes a `&dyn
+  SchemaCatalog` (`NoSchemas` opts out).
+* **One serialization.** Schemas are framed by `grmpl_core::wire::encode_schema`
+  under the shared `FORMAT_VERSION` byte (a separate `Ty` tag namespace); a
+  change to either the value tags or the schema `Ty` tags bumps the version.
+
 ### Patch–edition law (`DESIGN.md` §4.1, §5.2)
 
 A `commit` allocates the next edition **and** writes atomically, or has no
