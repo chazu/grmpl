@@ -301,7 +301,13 @@ fn exec_stmts(
                     .ok_or_else(|| rt_err(format!("view `{view}` has no column `{col}`")))?;
                 let want = sarg(rhs, env)?;
                 let rows = q.find(snap)?;
-                match rows.into_iter().find(|(t, _)| col_match(*op, &t.as_slice()[ci], &want)) {
+                // Deterministic choice: bind to the *least* matching tuple, not
+                // whichever the scan happened to surface first.
+                let picked = rows
+                    .into_iter()
+                    .filter(|(t, _)| col_match(*op, &t.as_slice()[ci], &want))
+                    .min_by(|(a, _), (b, _)| a.cmp(b));
+                match picked {
                     Some((t, _)) => {
                         for (i, y) in yields.iter().enumerate() {
                             env.insert(y.clone(), t.as_slice()[i].clone());
@@ -318,10 +324,12 @@ fn exec_stmts(
                     .enumerate()
                     .filter_map(|(i, a)| sarg_opt(a, env).map(|v| (i, v)))
                     .collect();
-                match rows
+                // Deterministic choice: bind to the *least* matching tuple.
+                let picked = rows
                     .into_iter()
-                    .find(|(t, _)| bound.iter().all(|(i, v)| t.as_slice().get(*i) == Some(v)))
-                {
+                    .filter(|(t, _)| bound.iter().all(|(i, v)| t.as_slice().get(*i) == Some(v)))
+                    .min_by(|(a, _), (b, _)| a.cmp(b));
+                match picked {
                     Some((t, _)) => {
                         for (i, a) in args.iter().enumerate() {
                             if let SArg::Var(name) = a {

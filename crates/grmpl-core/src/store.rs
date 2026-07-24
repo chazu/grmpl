@@ -54,3 +54,26 @@ pub trait TraceStore: EditionStore {
     /// `watch` delta primitive (used from M2 on).
     fn scan_updates(&self, rel: RelId, from: Edition, to: Edition) -> Result<Vec<Update>>;
 }
+
+/// A durable directory mapping interned relation *names* to their [`RelId`].
+///
+/// **Store-API boundary decision.** The *catalog contract* is declared here in
+/// the core — names are `&str` and ids are `RelId`, both storage-agnostic core
+/// types — while the durable map itself is a store concern (`grmpl-store`
+/// persists it in its `__meta` keyspace, next to the edition clock). It is kept
+/// deliberately separate from [`TraceStore`]: naming is orthogonal to the
+/// edition/tuple trace, so a store may implement one without the other, and the
+/// language layer resolves/allocates *stable* ids across reopens through this
+/// trait without ever naming the storage engine. The catalog is append-only —
+/// a name's id, once bound, never silently changes.
+pub trait Catalog: Send + Sync {
+    /// The [`RelId`] bound to `name`, or `None` if the name is unregistered.
+    fn rel_id(&self, name: &str) -> Result<Option<RelId>>;
+
+    /// Bind `name` to `id`. Idempotent when `name` already maps to `id`; errors
+    /// if `name` is already bound to a *different* id.
+    fn register(&self, name: &str, id: RelId) -> Result<()>;
+
+    /// The whole catalog, sorted by name — for reload and inspection.
+    fn entries(&self) -> Result<Vec<(String, RelId)>>;
+}
