@@ -357,11 +357,18 @@ pub trait Transport: Send + Sync {
 - **`Edition` ↔ `SeqNo`** *below the line only*: fjall's `SeqNo` is monotonic;
   higher shadows lower (MVCC). We map an `Edition` to a seqno watermark. Above
   the boundary, `Edition` is opaque.
-- **Retention caveat (real):** fjall lazily GCs stale versions during
-  compaction. Time-travel (post-v1) therefore requires **pinning snapshots** (a
-  live snapshot handle prevents GC of versions it can see) or an explicit
-  retention policy. v1 keeps only the latest edition live and does not promise
-  as-of reads below the compaction horizon.
+- **Retention caveat (superseded by P6).** This paragraph imagined leaning on
+  fjall's MVCC — lazy GC of stale versions during compaction, time-travel via
+  pinned snapshots, "only the latest edition live." **P6 does not.** Because
+  `grmpl-store` owns an append-only `(edition, counter)` row per update (not one
+  shadowing KV version per key), as-of reads are exact *by construction* at every
+  surviving edition, and retention is an **explicit consolidation watermark** the
+  store manages — `consolidate` folds history ≤ the watermark into a per-relation
+  checkpoint and discards the raw rows, turning the as-of read into
+  `O(checkpoint + tail)`. Reads/scans below the watermark are a hard `Error`
+  (the four *edition doors*), and the GC policy (`grmpl-proc::gc`) never advances
+  the watermark past the minimum durable watch cursor. See ROADMAP "P6 —
+  History".
 
 ### 4.2 iroh mapping (deferred; designed-for)
 

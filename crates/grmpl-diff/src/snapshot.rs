@@ -1,6 +1,6 @@
 //! `Snapshot` — an immutable read of the world at one edition (DESIGN.md §2.3 #5).
 
-use grmpl_core::{Diff, Edition, Fact, Result, RelId, TraceStore, Tuple};
+use grmpl_core::{Diff, Edition, Fact, Result, RelId, Schema, SchemaCatalog, TraceStore, Tuple};
 
 use crate::multiset;
 use crate::query::{eval_snapshot, Query};
@@ -34,6 +34,17 @@ impl<'a> Snapshot<'a> {
             }
         }
         Ok(false)
+    }
+
+    /// The column [`Schema`] of `rel` in effect **as-of this snapshot's edition**
+    /// — the P1 schema-at-edition surface paired with as-of `find q at E`, so a
+    /// caller reading the world at a past edition sees the *typing that was in
+    /// force then*, not today's. `None` if `rel` carried no registered schema by
+    /// then. Subject to the same P6 watermark floor as the data: a snapshot
+    /// pinned below the consolidation horizon cannot be read (`read`/`find` at it
+    /// error), so its as-of schema is only meaningful at or above the watermark.
+    pub fn schema(&self, schemas: &dyn SchemaCatalog, rel: RelId) -> Result<Option<Schema>> {
+        schemas.schema_at(rel, self.edition)
     }
 }
 
