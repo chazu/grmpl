@@ -81,6 +81,152 @@ fn ctor_spec_builds_tagged_tuple_and_lowers() {
     );
 }
 
+// ---- P9b: invertible printing over CtorSpec ----
+
+#[test]
+fn ctor_spec_print_inverts_build() {
+    let spec = CtorSpec {
+        tag: "Take".into(),
+        args: vec![VarId(0)],
+    };
+    let mut b: Bindings = Bindings::new();
+    b.insert(VarId(0), Value::text("lamp"));
+    let built = spec.build(&b);
+    // build -> print recovers the binding; print -> build reproduces the value.
+    assert_eq!(spec.print(&built), Some(b.clone()));
+    assert_eq!(spec.build(&spec.print(&built).unwrap()), built);
+
+    // shape guards: wrong tag, wrong arity, and non-tuple all reject.
+    let wrong_tag = Value::Tuple(Arc::from(vec![Value::text("Drop"), Value::text("lamp")]));
+    assert_eq!(spec.print(&wrong_tag), None);
+    let wrong_arity = Value::Tuple(Arc::from(vec![Value::text("Take")]));
+    assert_eq!(spec.print(&wrong_arity), None);
+    assert_eq!(spec.print(&Value::text("Take")), None);
+
+    // nullary ctor: only the bare tag tuple prints, to empty bindings.
+    let nil = CtorSpec {
+        tag: "Look".into(),
+        args: vec![],
+    };
+    assert_eq!(
+        nil.print(&Value::Tuple(Arc::from(vec![Value::text("Look")]))),
+        Some(Bindings::new())
+    );
+}
+
+#[test]
+fn ctor_spec_is_invertible_flags_repeated_vars() {
+    let injective = CtorSpec {
+        tag: "Pair".into(),
+        args: vec![VarId(0), VarId(1)],
+    };
+    let repeated = CtorSpec {
+        tag: "Pair".into(),
+        args: vec![VarId(0), VarId(0)],
+    };
+    assert!(injective.is_invertible());
+    assert!(!repeated.is_invertible());
+    assert!(CtorSpec {
+        tag: "Nil".into(),
+        args: vec![],
+    }
+    .is_invertible());
+
+    // A shape-valid value whose two slots disagree: the repeated-var spec cannot
+    // rebuild it (that is exactly what is_invertible() warns about), while the
+    // injective spec round-trips it cleanly.
+    let v = Value::Tuple(Arc::from(vec![
+        Value::text("Pair"),
+        Value::Int(1),
+        Value::Int(2),
+    ]));
+    assert_ne!(repeated.build(&repeated.print(&v).unwrap()), v);
+    assert_eq!(injective.build(&injective.print(&v).unwrap()), v);
+}
+
+/// Randomized round-trip law oracle (seeded xorshift64*, no new dep; seed
+/// printed on every failure for replay). Over random specs — with a small
+/// variable pool so repeats, hence non-invertible specs, occur often — it
+/// checks the two directions of the P9b law each round:
+///   * build → print recovers every argument variable (holds for ANY spec);
+///   * for invertible specs, print → build is an exact two-sided inverse on
+///     every shape-valid value.
+#[test]
+fn ctor_spec_roundtrip_law_holds_under_random_churn() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+    fn rand_value(rng: &mut Rng) -> Value {
+        match rng.below(3) {
+            0 => Value::Int((rng.next() % 100) as i64),
+            1 => Value::text(["a", "b", "c", "lamp", "take"][rng.below(5) as usize]),
+            _ => Value::Bool(rng.below(2) == 0),
+        }
+    }
+    fn rand_spec(rng: &mut Rng) -> CtorSpec {
+        let tag = ["Take", "Look", "Go", "Use"][rng.below(4) as usize].to_string();
+        let n = rng.below(5); // 0..=4 slots
+        // pool of 3 variables => repeats (non-invertible specs) are common.
+        let args = (0..n).map(|_| VarId(rng.below(3) as u32)).collect();
+        CtorSpec { tag, args }
+    }
+
+    for seed in 1..=64u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        for _ in 0..40 {
+            let spec = rand_spec(&mut rng);
+
+            // Direction 1 — build then print recovers every argument variable,
+            // for ANY spec, given a binding that binds all of its args.
+            let mut b: Bindings = Bindings::new();
+            for &v in &spec.args {
+                b.entry(v).or_insert_with(|| rand_value(&mut rng));
+            }
+            let built = spec.build(&b);
+            let recovered = spec
+                .print(&built)
+                .unwrap_or_else(|| panic!("seed {seed}: print rejected build output {built:?}"));
+            for &v in &spec.args {
+                assert_eq!(
+                    recovered.get(&v),
+                    b.get(&v),
+                    "seed {seed}: build->print lost var {v:?} for {spec:?}"
+                );
+            }
+
+            // Direction 2 — for INVERTIBLE specs, print is an exact two-sided
+            // inverse on every shape-valid value; for all specs, print;build is
+            // idempotent (its image is a fixpoint).
+            let mut slots = vec![Value::text(&spec.tag)];
+            slots.extend((0..spec.args.len()).map(|_| rand_value(&mut rng)));
+            let v = Value::Tuple(Arc::from(slots));
+            let rebuilt = spec.build(&spec.print(&v).expect("shape-valid value must print"));
+            if spec.is_invertible() {
+                assert_eq!(
+                    rebuilt, v,
+                    "seed {seed}: invertible print->build is not identity for {spec:?}"
+                );
+            }
+            assert_eq!(
+                spec.build(&spec.print(&rebuilt).unwrap()),
+                rebuilt,
+                "seed {seed}: print;build not idempotent for {spec:?}"
+            );
+        }
+    }
+}
+
 // ---- the surface lowers through inspectable IR ----
 
 #[test]

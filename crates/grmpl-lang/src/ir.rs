@@ -131,6 +131,62 @@ impl CtorSpec {
         Value::Tuple(Arc::from(vals))
     }
 
+    /// Whether [`build`] can be inverted by [`print`] as a genuine two-sided
+    /// inverse — true iff the argument slots map back **one-to-one**, i.e. no
+    /// pattern variable fills more than one slot.
+    ///
+    /// A repeated variable breaks invertibility: `build` then forces the two
+    /// slots it fills to carry the same value, so a shape-valid constructed
+    /// value whose repeated slots *disagree* has no binding that rebuilds it —
+    /// `print` can still recover a binding, but `build(print(v))` need not equal
+    /// `v`. When this returns `true`, the round-trip law holds in both
+    /// directions (see [`print`]).
+    ///
+    /// [`build`]: CtorSpec::build
+    /// [`print`]: CtorSpec::print
+    pub fn is_invertible(&self) -> bool {
+        let mut seen = std::collections::HashSet::with_capacity(self.args.len());
+        self.args.iter().all(|v| seen.insert(*v))
+    }
+
+    /// Invert [`build`]: recover the bindings a constructed `value` came from.
+    ///
+    /// Succeeds iff `value` has this constructor's shape — a [`Value::Tuple`]
+    /// whose head is `Text(tag)` equal to `self.tag` and whose arity is
+    /// `self.args.len() + 1` (the tag plus one slot per argument). It returns
+    /// the variable→slot map, reading each argument slot back into the variable
+    /// that filled it; on any shape mismatch it returns `None`.
+    ///
+    /// **Round-trip law.** For every binding `b` that binds all of `self.args`,
+    /// `self.print(&self.build(b))` agrees with `b` on those variables. When
+    /// [`is_invertible`] holds, the other direction is exact too: for every
+    /// value `v` this spec could construct, `self.build(&self.print(v)?) == v`.
+    ///
+    /// (A slot whose variable was *unbound* was built as empty text, so `print`
+    /// recovers it as bound-to-empty — the law is stated over fully-bound
+    /// bindings, matching v1 `form` semantics.)
+    ///
+    /// [`build`]: CtorSpec::build
+    /// [`is_invertible`]: CtorSpec::is_invertible
+    pub fn print(&self, value: &Value) -> Option<Bindings> {
+        let vals = match value {
+            Value::Tuple(vals) => vals,
+            _ => return None,
+        };
+        if vals.len() != self.args.len() + 1 {
+            return None;
+        }
+        match &vals[0] {
+            Value::Text(t) if **t == *self.tag => {}
+            _ => return None,
+        }
+        let mut bindings = Bindings::with_capacity(self.args.len());
+        for (id, slot) in self.args.iter().zip(&vals[1..]) {
+            bindings.insert(*id, slot.clone());
+        }
+        Some(bindings)
+    }
+
     /// Final lowering: generate the `Ctor` closure.
     pub fn lower(self) -> Ctor {
         Arc::new(move |b: &Bindings| self.build(b))
