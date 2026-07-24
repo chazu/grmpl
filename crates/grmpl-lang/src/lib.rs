@@ -30,5 +30,5 @@ pub mod compile;
 pub mod lexer;
 pub mod parser;
 
-pub use compile::Program;
+pub use compile::{NamedAgg, Program};
 pub use parser::parse;

@@ -13,8 +13,8 @@ pub mod watch;
 
 pub use multiset::Multiset;
 pub use query::{
-    eval_delta, eval_snapshot, eval_snapshot_with, eval_with, eval_with_recur, Arrangements, MapFn,
-    Pred, Query,
+    eval_delta, eval_snapshot, eval_snapshot_with, eval_with, eval_with_recur, Agg, Arrangements,
+    MapFn, Pred, Query,
 };
 pub use recursive::{IncrementalFixpoint, Maintenance};
 pub use snapshot::Snapshot;
