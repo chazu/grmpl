@@ -104,4 +104,12 @@ grmpl-core ── grmpl-diff ── grmpl-proc ── grmpl-lang
      ├── grmpl-store (fjall)     │
      ├── grmpl-pattern ──────────┴── grmpl-lang
      └── grmpl-transport (iroh, feature-gated)
+
+grmpl-session (P3 edge crate: TCP sessions, provisioning, world verbs)
+     └── depends on core + diff + proc + pattern + store
 ```
+
+`grmpl-session` is an **edge** crate, *not* part of the semantic core: it sits
+above the bright line and wires the core to clients, so it may name a concrete
+transport (std TCP) exactly as an application would. The bright line constrains
+the core crates, not the app built on them.

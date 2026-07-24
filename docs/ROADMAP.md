@@ -172,12 +172,57 @@ aggregate yields in `view` (follow-on ticket).
 
 ---
 
+## P3 — Client sessions & world construction (landed)
+
+The world becomes reachable from clients: connect, become a player, build and
+play — all as ordinary commits.
+
+### Work
+
+* **Replay-safe entity allocation** (`grmpl-proc::Alloc`). A single-row counter
+  relation `(next: Int)` hands out fresh entity ids; the read and the counter
+  bump ride in the *same* patch as the effects that use the id, so a replay from
+  the same edition reproduces identical ids (Replay law). Interim single-writer;
+  the durable, concurrency-safe allocator is P4.
+* **Provisioning** (`grmpl-session::Server::login`). A connection becomes a
+  player: a name is the minimal credential and a durable identity (the `PLAYER`
+  relation rebinds the same entity across reconnects); a new player is *spawned
+  as a commit* — allocated, named, and placed in the root room atomically.
+* **Verbs as ordinary patches** (`grmpl-session::world`). `dig` / `create` /
+  `go` / `take` / `look` are plain guarded `Patch`es over `LOCATED` / `NAMED` /
+  `EXITS` / `HELD`; world construction shares the exact commit machinery as
+  `take lamp`, no privileged path. `take`'s precondition is the optimistic race
+  point.
+* **Line-based TCP session layer** (`grmpl-session::net`, bin `grmpld`). One
+  connection per player on its own thread; the first line logs in, each
+  subsequent line is a command whose `TELL` text is written straight back. The
+  interim single-writer inbox-seq scheme serializes commits behind one writer.
+
+`grmpl-session` is an **edge** crate above the semantic core; it may name std
+TCP precisely because it is not one of the core crates — the bright line
+constrains the core, not the application on it.
+
+### Acceptance
+
+`crates/grmpl-session/tests/build_and_race_the_lamp.rs`: a builder digs a room,
+walks in, and creates a lamp; two players walk in and race to take it — exactly
+one wins, the loser is declined, and the store shows one `HELD` row — **entirely
+through client command lines**. `tests/tcp_session.rs` re-runs the race across
+two real loopback sockets on separate threads. `crates/grmpl-proc/tests/alloc.rs`
+pins the allocator's replay-safety and counter invariant.
+
+### Not in this phase
+
+Durable / concurrent id + inbox-seq allocator (P4), per-player authority scoping,
+websocket transport, reactive push of `watch` output to clients (P5).
+
+---
+
 ## Later phases
 
 Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
-* **P3 — Client sessions & world construction.**
 * **P4 — Scheduling & simulation time.**
 * **P5 — Reactive handlers (`on watch`).**
 * **P6 — History:** as-of, retention, GC.

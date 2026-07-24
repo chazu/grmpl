@@ -4,10 +4,12 @@
 //! from M5, `Process` and the actor loop. Depends on `grmpl-core` and
 //! `grmpl-diff`; never on fjall.
 
+pub mod alloc;
 pub mod commit;
 pub mod domain;
 pub mod process;
 
+pub use alloc::Alloc;
 pub use commit::{check_schema, commit_patch, CommitOutcome};
 pub use domain::{outbox_len, Domain};
 pub use process::{enqueue, inbox_fact, Behavior, Prepared, Process};
