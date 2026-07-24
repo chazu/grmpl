@@ -269,12 +269,63 @@ follow-on); replay & forks over the recorded samples (P10).
 
 ---
 
+## P5 — Reactive handlers (`on watch`) (landed)
+
+An `on watch <view>` belongs to a Process: a maintained view whose signed deltas
+are *pumped* into that Process's inbox as messages. This is the Attention law
+made concrete (DESIGN.md §2.4: reactivity is a maintained query; `on` = `watch` +
+handler; no callback primitive exists). Activations are durable rows, not
+callbacks — which is what makes the P10 activity log complete.
+
+### Work
+
+* **`grmpl-proc::OnWatch`** — binds a view (`grmpl-diff::Query`) to a Process's
+  inbox via a **durable watch-cursor** relation `(watch: Ent, edition: Int)` and
+  the shared P4 seq counter. `install` seeds the cursor at the current edition
+  (**skip-initial** default); `install_including_current` seeds it at
+  `Edition::ZERO`, so the first pump delivers the whole current view as `+` rows.
+* **`OnWatch::pump`** — reads the batch of signed deltas since the cursor
+  (`eval_delta` over `[cursor, current)`) and, in **one atomic commit**,
+  materializes each delta as an inbox message (`(diff: Int, row: Tuple)` at a
+  seq from the shared `SeqAlloc`) **and** advances the cursor. The commit is
+  `commit_if`-preconditioned on the present cursor row, so racing pumps resolve
+  to exactly one winner (each activation appears once, at a unique seq); the
+  delivered stream is a pure function of committed data, so replay is exact.
+  When the view is unchanged over the interval the pump commits nothing (so the
+  cursor never chases the pump's own non-view commits); it legitimately lags
+  `current` by those editions, and `eval_delta` from the lagging cursor stays
+  empty until the next real view change, at which point that whole interval is
+  delivered at once.
+* **Cascades are async message chains, never reentrancy.** The pump only
+  *appends*; it never runs a behavior. A change caused by handling an activation
+  is delivered by a *later* pump as new messages — a chain of separate commits.
+
+### Acceptance
+
+`crates/grmpl-proc/tests/on_watch.rs`: skip-initial omits the pre-existing
+snapshot then streams post-install deltas; `including current` delivers the
+snapshot first; activations are ordinary inbox rows and a handler's change only
+surfaces on the next pump (async cascade). A randomized-churn law oracle (32
+seeds) interleaves random `BASE` churn with pumps and checks, each round, the
+snapshot–stream law (`Σ delivered deltas = find(view, current)`) against an
+independent model, exactly-once contiguous unique seqs (every inbox row weight
+1), and a second replay run (deterministic delivery). A 4-thread race on a shared
+store confirms concurrent pumps deliver each activation exactly once.
+
+### Not in this phase
+
+An `on watch` grammar surface in `grmpl-lang` and reactive push of activations to
+connected clients in `grmpl-session` (the pump mechanism is delivered here; the
+language sugar and session wiring are follow-ons); per-key incremental reduce
+state (P13).
+
+---
+
 ## Later phases
 
 Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
-* **P5 — Reactive handlers (`on watch`).**
 * **P6 — History:** as-of, retention, GC.
 * **P7 — Core IR** (CBPV split reified).
 * **P8 — Typing:** value/row types, effect rows, CALM.
