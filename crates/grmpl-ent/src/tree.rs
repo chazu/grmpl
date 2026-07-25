@@ -21,6 +21,10 @@ use std::sync::Arc;
 
 use crate::measure::Measure;
 
+/// One entry difference between two tree versions: `(key, left_value,
+/// right_value)`, where a `None` side means the key is absent there.
+pub type EntryDiff<K, V> = (K, Option<V>, Option<V>);
+
 /// Adams' bounded-balance parameters. A subtree may be at most `DELTA`× the
 /// weight of its sibling; `GAMMA` chooses single vs double rotation.
 const DELTA: usize = 3;
@@ -148,6 +152,65 @@ where
                 }
             }
         }
+    }
+
+    /// Whether two trees are the **same shared version** — an `O(1)` pointer
+    /// check (both empty, or the same root `Arc`). A `true` result means no entry
+    /// differs; the backfollow / version-compare fast path (an unchanged relation
+    /// between two editions shares its root).
+    pub fn same_version(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// The entries that differ between `self` and `other`, as
+    /// `(key, self_value, other_value)` (a `None` side means absent). Short-
+    /// circuits to empty when the two are the same shared version.
+    pub fn diff(&self, other: &Self) -> Vec<EntryDiff<K, V>>
+    where
+        V: PartialEq,
+    {
+        if self.same_version(other) {
+            return Vec::new();
+        }
+        let a: Vec<(&K, &V)> = self.iter().collect();
+        let b: Vec<(&K, &V)> = other.iter().collect();
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() || j < b.len() {
+            match (a.get(i), b.get(j)) {
+                (Some((ak, av)), Some((bk, bv))) => match ak.cmp(bk) {
+                    std::cmp::Ordering::Less => {
+                        out.push(((*ak).clone(), Some((*av).clone()), None));
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.push(((*bk).clone(), None, Some((*bv).clone())));
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if av != bv {
+                            out.push(((*ak).clone(), Some((*av).clone()), Some((*bv).clone())));
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                },
+                (Some((ak, av)), None) => {
+                    out.push(((*ak).clone(), Some((*av).clone()), None));
+                    i += 1;
+                }
+                (None, Some((bk, bv))) => {
+                    out.push(((*bk).clone(), None, Some((*bv).clone())));
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        out
     }
 
     /// The entries with key in `[lo, hi)`, cloned, in order. `O(result + depth)`

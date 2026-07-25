@@ -103,6 +103,29 @@ impl EntStore {
             .unwrap_or(0))
     }
 
+    /// **Version-compare / backfollow (E6).** How `rel` differs between editions
+    /// `a` and `b`, as `(tuple, weight_at_a, weight_at_b)` for every tuple whose
+    /// net weight differs. An unchanged relation shares its Fact root across the
+    /// two editions, so the comparison short-circuits in `O(1)` — the read side of
+    /// the trace ("what is the same, what moved").
+    pub fn compare(&self, rel: RelId, a: Edition, b: Edition) -> Result<Vec<crate::tree::EntryDiff<Tuple, Diff>>> {
+        let inner = self.inner.lock().unwrap();
+        for at in [a, b] {
+            if at.0 < inner.watermark {
+                return Err(door("compare", at.0, inner.watermark));
+            }
+        }
+        let root_at = |ed: u64| {
+            inner
+                .fact
+                .get(&rel)
+                .and_then(|f| f.range(..=ed).next_back())
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default()
+        };
+        Ok(root_at(a.0).diff(&root_at(b.0)))
+    }
+
     /// **Reachability GC (E3).** Collect granfilade nodes no longer reachable
     /// from a live enfilade root (accumulated as commits path-copy and
     /// `consolidate` truncates). Serialized with commits (holds the edition
