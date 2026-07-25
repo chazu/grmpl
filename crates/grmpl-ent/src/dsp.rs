@@ -91,6 +91,34 @@ impl DspEnf {
     pub fn then(&self, more: Dsp) -> DspEnf {
         DspEnf { inner: self.inner.clone(), dsp: self.dsp.compose(&more) }
     }
+
+    /// **Displaced range read `[lo, hi)`, dsp threaded through the descent.**
+    /// Rather than materialize the displaced view and filter, transform the *query*
+    /// back into the shared tree's coordinates (the inverse dsp), walk its
+    /// **WID-pruned** range there, and re-displace only the results — `O(result +
+    /// log n)`, pruning whole out-of-range subtrees. This is the `DspLoaf`
+    /// discipline: the displacement composes down the traversal onto the query, so
+    /// the shared enfilade does the pruning in its own coordinate space.
+    ///
+    /// Precondition: entity-headed keys, and query bounds within the displaced
+    /// block so the inverse displacement does not wrap the id space (the relocation
+    /// regime) — then [`Dsp::apply`] is order-preserving and the transformed range
+    /// denotes the same set. A bound that underflows the id space under the inverse
+    /// dsp is outside the view's coordinate domain.
+    pub fn range(&self, lo: &Tuple, hi: &Tuple) -> Vec<(Tuple, Diff)> {
+        let inv = self.dsp.inverse();
+        let (ilo, ihi) = (inv.apply(lo), inv.apply(hi));
+        self.inner.range_collect(&ilo, &ihi).into_iter().map(|(k, v)| (self.dsp.apply(&k), v)).collect()
+    }
+
+    /// **Displaced range measure**, answered from the shared tree's cached subtree
+    /// measures in `O(log n)` without materializing any row — the WID count over
+    /// the displaced span, via the same query-coordinate transform as
+    /// [`range`](Self::range).
+    pub fn measure_range(&self, lo: &Tuple, hi: &Tuple) -> Count {
+        let inv = self.dsp.inverse();
+        self.inner.measure_range(&inv.apply(lo), &inv.apply(hi))
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +164,34 @@ mod tests {
         // Composing another shift is still O(1) and correct.
         let moved2 = moved.then(Dsp::by(7));
         assert_eq!(moved2.get(&ent(1007)), Some(0)); // entity 0 -> 1000 -> 1007
+    }
+
+    #[test]
+    fn displaced_range_and_measure_thread_the_dsp_through_the_walk() {
+        // Entities 0..20 → value n; relocate into the 1000-block.
+        let mut inner: Tree<Tuple, Diff, Count> = Tree::new();
+        for n in 0..20u64 {
+            inner = inner.insert(ent(n), n as i64);
+        }
+        let moved = DspEnf::relocate(inner, Dsp::by(1000));
+
+        // A displaced range query is answered by transforming the query, walking
+        // the shared tree's WID range, and re-displacing — it must equal the eager
+        // "materialize then filter" over the displaced contents, for every span.
+        // Spans stay within the relocated block (bounds ≥ the displaced origin),
+        // the non-wrapping regime the transform is defined over.
+        let all = moved.to_vec();
+        for (a, b) in [(1000u64, 1000), (1003, 1010), (1015, 1025), (1000, 1019), (1000, 1020)] {
+            let lo = ent(a);
+            let hi = ent(b);
+            let mut want: Vec<(Tuple, Diff)> =
+                all.iter().filter(|(k, _)| lo <= *k && *k < hi).cloned().collect();
+            want.sort();
+            let mut got = moved.range(&lo, &hi);
+            got.sort();
+            assert_eq!(got, want, "displaced range [{a},{b})");
+            // The WID measure matches the row count, without materializing.
+            assert_eq!(moved.measure_range(&lo, &hi), Count(want.len() as u64), "measure [{a},{b})");
+        }
     }
 }

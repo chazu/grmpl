@@ -38,8 +38,8 @@ throwaway construction-time differential oracle and is **deleted at completion**
 > *Deeper refinements deferred (each faithful-but-optimized version of a landed
 > property):* multi-order Arrangements for trailing-column spans (the lead-column
 > pushdown is done); a **persistent** fork sharing the granfilade node store (the
-> in-memory fork + DagWood ancestry are done); lazy Dsp threaded through the tree
-> traversal; node content-key caching to persist only the new path per commit.
+> in-memory fork + DagWood ancestry are done); node content-key caching to persist
+> only the new path per commit.
 
 **The one thing preserved (also per the original directive — "*while preserving
 the systems features*"):** the **seven design laws** and the **P0–P15 language
