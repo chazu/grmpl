@@ -187,10 +187,12 @@ impl Granfilade {
             .map_err(store_err)?
             .ok_or_else(|| Error::Store("granfilade: node key not found".into()))?;
         let bytes = bytes.as_ref();
-        let (key, pos) = K::decode(bytes, 0)?;
-        let (val, pos) = V::decode(bytes, pos)?;
-        let (lck, pos) = decode_ck(bytes, pos)?;
-        let (rck, _pos) = decode_ck(bytes, pos)?;
+        // Frame layout: child keys FIRST (so GC can read them type-agnostically),
+        // then the entry key and value.
+        let (lck, pos) = decode_ck(bytes, 0)?;
+        let (rck, pos) = decode_ck(bytes, pos)?;
+        let (key, pos) = K::decode(bytes, pos)?;
+        let (val, _pos) = V::decode(bytes, pos)?;
         let left = self.load(lck)?;
         let right = self.load(rck)?;
         Ok(Tree::from_parts(key, val, left, right))
@@ -200,6 +202,59 @@ impl Granfilade {
     pub fn node_count(&self) -> Result<usize> {
         Ok(self.nodes.iter().count())
     }
+
+    /// **Reachability GC (E3).** Collect every node unreachable from a live root
+    /// (the `log:*` and `ckpt:*` roots recorded in meta): mark reachable nodes by
+    /// walking their child keys from the roots, then sweep the rest. Returns the
+    /// number of nodes collected. Type-agnostic — it reads only the leading child
+    /// keys of each frame. (Serialize this with commits at the store level.)
+    pub fn gc(&self) -> Result<usize> {
+        // Roots: every content key referenced by a meta entry.
+        let mut stack: Vec<ContentKey> = Vec::new();
+        for prefix in [b"log:".as_ref(), b"ckpt:".as_ref()] {
+            for (_k, v) in self.meta_prefix(prefix)? {
+                if v.first() == Some(&1) {
+                    if let Some(b) = v.get(1..17) {
+                        stack.push(b.try_into().unwrap());
+                    }
+                }
+            }
+        }
+        // Mark.
+        let mut marked: std::collections::HashSet<ContentKey> = std::collections::HashSet::new();
+        while let Some(ck) = stack.pop() {
+            if !marked.insert(ck) {
+                continue;
+            }
+            if let Some(frame) = self.nodes.get(ck).map_err(store_err)? {
+                let (l, r) = children_of(frame.as_ref())?;
+                stack.extend(l);
+                stack.extend(r);
+            }
+        }
+        // Sweep.
+        let mut collected = 0usize;
+        let mut batch = self.db.batch();
+        for kv in self.nodes.iter() {
+            let (k, _v) = kv.into_inner().map_err(store_err)?;
+            let key: ContentKey = k.as_ref().try_into().map_err(|_| trunc("node key"))?;
+            if !marked.contains(&key) {
+                batch.remove(&self.nodes, k.as_ref().to_vec());
+                collected += 1;
+            }
+        }
+        batch.commit().map_err(store_err)?;
+        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        Ok(collected)
+    }
+}
+
+/// The two child content keys of a node frame (leading fields), read without
+/// decoding the entry — used by GC.
+fn children_of(frame: &[u8]) -> Result<(Option<ContentKey>, Option<ContentKey>)> {
+    let (l, pos) = decode_ck(frame, 0)?;
+    let (r, _pos) = decode_ck(frame, pos)?;
+    Ok((l, r))
 }
 
 /// Recurse the tree, appending each node's `(content_key, frame_bytes)` and
@@ -214,11 +269,12 @@ where
     let (key, val, left, right) = tree.root_parts()?;
     let lck = collect_nodes(left, out);
     let rck = collect_nodes(right, out);
+    // Child keys first (GC reads them without decoding the entry), then entry.
     let mut bytes = Vec::new();
-    key.encode(&mut bytes);
-    val.encode(&mut bytes);
     encode_ck(&mut bytes, lck);
     encode_ck(&mut bytes, rck);
+    key.encode(&mut bytes);
+    val.encode(&mut bytes);
     let ck = hash128(&bytes);
     out.push((ck, bytes));
     Some(ck)

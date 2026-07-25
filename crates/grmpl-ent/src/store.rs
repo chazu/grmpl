@@ -103,6 +103,18 @@ impl EntStore {
             .unwrap_or(0))
     }
 
+    /// **Reachability GC (E3).** Collect granfilade nodes no longer reachable
+    /// from a live enfilade root (accumulated as commits path-copy and
+    /// `consolidate` truncates). Serialized with commits (holds the edition
+    /// lock). A no-op in-memory. Returns the number of nodes collected.
+    pub fn gc(&self) -> Result<usize> {
+        let _guard = self.inner.lock().unwrap();
+        match &self.gran {
+            Some(g) => g.gc(),
+            None => Ok(0),
+        }
+    }
+
     /// **Structural-sharing fork (E3).** A new independent store whose state is
     /// this store's as-of `at`, **sharing every enfilade node** with the parent
     /// (the versioned Fact roots are `Arc`-cloned, not copied). Forking at the

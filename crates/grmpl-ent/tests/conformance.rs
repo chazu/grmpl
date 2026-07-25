@@ -9,7 +9,7 @@
 //! closed and reopened from disk, must still agree (the ent rebuilds its state
 //! from the persisted enfilades).
 
-use grmpl_core::{Diff, Edition, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, EditionStore, RelId, TraceStore, Tuple, Value};
 use grmpl_ent::EntStore;
 use grmpl_store::FjallStore;
 
@@ -132,6 +132,33 @@ fn ent_store_matches_fjall_under_random_churn() {
             assert_agree(seed, round, &mut rng, &ent, &fj);
         }
     }
+}
+
+#[test]
+fn gc_collects_orphans_and_preserves_live_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let mut rng = Rng::new(777);
+    let want = {
+        let ent = EntStore::open(dir.path()).unwrap();
+        let fj = FjallStore::open(fdir.path()).unwrap();
+        // Churn (each commit path-copies its Edition enfilade → orphaned nodes).
+        for _ in 0..80 {
+            drive_one(&mut rng, &ent, &fj);
+        }
+        // Consolidate to current (truncates the logs → more orphans), then GC.
+        let cur = ent.current();
+        ent.consolidate(cur).unwrap();
+        fj.consolidate(cur).unwrap();
+        let collected = ent.gc().unwrap();
+        assert!(collected > 0, "GC collected nothing after churn + consolidate");
+        // The ent still matches the LSM after GC (no live node was collected).
+        assert_agree(0, 0, &mut rng, &ent, &fj);
+        snapshot(&ent)
+    };
+    // Reopen after GC: the live state is intact (reachable nodes were preserved).
+    let ent = EntStore::open(dir.path()).unwrap();
+    assert_eq!(snapshot(&ent), want, "GC collected a reachable node — reopen state changed");
 }
 
 #[test]
