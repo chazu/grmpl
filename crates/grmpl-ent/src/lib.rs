@@ -20,7 +20,7 @@ pub mod measure;
 pub mod store;
 pub mod tree;
 
-pub use canopy::{Canopy, InterestId};
+pub use canopy::{Canopy, Endorsement, InterestId};
 pub use context::Context;
 pub use dag::{Branch, BranchId, Dag};
 pub use dsp::{Dsp, DspEnf};
