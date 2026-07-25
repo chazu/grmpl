@@ -103,6 +103,49 @@ impl EntStore {
             .unwrap_or(0))
     }
 
+    /// **Structural-sharing fork (E3).** A new independent store whose state is
+    /// this store's as-of `at`, **sharing every enfilade node** with the parent
+    /// (the versioned Fact roots are `Arc`-cloned, not copied). Forking at the
+    /// current edition is `O(#relations)`, not the LSM's `O(state)` verbatim copy
+    /// — the cheap virtual copy at the heart of the Ent. The fork then evolves
+    /// independently. (In-memory; a persistent fork sharing the granfilade node
+    /// store is a later increment.)
+    pub fn fork_at(&self, at: Edition) -> Result<EntStore> {
+        let inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("fork_at", at.0, inner.watermark));
+        }
+        // Fact: keep the versioned roots up to `at` (their trees are shared Arcs).
+        let mut fact: HashMap<RelId, BTreeMap<u64, FactTree>> = HashMap::new();
+        for (rel, versions) in &inner.fact {
+            let kept: BTreeMap<u64, FactTree> =
+                versions.range(..=at.0).map(|(e, t)| (*e, t.clone())).collect();
+            if !kept.is_empty() {
+                fact.insert(*rel, kept);
+            }
+        }
+        // Edition log: the whole tree when forking at current (shared Arc), else
+        // the prefix ≤ `at`.
+        let mut log: HashMap<RelId, LogTree> = HashMap::new();
+        for (rel, l) in &inner.log {
+            if at.0 >= inner.current {
+                log.insert(*rel, l.clone());
+            } else {
+                let mut t = LogTree::new();
+                for (k, v) in l.range_collect(&(0, 0), &(at.0 + 1, 0)) {
+                    t = t.insert(k, v);
+                }
+                if !t.is_empty() {
+                    log.insert(*rel, t);
+                }
+            }
+        }
+        Ok(EntStore {
+            inner: Mutex::new(Inner { current: at.0, watermark: inner.watermark, fact, log }),
+            gran: None,
+        })
+    }
+
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
     /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
     fn persist(&self, inner: &Inner, touched: &[RelId], all_ckpts: bool) -> Result<()> {

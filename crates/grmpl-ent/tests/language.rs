@@ -73,6 +73,50 @@ fn wid_range_read_and_count_match_a_full_scan() {
 }
 
 #[test]
+fn structural_sharing_fork_diverges_independently() {
+    let parent = EntStore::new();
+    parent
+        .commit(&[
+            (LOCATED, Tuple::from([e(LAMP), e(ROOM)]), 1),
+            (LOCATED, Tuple::from([e(PLAYER), e(ROOM)]), 1),
+        ])
+        .unwrap();
+    let mid = parent.current();
+    parent
+        .commit(&[(NAMED, Tuple::from([e(LAMP), Value::text("brass lamp")]), 1)])
+        .unwrap();
+
+    // Fork at current: byte-identical observable state (shared enfilade nodes).
+    let fork = parent.fork_at(parent.current()).unwrap();
+    for r in [LOCATED, NAMED] {
+        assert_eq!(
+            fork.read_at(r, fork.current()).unwrap(),
+            parent.read_at(r, parent.current()).unwrap(),
+            "fork state differs from parent at fork point"
+        );
+    }
+
+    // Diverge: remove the lamp in the fork only.
+    fork.commit(&[(LOCATED, Tuple::from([e(LAMP), e(ROOM)]), -1)]).unwrap();
+    let lamp_here = |s: &EntStore| {
+        s.read_at(LOCATED, s.current())
+            .unwrap()
+            .into_iter()
+            .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)]))
+    };
+    assert!(lamp_here(&parent), "parent was mutated by a commit to the fork");
+    assert!(!lamp_here(&fork), "fork did not diverge");
+
+    // Fork at a past edition reproduces the parent's state then.
+    let fork_mid = parent.fork_at(mid).unwrap();
+    assert_eq!(fork_mid.current(), mid);
+    assert!(
+        fork_mid.read_at(NAMED, fork_mid.current()).unwrap().is_empty(),
+        "a past fork saw a fact committed after the fork point"
+    );
+}
+
+#[test]
 fn optimistic_patch_commit_runs_over_the_ent_store() {
     let store = seed();
     let authority = Authority::new(
