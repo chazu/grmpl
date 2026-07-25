@@ -35,11 +35,32 @@ throwaway construction-time differential oracle and is **deleted at completion**
 >   pushdown is an evaluation-time rewrite (like `Query::Shared`), so the typed/
 >   inspected `QueryIr` stays the plain `Rel`+`Filter`.
 >
-> *Deeper refinements deferred (each faithful-but-optimized version of a landed
-> property):* multi-order Arrangements for trailing-column spans (the lead-column
-> pushdown is done); a **persistent** fork sharing the granfilade node store (the
-> in-memory fork + DagWood ancestry are done); node content-key caching to persist
-> only the new path per commit.
+> - **E6c** DSP **threaded through the WID walk**: `DspEnf` answers displaced
+>   `range`/`measure_range` by transforming the *query* into the shared tree's
+>   coordinates and pruning there (O(result+log n) / O(log n), no materialization).
+>
+> **Every distinctive Xanadu-`Ent` structural component is now present and correct**
+> — measured enfilade, granfilade, WID pruning (load-bearing in the language),
+> DSP transforms, structural-sharing fork, Edition enfilade + DagWood branch graph,
+> interval-tree canopy with flag-lattice, and backfollow/version-compare. What
+> remains are **pure performance optimizations of already-correct capabilities**,
+> each deferred with a specific reason — not parity gaps:
+>
+> 1. **Multi-order Arrangements** (trailing-column range spans). The lead-column
+>    pushdown is done; secondary orderings would let `RangeRel` prune on non-lead
+>    columns too. Scope: the store maintains N orderings per relation — a sizeable
+>    addition, no missing capability (non-lead filters already run, unpruned).
+> 2. **Persistent fork *sharing* the granfilade node store.** The in-memory
+>    structural-sharing fork + DagWood ancestry are done. True O(edit) *durable*
+>    node-sharing needs all branches in one granfilade (roots namespaced by branch)
+>    — a persistence-layer redesign; a durable *copy* fork would be weaker, not the
+>    faithful sharing form, so it is left for the real design.
+> 3. **Path-only persistence** (node content-key memoization). On-disk structural
+>    sharing already holds (a commit grows the store by only the edited path); the
+>    remaining win is making the per-commit *traversal* O(log n) instead of O(n) by
+>    caching each node's content key. Deferred because a safe implementation must
+>    avoid pointer-ABA and a tree↔granfilade layering break — invasive core change,
+>    performance-only, not undertaken hastily.
 
 **The one thing preserved (also per the original directive — "*while preserving
 the systems features*"):** the **seven design laws** and the **P0–P15 language

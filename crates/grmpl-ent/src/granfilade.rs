@@ -7,9 +7,16 @@
 //! by one edited path share every untouched node on disk (Xanadu structural
 //! sharing / Gold's granfilade, modernised as a content-addressed blob store).
 //!
-//! A commit persists only the `O(log n)` new nodes on the edited path; a load
-//! reconstructs the exact tree shape (so content keys round-trip). Values are
-//! serialized through the single `grmpl_core::wire` value codec ([`Persist`]).
+//! A commit adds only the `O(log n)` new distinct nodes on the edited path to the
+//! store — every untouched subtree already hashes to a key that is present, so
+//! re-inserting it is idempotent and on-disk growth is path-sized. (The
+//! *traversal* is still `O(n)`: it re-serializes each node to recompute its
+//! content key. Skipping already-persisted subtrees without revisiting — true
+//! path-only *work* — needs a content-key memoized on each node, an enfilade
+//! change deferred as a pure optimization; the on-disk sharing it would speed up
+//! already holds.) A load reconstructs the exact tree shape, so content keys
+//! round-trip. Values are serialized through the single `grmpl_core::wire` value
+//! codec ([`Persist`]).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -149,9 +156,10 @@ impl Granfilade {
         Ok(out)
     }
 
-    /// Persist `tree`, returning its root content key (`None` if empty). Writes
-    /// only nodes not already present-by-content; unchanged subtrees of a prior
-    /// version are shared automatically. One atomic batch + `SyncAll`.
+    /// Persist `tree`, returning its root content key (`None` if empty). Every
+    /// node is content-keyed, so a node already present by content is re-inserted
+    /// idempotently and unchanged subtrees of a prior version are shared on disk;
+    /// the store grows by only the edited path. One atomic batch + `SyncAll`.
     pub fn persist<K, V, M>(&self, tree: &Tree<K, V, M>) -> Result<Option<ContentKey>>
     where
         K: Persist + Ord + Clone,
