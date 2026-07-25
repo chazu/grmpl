@@ -12,6 +12,7 @@ members = [
     "crates/grmpl-session",
     "crates/grmpl-bench",
     "crates/grmpl-cli",
+    "crates/grmpl-ent",
 ]
 
 [workspace.package]

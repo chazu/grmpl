@@ -1,0 +1,12 @@
+[package]
+name = "grmpl-ent"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The Ent: a family of persistent, measured, versioned enfilades over a shared granfilade — the authoritative substrate of grmpl (Xanadu-Ent parity). Below the bright line: it names fjall (the granfilade node store) exactly as grmpl-store names it, and implements the grmpl-core store traits so the semantic core sees only an opaque store."
+
+[dependencies]
+grmpl-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
