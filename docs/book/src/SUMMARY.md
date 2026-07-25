@@ -17,6 +17,7 @@
 
 - [The completed Ent plex](./grmpl/plex.md)
 - [The bright line and the seven laws](./grmpl/laws.md)
+- [Editions and causal frontiers](./grmpl/editions.md)
 - [grmpl-ent: the implementation](./grmpl/implementation.md)
 - [Features so far, and the Ent underneath them](./grmpl/features.md)
 

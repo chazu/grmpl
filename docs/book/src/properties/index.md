@@ -23,7 +23,10 @@ inherits this discipline as an explicit law: **editions and snapshots are
 opaque**. A single machine may implement an edition as a monotonic counter; a
 distributed one may use a causal frontier. Programs must not assume editions are
 consecutive integers — so identity stays stable across implementations that
-address time very differently.
+address time very differently. The chapter
+[*Editions and causal frontiers*](../grmpl/editions.md) works this out in full:
+why the same opaque handle is a monotonic counter on one machine and a causal
+frontier across many.
 
 ## 3. `O(depth)` search of a sparse, transfinite space
 
