@@ -86,6 +86,17 @@ pub struct FjallStore {
     /// checkpoints and their raw updates discarded. Monotonic. Read on the door
     /// paths (`read_at`/`scan_updates`); advanced only by `consolidate`.
     watermark: Mutex<u64>,
+    /// **A1 (P13 statefulness): the net-weight index.** The current accumulated
+    /// weight of every live tuple, `(rel, tuple) → Σdiff` (zero-weight tuples
+    /// absent). It turns the optimistic precondition re-check from an O(history)
+    /// scan (`holds_at` folding checkpoint + tail) into an O(1) lookup. It is a
+    /// *derived* structure: rebuilt from the log on `open` and maintained in
+    /// lock-step with each committed write, so it never becomes the source of
+    /// truth and needs no on-disk format, keyspace, or `canonical_dump`/`fork`
+    /// change. Touched only by commit-path holders of `current`, so it stays
+    /// consistent with the edition clock. (The persistent, in-batch realization
+    /// is the plan's next increment; this in-memory cut proves the win first.)
+    net: Mutex<HashMap<(RelId, Tuple), Diff>>,
 }
 
 impl FjallStore {
@@ -105,13 +116,37 @@ impl FjallStore {
             Some(bytes) => u64_be(bytes.as_ref()),
             None => 0,
         };
+        // Rebuild the derived net-weight index from the log. The net weight of a
+        // tuple as-of `current` is the sum of *every* row for it (checkpoint +
+        // whole tail — all committed editions are ≤ current). O(state).
+        let net = Self::load_net(&db)?;
         Ok(FjallStore {
             db,
             meta,
             rels: Mutex::new(HashMap::new()),
             current: Mutex::new(current),
             watermark: Mutex::new(watermark),
+            net: Mutex::new(net),
         })
+    }
+
+    /// Fold the whole log into `(rel, tuple) → Σdiff`, dropping zero weights.
+    fn load_net(db: &Database) -> Result<HashMap<(RelId, Tuple), Diff>> {
+        let mut net: HashMap<(RelId, Tuple), Diff> = HashMap::new();
+        for name in db.list_keyspace_names() {
+            let name = name.as_ref();
+            let Some(idstr) = name.strip_prefix("rel_") else { continue };
+            let Ok(id) = idstr.parse::<u32>() else { continue };
+            let rel = RelId(id);
+            let ks = db.keyspace(name, KeyspaceCreateOptions::default).map_err(map_err)?;
+            for kv in ks.iter() {
+                let (_k, v) = kv.into_inner().map_err(map_err)?;
+                let (diff, tuple) = codec::decode_record(v.as_ref())?;
+                *net.entry((rel, tuple)).or_insert(0) += diff;
+            }
+        }
+        net.retain(|_, d| *d != 0);
+        Ok(net)
     }
 
     /// Fork the whole domain into a new store rooted at `path` (P10 **forks
@@ -202,31 +237,6 @@ impl EditionStore for FjallStore {
 }
 
 impl FjallStore {
-    /// Whether `tuple` has positive accumulated weight in `rel` as-of edition
-    /// `at`. Used by the atomic precondition re-check, always with `at =
-    /// current` (≥ watermark), so no door check is needed here.
-    fn holds_at(&self, rel: RelId, tuple: &Tuple, at: u64) -> Result<bool> {
-        let ks = self.keyspace_for(rel)?;
-        let wm = *self.watermark.lock().unwrap();
-        let mut sum: Diff = 0;
-        // Checkpoint (consolidated state ≤ watermark) then the tail (watermark, at].
-        for kv in ks.prefix(CKPT_PREFIX) {
-            let (_k, v) = kv.into_inner().map_err(map_err)?;
-            let (diff, t) = codec::decode_record(v.as_ref())?;
-            if &t == tuple {
-                sum += diff;
-            }
-        }
-        for kv in ks.range(tail_start(wm)..=tail_end(at)) {
-            let (_k, v) = kv.into_inner().map_err(map_err)?;
-            let (diff, t) = codec::decode_record(v.as_ref())?;
-            if &t == tuple {
-                sum += diff;
-            }
-        }
-        Ok(sum > 0)
-    }
-
     /// The shared write path: apply `updates` at edition `next` in one atomic
     /// batch (data + edition bump together).
     fn write_batch(&self, next: u64, updates: &[(RelId, Tuple, Diff)]) -> Result<()> {
@@ -244,7 +254,28 @@ impl FjallStore {
         batch.insert(&self.meta, EDITION_KEY, next.to_be_bytes().to_vec());
         batch.commit().map_err(map_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(map_err)?;
+        // Only after the durable write succeeds, advance the derived net-weight
+        // index in lock-step (callers hold `current`, so this is serialized with
+        // the edition clock). Applying updates in order handles repeated tuples
+        // within one batch; a tuple crossing to zero net is dropped.
+        let mut net = self.net.lock().unwrap();
+        for (rel, tuple, diff) in updates {
+            let key = (*rel, tuple.clone());
+            let new = net.get(&key).copied().unwrap_or(0) + *diff;
+            if new == 0 {
+                net.remove(&key);
+            } else {
+                net.insert(key, new);
+            }
+        }
         Ok(())
+    }
+
+    /// A1 fast path: does `tuple` have positive net weight in `rel` as-of the
+    /// current edition? An O(1) index lookup replacing the O(history) `holds_at`
+    /// fold. Correct for the optimistic re-check, which always tests at `current`.
+    fn holds_now(&self, rel: RelId, tuple: &Tuple) -> bool {
+        self.net.lock().unwrap().get(&(rel, tuple.clone())).is_some_and(|n| *n > 0)
     }
 }
 
@@ -268,7 +299,9 @@ impl TraceStore for FjallStore {
         let mut current = self.current.lock().unwrap();
         let at = *current;
         for (rel, tuple) in preconditions {
-            if !self.holds_at(*rel, tuple, at)? {
+            // A1: O(1) net-weight lookup as-of current, replacing the O(history)
+            // holds_at scan. Same answer (net at current == the folded sum).
+            if !self.holds_now(*rel, tuple) {
                 return Ok(None); // precondition failed → no effect
             }
         }
