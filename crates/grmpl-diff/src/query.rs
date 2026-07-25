@@ -39,6 +39,15 @@ pub enum Agg {
 #[derive(Clone)]
 pub enum Query {
     Rel(RelId),
+    /// A base relation restricted to the tuple-key half-open range `[lo, hi)` —
+    /// the range-read operator that rides the substrate's arranged-trace fast path
+    /// ([`TraceStore::read_range`]). Semantically identical to
+    /// `Rel(rel).filter(|t| lo <= t < hi)`, but the restriction is pushed to the
+    /// store, so a measured, key-ordered trace (the Ent's WID enfilade) prunes
+    /// out-of-range subtrees instead of materializing the whole relation. Over a
+    /// store without such a trace the default `read_range` makes it exactly the
+    /// filter, so the operator is always correct.
+    RangeRel { rel: RelId, lo: Tuple, hi: Tuple },
     Map { input: Box<Query>, f: MapFn },
     Filter { input: Box<Query>, pred: Pred },
     Project { input: Box<Query>, cols: Arc<[usize]> },
@@ -73,6 +82,11 @@ pub enum Query {
 impl Query {
     pub fn rel(r: RelId) -> Query {
         Query::Rel(r)
+    }
+    /// A base relation restricted to the tuple-key range `[lo, hi)`, pushed to the
+    /// store's arranged-trace fast path (see [`Query::RangeRel`]).
+    pub fn range(r: RelId, lo: Tuple, hi: Tuple) -> Query {
+        Query::RangeRel { rel: r, lo, hi }
     }
     pub fn map(self, f: impl Fn(&Tuple) -> Tuple + Send + Sync + 'static) -> Query {
         Query::Map { input: Box::new(self), f: Arc::new(f) }
@@ -223,7 +237,7 @@ fn fold_agg(members: &[Tuple], agg: &Agg) -> Value {
 fn contains_reduce(q: &Query) -> bool {
     match q {
         Query::Reduce { .. } => true,
-        Query::Rel(_) | Query::Recur => false,
+        Query::Rel(_) | Query::RangeRel { .. } | Query::Recur => false,
         Query::Map { input, .. }
         | Query::Filter { input, .. }
         | Query::Project { input, .. } => contains_reduce(input),
@@ -304,6 +318,12 @@ fn eval_inner(
         Query::Rel(r) => match overrides.and_then(|o| o.get(r)) {
             Some(m) => m.clone(),
             None => multiset::from_pairs(store.read_at(*r, at)?),
+        },
+        Query::RangeRel { rel, lo, hi } => match overrides.and_then(|o| o.get(rel)) {
+            // An overridden relation is already in memory; apply the same range
+            // restriction the store would, so the operator stays a pure filter.
+            Some(m) => m.iter().filter(|(t, _)| lo <= *t && *t < hi).map(|(t, d)| (t.clone(), *d)).collect(),
+            None => multiset::from_pairs(store.read_range(*rel, at, lo, hi)?),
         },
         Query::Map { input, f } => {
             let child = eval_inner(input, store, at, recur, overrides, arr)?;
@@ -398,6 +418,14 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
         Query::Rel(r) => {
             let ups = store.scan_updates(*r, from, to)?;
             multiset::from_pairs(ups.into_iter().map(|u| (u.tuple, u.diff)))
+        }
+        Query::RangeRel { rel, lo, hi } => {
+            // The delta of a range-restricted relation is its updates whose tuple
+            // falls in the range — `scan_updates` filtered by `[lo, hi)`.
+            let ups = store.scan_updates(*rel, from, to)?;
+            multiset::from_pairs(
+                ups.into_iter().filter(|u| *lo <= u.tuple && u.tuple < *hi).map(|u| (u.tuple, u.diff)),
+            )
         }
         Query::Map { input, f } => {
             let d = eval_delta(input, store, from, to)?;

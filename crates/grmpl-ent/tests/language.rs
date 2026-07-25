@@ -100,6 +100,58 @@ fn wid_range_read_and_count_match_a_full_scan() {
 }
 
 #[test]
+fn range_operator_prunes_at_the_source_and_matches_the_filter() {
+    use grmpl_diff::{eval_delta, eval_snapshot};
+
+    let store = EntStore::new();
+    let updates: Vec<(RelId, Tuple, i64)> =
+        (0..40).map(|k| (RelId(1), Tuple::from([Value::Int(k)]), 1)).collect();
+    store.commit(&updates).unwrap();
+    let at = store.current();
+
+    let sorted = |m: grmpl_diff::Multiset| {
+        let mut v: Vec<(Tuple, i64)> = m.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    for (a, b) in [(-5i64, 5), (10, 10), (7, 33), (0, 40), (30, 100)] {
+        let lo = Tuple::from([Value::Int(a)]);
+        let hi = Tuple::from([Value::Int(b)]);
+        // The pushed-down range operator equals the equivalent Rel-then-filter,
+        // run by the real engine — but the Ent's `read_range` prunes at the source.
+        let ranged = Query::range(RelId(1), lo.clone(), hi.clone());
+        let filtered = Query::rel(RelId(1)).filter({
+            let (lo, hi) = (lo.clone(), hi.clone());
+            move |t| lo <= *t && *t < hi
+        });
+        assert_eq!(
+            sorted(eval_snapshot(&ranged, &store, at).unwrap()),
+            sorted(eval_snapshot(&filtered, &store, at).unwrap()),
+            "range [{a},{b}) snapshot"
+        );
+    }
+
+    // The operator composes in a join: pair each in-range key with itself.
+    let lo = Tuple::from([Value::Int(10)]);
+    let hi = Tuple::from([Value::Int(20)]);
+    let joined = Query::range(RelId(1), lo, hi).join(Query::rel(RelId(1)), [0], [0]);
+    let rows = sorted(eval_snapshot(&joined, &store, at).unwrap());
+    assert_eq!(rows.len(), 10, "join over the range should yield 10 self-pairs");
+    assert!(rows.iter().all(|(t, d)| *d == 1 && t.as_slice()[0] == t.as_slice()[1]));
+
+    // The delta of the range operator over an edition step is the in-range change.
+    let before = store.current();
+    store.commit(&[(RelId(1), Tuple::from([Value::Int(15)]), -1), (RelId(1), Tuple::from([Value::Int(99)]), 1)]).unwrap();
+    let after = store.current();
+    let d = sorted(
+        eval_delta(&Query::range(RelId(1), Tuple::from([Value::Int(10)]), Tuple::from([Value::Int(20)])), &store, before, after).unwrap(),
+    );
+    // 15 left the range; 99 is out of range, so it does not appear.
+    assert_eq!(d, vec![(Tuple::from([Value::Int(15)]), -1)]);
+}
+
+#[test]
 fn structural_sharing_fork_diverges_independently() {
     let parent = EntStore::new();
     parent

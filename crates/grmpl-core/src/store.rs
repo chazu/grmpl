@@ -55,6 +55,26 @@ pub trait TraceStore: EditionStore {
     /// `watch` delta primitive (used from M2 on).
     fn scan_updates(&self, rel: RelId, from: Edition, to: Edition) -> Result<Vec<Update>>;
 
+    /// Consolidated contents of `rel` as-of `at` **restricted to the tuple-key
+    /// half-open range `[lo, hi)`** — the range-read primitive of an *arranged
+    /// trace* (DESIGN.md §4, "and (later) arranged traces").
+    ///
+    /// This is `read_at` composed with a range restriction, and the default
+    /// implementation is exactly that: a full read then a filter, so every store
+    /// is correct without extra work. A store whose trace is a *measured,
+    /// key-ordered* structure (the Ent's WID enfilade) overrides this to answer in
+    /// `O(result + log n)`, pruning whole out-of-range subtrees instead of
+    /// scanning the relation — the substrate-level fast path the language's join
+    /// pushdown ([`grmpl_diff`]'s `RangeRel`) rides on. Naming a tuple range is a
+    /// pure value-level contract; the trait still names no storage technology.
+    fn read_range(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self
+            .read_at(rel, at)?
+            .into_iter()
+            .filter(|(t, _)| lo <= t && t < hi)
+            .collect())
+    }
+
     /// The consolidation **watermark** (P6 history/GC). Every edition ≤ this has
     /// been folded into per-relation checkpoints and its raw updates discarded,
     /// so no intermediate as-of state below it survives. This is the floor of

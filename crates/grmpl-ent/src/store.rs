@@ -408,6 +408,16 @@ impl TraceStore for EntStore {
         Ok(out)
     }
 
+    /// **WID-pruned range read (E2b).** The Ent's override of the substrate
+    /// range-read primitive: instead of the default full-scan-then-filter, walk
+    /// the Fact enfilade pruning whole out-of-range subtrees by their cached
+    /// measures — `O(result + log n)`. This is the same fast path as
+    /// [`EntStore::range_at`], now reachable through the store trait so
+    /// `grmpl-diff`'s `RangeRel` operator prunes at the source.
+    fn read_range(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        self.range_at(rel, at, lo, hi)
+    }
+
     fn watermark(&self) -> Edition {
         Edition(self.inner.lock().unwrap().watermark)
     }
