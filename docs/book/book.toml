@@ -1,0 +1,17 @@
+[book]
+title = "grmpl and the Ent"
+description = "The story of Xanadu's enfilade, the Ent, and how grmpl rebuilds it as a differential, relational world substrate."
+authors = ["the grmpl project"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/"
+additional-css = []
+mathjax-support = false
+
+[output.html.fold]
+enable = true
+level = 1
