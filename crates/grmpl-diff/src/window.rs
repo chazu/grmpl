@@ -10,11 +10,12 @@
 //!
 //! This module owns both halves:
 //!
-//! * **The window grammar** ([`Window`], [`tumbling`], [`sliding`]) — pure
-//!   edition arithmetic over the half-open interval `(from, to]`, and the two
-//!   materializations a window admits: an **event slice**
-//!   ([`Window::events`], raw [`Update`]s in commit order, event mode §4b) or a
-//!   **consolidated tuple-set** ([`Window::consolidate`], state mode §4a).
+//! * **The window grammar** ([`Window`], [`tumbling`], [`sliding`], [`sessions`],
+//!   [`CountWindow`]) — pure edition arithmetic over the half-open interval
+//!   `(from, to]`, and the two materializations a window admits: an **event
+//!   slice** ([`Window::events`], raw [`Update`]s in commit order, event mode
+//!   §4b) or a **consolidated tuple-set** ([`Window::consolidate`], state mode
+//!   §4a).
 //! * **State-mode consolidation** ([`consolidate_window`],
 //!   [`ConsolidatedWindow`]) — the snapshot-anchored net contents, described
 //!   below.
@@ -65,13 +66,25 @@
 //! truncated history, inherited for free from `eval_delta`/`eval_snapshot` and
 //! (for event mode) from `scan_updates` itself.
 //!
-//! # What is *not* here
+//! # The rest of the §5 grammar (TKT-117)
 //!
-//! Windows are **edition-bounded only** (§5). Session windows (gap-based) and
-//! count windows (last N updates) are explicitly **deferred**: a count window
-//! needs a counter cursor over commit order, which `Update` does not carry.
-//! `iter`, the fixpoint sub-coordinate of `Time`, is not a window axis either —
-//! it is internal to `Iterate`.
+//! §5 tabulates five window shapes and defers two of them. Both now exist, and
+//! the reason they were deferred is exactly the difference between them:
+//!
+//! * [`sessions`] — **gap-based**. Still edition-bounded, so it is pure edition
+//!   arithmetic like [`tumbling`]/[`sliding`]: partition the editions that
+//!   actually carry updates wherever the inter-event gap exceeds a timeout, and
+//!   hand back one tight `(first−1, last]` window per session. Because each
+//!   session *is* an edition interval, both materializations work on it
+//!   unchanged.
+//! * [`CountWindow`] — **last N updates**. This one is not an edition shape at
+//!   all: it needs "a counter cursor over commit order", and a boundary that
+//!   falls *inside* an edition has no snapshot to anchor against. It is
+//!   therefore an **event-mode** window with its own maintained type rather than
+//!   a `Vec<Window>`; see its docs.
+//!
+//! `iter`, the fixpoint sub-coordinate of `Time`, is not a window axis — it is
+//! internal to `Iterate`.
 
 use grmpl_core::{Diff, Edition, Error, RelId, Result, TraceStore, Tuple, Update, Value};
 
@@ -232,6 +245,273 @@ pub fn sliding(from: Edition, to: Edition, size: u64, step: u64) -> Result<Vec<W
         }
     }
     Ok(out)
+}
+
+/// **Session** windows (design §5, deferred there; TKT-117): split a sequence of
+/// **active editions** — the editions that actually carry updates — wherever the
+/// gap between consecutive ones exceeds `timeout`, and return one tight window
+/// per session.
+///
+/// Session *k* is the window `(first − 1, last]`, where `first`/`last` are its
+/// own extreme active editions. That is the narrowest edition interval containing
+/// exactly the session's activity: `from` sits one below `first` because a window
+/// is exclusive at its anchor, so `first` is the earliest edition in scope.
+///
+/// The law this satisfies, in both directions — under-splitting and
+/// over-splitting are both errors:
+///
+/// * **Within a session**, every consecutive gap is `≤ timeout`.
+/// * **At every boundary** between consecutive sessions, the gap is `> timeout`.
+///
+/// Together those make the split unique: it is the coarsest partition with no
+/// over-long internal gap. Sessions are consequently disjoint and separated by at
+/// least one edition — a boundary gap exceeds `timeout ≥ 1`, so the next
+/// session's anchor `first − 1` is strictly above the previous session's `last`.
+///
+/// `actives` must be **strictly ascending** (the order `scan_updates` delivers,
+/// deduplicated) and must not contain [`Edition::ZERO`], which is the empty world
+/// before any commit and therefore carries no update. `timeout` must be positive:
+/// consecutive editions are at least one apart, so a zero timeout would make
+/// every event its own session, which is a `tumbling` of size 1 wearing a
+/// disguise rather than a gap grammar. Ill-formed input is [`Error::Query`], the
+/// same reading [`sliding`] takes of a gap-producing step.
+pub fn sessions(actives: &[Edition], timeout: u64) -> Result<Vec<Window>> {
+    if timeout == 0 {
+        return Err(Error::Query(
+            "session timeout must be positive: consecutive editions are at least one apart, so a \
+             zero timeout closes a session at every event"
+                .into(),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut run: Option<(Edition, Edition)> = None; // (first, last) of the open session
+    for (i, e) in actives.iter().copied().enumerate() {
+        if e == Edition::ZERO {
+            return Err(Error::Query(
+                "session windows: edition 0 is the empty world and carries no update".into(),
+            ));
+        }
+        match run {
+            None => run = Some((e, e)),
+            Some((first, last)) => {
+                if e <= last {
+                    return Err(Error::Query(format!(
+                        "session windows: active editions must be strictly ascending, but item \
+                         {i} is {} after {}",
+                        e.0, last.0
+                    )));
+                }
+                if e.0 - last.0 <= timeout {
+                    run = Some((first, e)); // same session: the gap is within timeout
+                } else {
+                    out.push(Window { from: Edition(first.0 - 1), to: last });
+                    run = Some((e, e)); // the gap closed it
+                }
+            }
+        }
+    }
+    if let Some((first, last)) = run {
+        out.push(Window { from: Edition(first.0 - 1), to: last });
+    }
+    Ok(out)
+}
+
+impl Window {
+    /// The **session windows** of `rel`'s activity inside this window (§5,
+    /// TKT-117): scan the event slice, take the distinct editions it touches, and
+    /// split them on gaps exceeding `timeout`. See [`sessions`].
+    ///
+    /// Sessions are cut from *observed activity*, so this is per base relation
+    /// for the same reason event mode is (TKT-140): idleness is a property of a
+    /// relation's own commit history, and only raw updates carry it.
+    pub fn sessions(
+        &self,
+        store: &dyn TraceStore,
+        rel: RelId,
+        timeout: u64,
+    ) -> Result<Vec<Window>> {
+        let mut actives: Vec<Edition> =
+            self.events(store, rel)?.iter().map(|u| Edition(u.time.edition)).collect();
+        // `scan_updates` delivers commit order, so equal editions are adjacent
+        // and `dedup` yields the strictly ascending sequence `sessions` wants.
+        actives.dedup();
+        sessions(&actives, timeout)
+    }
+}
+
+/// What one [`CountWindow::advance_to`] did to the window: the updates that
+/// arrived, and the ones displaced off the oldest end, both in arrival order.
+///
+/// This is the count window's delta, and it is complete — but the accounting is
+/// over the *concatenation*, not over the previous contents alone:
+///
+/// ```text
+///   contents_after  =  (contents_before ++ admitted)  with the first |evicted| dropped
+///   |evicted|       =  max(0, |contents_before| + |admitted| − n)
+/// ```
+///
+/// The distinction is real rather than pedantic. When a single advance brings
+/// more than `n` updates, the surplus taken off the oldest end reaches **into the
+/// admissions**: an update that arrived and was immediately displaced by a later
+/// one in the same advance appears in *both* lists. That is the honest report —
+/// it did pass through the window's commit order — and a consumer that treats
+/// `admitted` as "now present" must apply `evicted` to it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct CountDelta {
+    /// Updates that arrived, in commit order.
+    pub admitted: Vec<Update>,
+    /// Updates displaced off the oldest end, oldest first — possibly including
+    /// some of `admitted`, when the advance brought more than `n`.
+    pub evicted: Vec<Update>,
+}
+
+/// A **count window** (design §5, deferred there; TKT-117): the last `n` updates
+/// of one relation in arrival order, maintained as the trace advances.
+///
+/// # Why this is not a `Window`
+///
+/// Every other shape in §5 is an edition interval, and the design says why this
+/// one cannot be: it "needs a counter cursor over commit order". An edition may
+/// carry any number of updates, so the boundary of "the last `n`" generally falls
+/// *inside* an edition — there is no `from` such that `(from, to]` holds exactly
+/// `n` updates. That is not a missing convenience; it is the reason a count
+/// window is **event mode only**:
+///
+/// * [`events`](Self::events) hands back the maintained `&[Update]` slice in
+///   commit order, ready for `grmpl_pattern::DeltaInput` exactly as
+///   [`Window::events`] is.
+/// * There is deliberately **no** state-mode `consolidate`. State mode is
+///   snapshot-*anchored* (see the module docs), and a boundary inside an edition
+///   has no edition to anchor at, so the anchoring invariant TKT-114 pinned
+///   cannot be stated for it. [`consolidate_events`] over
+///   [`events`](Self::events) is available for the unanchored fold, with the
+///   usual caveat that it is "what the window did", not "what it left".
+///
+/// # Maintenance
+///
+/// [`open`](Self::open) seeds the window from history — one scan up to the
+/// opening edition, the analogue of a parse stream's anchor snapshot — and each
+/// [`advance_to`](Self::advance_to) appends the new segment and evicts from the
+/// front. The invariant, re-established after every advance, is simply:
+///
+/// ```text
+///   contents  ==  the last min(n, updates seen) updates, in arrival order
+/// ```
+///
+/// Eviction is therefore exactly one-for-one once the window is full: `k`
+/// arrivals evict `k` of the oldest, so nothing stale is retained and nothing
+/// live is dropped.
+pub struct CountWindow {
+    rel: RelId,
+    n: usize,
+    buf: Vec<Update>,
+    at: Edition,
+    seen: u64,
+}
+
+impl CountWindow {
+    /// Open a window of the last `n` updates of `rel` as of edition `at`, seeded
+    /// from history.
+    ///
+    /// The seed is a single scan of `(⊥, at]` — the one-time cost of knowing what
+    /// "the last `n`" means at all, paid once rather than per advance. Open at
+    /// [`Edition::ZERO`] for an empty start that only ever sees what arrives
+    /// after. `n` must be positive.
+    pub fn open(store: &dyn TraceStore, rel: RelId, n: usize, at: Edition) -> Result<CountWindow> {
+        if n == 0 {
+            return Err(Error::Query("count window size must be positive".into()));
+        }
+        let all = store.scan_updates(rel, Edition::ZERO, at)?;
+        let seen = all.len() as u64;
+        let buf = last_n(&all, n).to_vec();
+        Ok(CountWindow { rel, n, buf, at, seen })
+    }
+
+    /// The relation whose commit order this window counts.
+    pub fn rel(&self) -> RelId {
+        self.rel
+    }
+
+    /// The window's capacity `n` — the most updates it will ever hold.
+    pub fn capacity(&self) -> usize {
+        self.n
+    }
+
+    /// The edition through which this window has consumed.
+    pub fn at(&self) -> Edition {
+        self.at
+    }
+
+    /// How many updates have passed through since [`open`](Self::open) seeded it
+    /// — including the seed. `len() == min(capacity(), seen())` always.
+    pub fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    /// The window's contents: the last `min(n, seen)` updates in arrival order,
+    /// ready for `grmpl_pattern::DeltaInput`.
+    pub fn events(&self) -> &[Update] {
+        &self.buf
+    }
+
+    /// How many updates the window currently holds.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The window holds nothing — `n` updates have not yet been seen at all.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// The edition interval the window's contents currently span, as the tight
+    /// `(first − 1, last]` — for reporting only.
+    ///
+    /// It is **not** a window the contents can be recovered from: the first
+    /// edition in scope may be only *partly* in the count window (its earlier
+    /// updates already evicted), which is precisely why a count window is not a
+    /// [`Window`]. `None` when empty.
+    pub fn span(&self) -> Option<Window> {
+        let first = self.buf.first()?.time.edition;
+        let last = self.buf.last()?.time.edition;
+        Some(Window { from: Edition(first.saturating_sub(1)), to: Edition(last) })
+    }
+
+    /// Consume `rel`'s updates over `(at, to]`, admitting each in commit order
+    /// and evicting from the front to keep the window at `n`.
+    ///
+    /// `to` may not precede the current position — a count window advances with
+    /// the trace, and a retreat is an ill-formed plan rather than an empty delta
+    /// ([`Error::Query`]), the same reading every other advancing cursor in the
+    /// layer takes.
+    pub fn advance_to(&mut self, store: &dyn TraceStore, to: Edition) -> Result<CountDelta> {
+        if to < self.at {
+            return Err(Error::Query(format!(
+                "count window cannot retreat: already consumed through edition {}, asked to \
+                 advance to {}",
+                self.at.0, to.0
+            )));
+        }
+        let admitted = store.scan_updates(self.rel, self.at, to)?;
+        self.at = to;
+        if admitted.is_empty() {
+            return Ok(CountDelta::default());
+        }
+        self.seen += admitted.len() as u64;
+        self.buf.extend(admitted.iter().cloned());
+        // One eviction per arrival once full: drop the oldest surplus, oldest
+        // first, so what remains is the last `n` in arrival order.
+        let surplus = self.buf.len().saturating_sub(self.n);
+        let evicted = self.buf.drain(..surplus).collect();
+        Ok(CountDelta { admitted, evicted })
+    }
+}
+
+/// The last `n` items of a slice — `min(n, len)` of them, in the slice's own
+/// order. The pure kernel of a [`CountWindow`], separated so the eviction law is
+/// stated over arithmetic rather than over a maintained buffer.
+pub fn last_n<T>(items: &[T], n: usize) -> &[T] {
+    &items[items.len().saturating_sub(n)..]
 }
 
 /// Fold an **event slice** into a consolidated, tuple-sorted, zero-free

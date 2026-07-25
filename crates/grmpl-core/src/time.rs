@@ -38,7 +38,13 @@ impl Edition {
 pub type Diff = i64;
 
 /// One differential update: at `time`, `tuple`'s multiplicity changed by `diff`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// `Hash` is derived (over the same fields `Eq` compares) so an update can key a
+/// content-addressed cache — an event-mode match arrangement keys a parse by the
+/// span of updates the parser read (`grmpl_diff::MatchArrangement`). Every field
+/// is already hashable and the value is immutable, so this is the ordinary
+/// "structural identity" reading, not a new notion of update equality.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Update {
     pub tuple: Tuple,
     pub time: Time,
