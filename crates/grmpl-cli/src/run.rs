@@ -22,7 +22,7 @@ use grmpl_core::{
 use grmpl_diff::Snapshot;
 use grmpl_lang::Program;
 use grmpl_proc::{decode_activation, enqueue, OnWatch, Process};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const BUILTIN_MOO: &str = include_str!("../../../worlds/moo.grmpl");
 
@@ -88,12 +88,12 @@ pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), Strin
     repl.loop_forever()
 }
 
-fn open_store(dir: Option<&str>) -> Result<FjallStore, String> {
+fn open_store(dir: Option<&str>) -> Result<EntStore, String> {
     let path = match dir {
         Some(d) => std::path::PathBuf::from(d),
         None => std::env::temp_dir().join(format!("grmpl-run-{}", std::process::id())),
     };
-    FjallStore::open(&path).map_err(|e| format!("cannot open store at {}: {e:?}", path.display()))
+    EntStore::open(&path).map_err(|e| format!("cannot open store at {}: {e:?}", path.display()))
 }
 
 // ===========================================================================
@@ -191,7 +191,7 @@ fn process(
 // ===========================================================================
 // Seeding (all data — no rules)
 // ===========================================================================
-fn seed_world(store: &FjallStore, r: &Rels) -> Result<(), String> {
+fn seed_world(store: &EntStore, r: &Rels) -> Result<(), String> {
     let at = store.current();
     let seeded = store
         .read_at(r.named, at)
@@ -280,7 +280,7 @@ fn seed_world(store: &FjallStore, r: &Rels) -> Result<(), String> {
 
 /// Seed the cribbage rule tables: the *arithmetic*, precomputed as relations the
 /// scoring views join against. This is data entry, not scoring.
-fn seed_rules(store: &FjallStore, r: &Rels) -> Result<(), String> {
+fn seed_rules(store: &EntStore, r: &Rels) -> Result<(), String> {
     let at = store.current();
     let already = !store.read_at(r.cardval, at).map_err(err)?.is_empty();
     if already {
@@ -330,7 +330,7 @@ fn seed_rules(store: &FjallStore, r: &Rels) -> Result<(), String> {
 // ===========================================================================
 struct Repl<'a> {
     prog: &'a Arc<Program>,
-    store: &'a FjallStore,
+    store: &'a EntStore,
     r: Rels,
     player: Process,
     cat: Process,
