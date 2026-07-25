@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use grmpl_core::{RelId, Tuple, Value};
+use grmpl_core::{Entity, RelId, Tuple, Value};
 use grmpl_diff::{Agg, MapFn, Pred, Query};
 use grmpl_pattern::{Bindings, Ctor, Form, Pattern, Rule, VarId};
 
@@ -255,10 +255,7 @@ impl QueryIr {
                 input: Box::new(input.lower()),
                 f: map.lower(),
             },
-            QueryIr::Filter { input, pred } => Query::Filter {
-                input: Box::new(input.lower()),
-                pred: pred.lower(),
-            },
+            QueryIr::Filter { input, pred } => lower_filter(*input, pred),
             QueryIr::Project { input, cols } => input.lower().project(cols),
             QueryIr::Join {
                 left,
@@ -274,6 +271,78 @@ impl QueryIr {
             QueryIr::Iterate { init, step } => Query::iterate(init.lower(), step.lower()),
         }
     }
+}
+
+/// Lower a `Filter`, pushing a **lead-column equality** into the store as a
+/// [`Query::range`] read when possible — the compiler half of E2b.
+///
+/// `Filter(Rel(r), … col0 == k …)` over a key `k` with a well-defined successor
+/// (an `Ent` or `Int`) lowers to `RangeRel(r, [k], [k⁺])` — which, since tuple
+/// order is lexicographic and [`Value`] order is type-major, contains **exactly**
+/// the rows whose first column is `k` — with any remaining conjuncts left as a
+/// residual `Filter`. So the substrate's WID enfilade prunes to the matching key
+/// instead of scanning the whole relation, and the query is unchanged in meaning:
+/// this is an evaluation-time optimization (like `Query::Shared`), which is why it
+/// lives in lowering and leaves [`QueryIr`] — the inspected/typed form — as the
+/// plain `Rel`+`Filter`. Any other shape lowers unchanged.
+fn lower_filter(input: QueryIr, pred: PredExpr) -> Query {
+    if let QueryIr::Rel(r) = input {
+        if let Some((key, residual)) = pushdown_lead_eq(&pred) {
+            let hi = lead_successor(&key).expect("candidate key has a successor");
+            let base = Query::range(r, Tuple::from([key]), Tuple::from([hi]));
+            return match residual {
+                None => base,
+                Some(p) => Query::Filter { input: Box::new(base), pred: p.lower() },
+            };
+        }
+        return Query::Filter { input: Box::new(Query::rel(r)), pred: pred.lower() };
+    }
+    Query::Filter { input: Box::new(input.lower()), pred: pred.lower() }
+}
+
+/// The least value strictly greater than every tuple whose first column is `v` —
+/// `v`'s successor in the total [`Value`] order — for the types that have one
+/// (`Ent`/`Int`, guarding overflow). `None` for `Text`/`Bool` and at the numeric
+/// ceiling, where no exact half-open key range exists and the caller keeps the
+/// plain filter.
+fn lead_successor(v: &Value) -> Option<Value> {
+    match v {
+        Value::Ent(e) => e.0.checked_add(1).map(|n| Value::Ent(Entity(n))),
+        Value::Int(n) => n.checked_add(1).map(Value::Int),
+        _ => None,
+    }
+}
+
+/// If `pred` constrains column 0 to a literal with a [`lead_successor`], return
+/// that key and the residual predicate (the other conjuncts, or `None` if the
+/// equality was the whole predicate). Only a *pushable* key (successor exists) is
+/// selected, so the caller can always build the range.
+fn pushdown_lead_eq(pred: &PredExpr) -> Option<(Value, Option<PredExpr>)> {
+    let conjuncts: Vec<&PredExpr> = match pred {
+        PredExpr::And(ps) => ps.iter().collect(),
+        other => vec![other],
+    };
+    let lead_lit = |p: &PredExpr| -> Option<Value> {
+        let (a, b) = match p {
+            PredExpr::Eq(a, b) => (a, b),
+            _ => return None,
+        };
+        let v = match (a, b) {
+            (RowExpr::Col(0), RowExpr::Lit(v)) | (RowExpr::Lit(v), RowExpr::Col(0)) => v,
+            _ => return None,
+        };
+        lead_successor(v).map(|_| v.clone())
+    };
+    let k = conjuncts.iter().position(|p| lead_lit(p).is_some())?;
+    let key = lead_lit(conjuncts[k]).expect("position found a lead literal");
+    let rest: Vec<PredExpr> =
+        conjuncts.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, p)| (*p).clone()).collect();
+    let residual = match rest.len() {
+        0 => None,
+        1 => Some(rest.into_iter().next().unwrap()),
+        _ => Some(PredExpr::And(rest)),
+    };
+    Some((key, residual))
 }
 
 /// One grammar rule as inspectable data — the reified `grmpl_pattern::Rule`: a
@@ -336,5 +405,56 @@ impl Comp {
             Comp::Find(q) | Comp::Watch(q) => Some(q),
             Comp::Parse(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod pushdown_tests {
+    use super::*;
+
+    fn ent(n: u64) -> Value {
+        Value::Ent(Entity(n))
+    }
+
+    #[test]
+    fn lead_successor_only_for_ordinal_types() {
+        assert_eq!(lead_successor(&ent(5)), Some(ent(6)));
+        assert_eq!(lead_successor(&Value::Int(5)), Some(Value::Int(6)));
+        // No exact half-open key range for text/bool, or at the numeric ceiling.
+        assert_eq!(lead_successor(&Value::text("x")), None);
+        assert_eq!(lead_successor(&Value::Bool(true)), None);
+        assert_eq!(lead_successor(&Value::Int(i64::MAX)), None);
+        assert_eq!(lead_successor(&Value::Ent(Entity(u64::MAX))), None);
+    }
+
+    #[test]
+    fn pushdown_picks_the_lead_equality_and_keeps_the_rest() {
+        // Bare lead equality → pushed, no residual.
+        let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5)));
+        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), None)));
+        // Operand order does not matter.
+        let p = PredExpr::Eq(RowExpr::Lit(ent(5)), RowExpr::Col(0));
+        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), None)));
+
+        // Lead equality alongside a column-column join key → the join key stays.
+        let join = PredExpr::Eq(RowExpr::Col(1), RowExpr::Col(0));
+        let p = PredExpr::And(vec![
+            PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5))),
+            join.clone(),
+        ]);
+        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), Some(join))));
+    }
+
+    #[test]
+    fn pushdown_declines_non_lead_and_unpushable_keys() {
+        // Equality on a non-lead column → no pushdown.
+        let p = PredExpr::Eq(RowExpr::Col(1), RowExpr::Lit(ent(5)));
+        assert_eq!(pushdown_lead_eq(&p), None);
+        // Lead column bound to a text literal (no successor) → no pushdown.
+        let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(Value::text("x")));
+        assert_eq!(pushdown_lead_eq(&p), None);
+        // A column-column lead constraint is not a literal key.
+        let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Col(2));
+        assert_eq!(pushdown_lead_eq(&p), None);
     }
 }

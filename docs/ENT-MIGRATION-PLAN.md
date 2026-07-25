@@ -26,20 +26,21 @@ throwaway construction-time differential oracle and is **deleted at completion**
 > the showcase's substrate demos, and the `grmpl-bench` baseline — deleted only
 > after a soak window, kept meanwhile as the independent third leg.
 >
-> - **E2b** the Ent's WID pruning is **load-bearing in the language**: a
->   `TraceStore::read_range` substrate primitive (default = filtered `read_at`,
+> - **E2b** the Ent's WID pruning is **load-bearing in the language**, end to end:
+>   a `TraceStore::read_range` substrate primitive (default = filtered `read_at`,
 >   overridden by the Ent's O(result+log n) enfilade walk) feeds a `RangeRel`
->   operator in `grmpl-diff` that pushes the tuple-range restriction to the store —
->   so a range-restricted base read prunes at the source instead of scanning.
+>   operator in `grmpl-diff`, and the `grmpl-lang` lowerer **auto-emits it** from a
+>   lead-column equality (`view v(x) { r(x, …) }`) — so every entity-keyed view in
+>   the MOO prunes to the matching key at the source instead of scanning. The
+>   pushdown is an evaluation-time rewrite (like `Query::Shared`), so the typed/
+>   inspected `QueryIr` stays the plain `Rel`+`Filter`.
 >
 > *Deeper refinements deferred (each faithful-but-optimized version of a landed
-> property):* multi-order Arrangements for trailing-column spans + a `grmpl-lang`
-> compiler pushdown that emits `RangeRel` from lead-column equality (the operator +
-> substrate primitive are done; auto-emission is the remaining half); a
-> **persistent** fork sharing the granfilade node store (the in-memory fork +
-> DagWood ancestry are done); a measured interval-tree canopy with the endorsement
-> flag-lattice; lazy Dsp threaded through the tree traversal; node content-key
-> caching to persist only the new path per commit.
+> property):* multi-order Arrangements for trailing-column spans (the lead-column
+> pushdown is done); a **persistent** fork sharing the granfilade node store (the
+> in-memory fork + DagWood ancestry are done); a measured interval-tree canopy with
+> the endorsement flag-lattice; lazy Dsp threaded through the tree traversal; node
+> content-key caching to persist only the new path per commit.
 
 **The one thing preserved (also per the original directive — "*while preserving
 the systems features*"):** the **seven design laws** and the **P0–P15 language

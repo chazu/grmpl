@@ -290,6 +290,58 @@ fn lowered_view_ir_evaluates() {
 }
 
 #[test]
+fn lead_column_equality_lowers_through_the_range_pushdown() {
+    // A parameterized view whose lead column is bound to the argument: at lower
+    // time this becomes a `RangeRel` range-read (E2b pushdown), which over any
+    // store returns exactly the rows whose first column equals the key. The IR
+    // itself is still the plain `Rel`+`Filter` (an evaluation-time optimization),
+    // and the result must be identical to a full scan filtered by the key.
+    let prog =
+        Program::compile("rel loc(thing, room)\nview whereis(th) { loc(th, r) yield r }", 1).unwrap();
+    let loc = prog.rel_id("loc").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = FjallStore::open(dir.path()).unwrap();
+    let ent = |n: u64| Value::Ent(grmpl_core::Entity(n));
+    store
+        .commit(&[
+            (loc, t([ent(10), ent(1)]), 1), // thing 10 in room 1
+            (loc, t([ent(10), ent(3)]), 1), // thing 10 also in room 3
+            (loc, t([ent(11), ent(2)]), 1), // thing 11 in room 2
+        ])
+        .unwrap();
+
+    // The param binds the LEAD column (`thing`) — the pushdown case. The IR stays
+    // inspectable as Rel+Filter (the pushdown is only in lowering).
+    let ir = prog.view_ir("whereis", &[ent(10)]).unwrap();
+    assert_eq!(
+        ir,
+        QueryIr::Distinct(Box::new(QueryIr::Project {
+            input: Box::new(QueryIr::Filter {
+                input: Box::new(QueryIr::Rel(loc)),
+                pred: PredExpr::And(vec![PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(10)))]),
+            }),
+            cols: vec![1],
+        }))
+    );
+
+    // Lowered and evaluated for thing 10: rooms 1 and 3, not 2. The lead-column
+    // equality drives the range read; the result is the exact set.
+    let q = ir.lower();
+    let mut got: Vec<(Tuple, Diff)> = q.find(&Snapshot::at_current(&store)).unwrap();
+    got.sort();
+    assert_eq!(got, vec![(t([ent(1)]), 1), (t([ent(3)]), 1)]);
+
+    // A thing that is nowhere yields nothing (the range is empty).
+    let empty = prog.find_view("whereis", &[ent(99)]).unwrap();
+    let rows = match empty {
+        Comp::Find(plan) => plan.lower().find(&Snapshot::at_current(&store)).unwrap(),
+        _ => unreachable!(),
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn form_ir_exposes_ctor_specs() {
     let prog = Program::compile(
         "form command {\n \"take\" name -> Take(name)\n \"look\" -> Look()\n}",
