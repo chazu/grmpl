@@ -9,7 +9,7 @@
 //! closed and reopened from disk, must still agree (the ent rebuilds its state
 //! from the persisted enfilades).
 
-use grmpl_core::{Diff, Edition, EditionStore, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, RelId, TraceStore, Tuple, Value};
 use grmpl_ent::EntStore;
 use grmpl_store::FjallStore;
 
