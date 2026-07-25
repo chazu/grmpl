@@ -69,6 +69,40 @@ impl EntStore {
         Ok(EntStore { inner: Mutex::new(inner), gran: Some(gran) })
     }
 
+    /// **WID range read (E2).** The rows of `rel` whose tuple key lies in
+    /// `[lo, hi)`, as-of `at` — an `O(result + log n)` walk of the Fact enfilade
+    /// that prunes whole out-of-range subtrees, where the LSM must scan the
+    /// relation. (Lead-prefix pruning on the primary order; per-column
+    /// Arrangements for trailing-column spans are the next increment.)
+    pub fn range_at(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        let inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("range_at", at.0, inner.watermark));
+        }
+        Ok(inner
+            .fact
+            .get(&rel)
+            .and_then(|f| f.range(..=at.0).next_back())
+            .map(|(_, t)| t.range_collect(lo, hi))
+            .unwrap_or_default())
+    }
+
+    /// **WID measure (E2).** How many live tuples of `rel` lie in `[lo, hi)`
+    /// as-of `at` — answered in `O(log n)` from the cached subtree measures,
+    /// without materializing the rows (Xanadu wid pruning).
+    pub fn count_at(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("count_at", at.0, inner.watermark));
+        }
+        Ok(inner
+            .fact
+            .get(&rel)
+            .and_then(|f| f.range(..=at.0).next_back())
+            .map(|(_, t)| t.measure_range(lo, hi).0)
+            .unwrap_or(0))
+    }
+
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
     /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
     fn persist(&self, inner: &Inner, touched: &[RelId], all_ckpts: bool) -> Result<()> {

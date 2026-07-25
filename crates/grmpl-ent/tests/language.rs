@@ -49,6 +49,30 @@ fn differential_query_runs_over_the_ent_store() {
 }
 
 #[test]
+fn wid_range_read_and_count_match_a_full_scan() {
+    let store = EntStore::new();
+    // Seed rel 1 with single-column tuples Int(0..40).
+    let updates: Vec<(RelId, Tuple, i64)> =
+        (0..40).map(|k| (RelId(1), Tuple::from([Value::Int(k)]), 1)).collect();
+    store.commit(&updates).unwrap();
+    let at = store.current();
+
+    for (a, b) in [(-5i64, 5), (10, 10), (7, 33), (0, 40), (30, 100), (50, 60)] {
+        let lo = Tuple::from([Value::Int(a)]);
+        let hi = Tuple::from([Value::Int(b)]);
+        // Ground truth: the full sorted state filtered to the half-open span.
+        let want: Vec<(Tuple, i64)> = store
+            .read_at(RelId(1), at)
+            .unwrap()
+            .into_iter()
+            .filter(|(t, _)| lo <= *t && *t < hi)
+            .collect();
+        assert_eq!(store.range_at(RelId(1), at, &lo, &hi).unwrap(), want, "range [{a},{b})");
+        assert_eq!(store.count_at(RelId(1), at, &lo, &hi).unwrap(), want.len() as u64, "count [{a},{b})");
+    }
+}
+
+#[test]
 fn optimistic_patch_commit_runs_over_the_ent_store() {
     let store = seed();
     let authority = Authority::new(
