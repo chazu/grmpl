@@ -144,6 +144,54 @@ fn structural_sharing_fork_diverges_independently() {
 }
 
 #[test]
+fn fork_family_records_ancestry_in_the_dagwood() {
+    // The DagWood (fulltrace branch structure): forks share one branch DAG, so
+    // ancestry is queryable across the whole family even as each branch diverges.
+    let root = EntStore::new();
+    root.commit(&[(LOCATED, Tuple::from([e(LAMP), e(ROOM)]), 1)]).unwrap();
+    let fork_point = root.current();
+
+    // Fork the root, then fork the child again — a three-branch family.
+    let child = root.fork_at(fork_point).unwrap();
+    let grandchild = child.fork_at(child.current()).unwrap();
+
+    // Distinct branch ids; root is branch 0.
+    assert_eq!(root.branch_id(), 0);
+    assert_ne!(child.branch_id(), root.branch_id());
+    assert_ne!(grandchild.branch_id(), child.branch_id());
+
+    // Each branch evolves independently after the fork.
+    root.commit(&[(NAMED, Tuple::from([e(ROOM), Value::text("root world")]), 1)]).unwrap();
+    child.commit(&[(NAMED, Tuple::from([e(ROOM), Value::text("child world")]), 1)]).unwrap();
+    grandchild.commit(&[(NAMED, Tuple::from([e(ROOM), Value::text("grandchild")]), 1)]).unwrap();
+
+    // Descent flows down the fork chain, not up or sideways.
+    assert!(child.descends_from(&root, fork_point), "child must descend from root");
+    assert!(grandchild.descends_from(&root, fork_point), "grandchild descends from root");
+    assert!(!root.descends_from(&child, child.current()), "root must not descend from its fork");
+    assert!(
+        !grandchild.descends_from(&root, root.current()),
+        "grandchild never saw root's post-fork commit"
+    );
+
+    // A sibling fork of the root is a cousin of the child — neither descends from
+    // the other, and their merge base is the shared root at the fork point.
+    let sibling = root.fork_at(fork_point).unwrap();
+    assert!(!sibling.descends_from(&child, child.current()));
+    assert!(!child.descends_from(&sibling, sibling.current()));
+    assert_eq!(
+        child.common_ancestor_with(&sibling),
+        Some((root.branch_id(), fork_point.0)),
+        "cousins should meet at the root fork point"
+    );
+
+    // A store from a disjoint DagWood shares no ancestry.
+    let stranger = EntStore::new();
+    assert!(!child.descends_from(&stranger, stranger.current()));
+    assert_eq!(child.common_ancestor_with(&stranger), None);
+}
+
+#[test]
 fn optimistic_patch_commit_runs_over_the_ent_store() {
     let store = seed();
     let authority = Authority::new(

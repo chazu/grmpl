@@ -13,6 +13,7 @@
 
 pub mod canopy;
 pub mod context;
+pub mod dag;
 pub mod dsp;
 pub mod granfilade;
 pub mod measure;
@@ -21,6 +22,7 @@ pub mod tree;
 
 pub use canopy::{Canopy, InterestId};
 pub use context::Context;
+pub use dag::{Branch, BranchId, Dag};
 pub use dsp::{Dsp, DspEnf};
 pub use granfilade::{ContentKey, Granfilade, Persist};
 pub use measure::{Count, Measure};

@@ -18,12 +18,13 @@
 //! is a pure in-memory store (used by the conformance oracle).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
     Diff, Edition, EditionStore, Error, RelId, Result, Time, TraceStore, Tuple, Update,
 };
 
+use crate::dag::{BranchId, Dag};
 use crate::granfilade::{ContentKey, Granfilade};
 use crate::measure::Count;
 use crate::tree::Tree;
@@ -38,6 +39,11 @@ type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
 pub struct EntStore {
     inner: Mutex<Inner>,
     gran: Option<Granfilade>,
+    /// This store's branch in the fulltrace's DagWood.
+    branch: BranchId,
+    /// The branch DAG shared with every fork of this store (Xanadu's `DagWood` /
+    /// fulltrace branch structure) — see [`crate::dag`].
+    dag: Arc<Mutex<Dag>>,
 }
 
 struct Inner {
@@ -58,7 +64,12 @@ impl Default for EntStore {
 impl EntStore {
     /// A pure in-memory ent store (no durability).
     pub fn new() -> EntStore {
-        EntStore { inner: Mutex::new(Inner::empty()), gran: None }
+        EntStore {
+            inner: Mutex::new(Inner::empty()),
+            gran: None,
+            branch: Dag::ROOT,
+            dag: Arc::new(Mutex::new(Dag::new())),
+        }
     }
 
     /// Open (or create) a durable ent store on a granfilade at `path`, rebuilding
@@ -66,7 +77,12 @@ impl EntStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<EntStore> {
         let gran = Granfilade::open(path)?;
         let inner = Inner::rebuild(&gran)?;
-        Ok(EntStore { inner: Mutex::new(inner), gran: Some(gran) })
+        Ok(EntStore {
+            inner: Mutex::new(inner),
+            gran: Some(gran),
+            branch: Dag::ROOT,
+            dag: Arc::new(Mutex::new(Dag::new())),
+        })
     }
 
     /// **WID range read (E2).** The rows of `rel` whose tuple key lies in
@@ -150,6 +166,10 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("fork_at", at.0, inner.watermark));
         }
+        // Graft a new branch onto this store's branch at the fork edition in the
+        // shared DagWood; the child carries that id and the same registry, so
+        // ancestry is queryable across the whole fork family (the fulltrace).
+        let child_branch = self.dag.lock().unwrap().fork(self.branch, at.0);
         // Fact: keep the versioned roots up to `at` (their trees are shared Arcs).
         let mut fact: HashMap<RelId, BTreeMap<u64, FactTree>> = HashMap::new();
         for (rel, versions) in &inner.fact {
@@ -178,7 +198,52 @@ impl EntStore {
         Ok(EntStore {
             inner: Mutex::new(Inner { current: at.0, watermark: inner.watermark, fact, log }),
             gran: None,
+            branch: child_branch,
+            dag: Arc::clone(&self.dag),
         })
+    }
+
+    /// This store's branch in the fulltrace's DagWood ([`Dag::ROOT`] unless it is
+    /// a fork).
+    pub fn branch_id(&self) -> BranchId {
+        self.branch
+    }
+
+    /// A snapshot of the branch DAG shared with this store's fork family — the
+    /// fulltrace's branch structure (Xanadu's `DagWood`).
+    pub fn dag(&self) -> Dag {
+        self.dag.lock().unwrap().clone()
+    }
+
+    /// **Backfollow across branches (E3).** Does this store's current point
+    /// descend from `ancestor`'s point as-of `ancestor_at` — i.e. did that history
+    /// flow into this branch? Forks share the DagWood, so this answers across the
+    /// whole family; two stores that never shared a fork return `false` (disjoint
+    /// DagWoods). Reflexive on the same branch (earlier editions are ancestors).
+    pub fn descends_from(&self, ancestor: &EntStore, ancestor_at: Edition) -> bool {
+        if !Arc::ptr_eq(&self.dag, &ancestor.dag) {
+            return false;
+        }
+        let here = self.inner.lock().unwrap().current;
+        self.dag
+            .lock()
+            .unwrap()
+            .is_ancestor(ancestor.branch, ancestor_at.0, self.branch, here)
+    }
+
+    /// The merge base of this store and `other` in the shared DagWood — the latest
+    /// `(branch, edition)` their histories both descend from, or `None` if they
+    /// belong to disjoint DagWoods.
+    pub fn common_ancestor_with(&self, other: &EntStore) -> Option<(BranchId, u64)> {
+        if !Arc::ptr_eq(&self.dag, &other.dag) {
+            return None;
+        }
+        let here = self.inner.lock().unwrap().current;
+        let there = other.inner.lock().unwrap().current;
+        self.dag
+            .lock()
+            .unwrap()
+            .common_ancestor(self.branch, here, other.branch, there)
     }
 
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
