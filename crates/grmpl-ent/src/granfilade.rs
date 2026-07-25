@@ -85,10 +85,12 @@ impl Persist for Value {
     }
 }
 
-/// The content-addressed node store for one or more enfilades.
+/// The content-addressed node store for one or more enfilades, plus a small
+/// `meta` keyspace for enfilade roots and the edition clock.
 pub struct Granfilade {
     db: Database,
     nodes: fjall::Keyspace,
+    meta: fjall::Keyspace,
 }
 
 impl Granfilade {
@@ -96,7 +98,55 @@ impl Granfilade {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Granfilade> {
         let db = Database::builder(path.as_ref()).open().map_err(store_err)?;
         let nodes = db.keyspace("nodes", KeyspaceCreateOptions::default).map_err(store_err)?;
-        Ok(Granfilade { db, nodes })
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).map_err(store_err)?;
+        Ok(Granfilade { db, nodes, meta })
+    }
+
+    /// Collect a tree's nodes as `(content_key, frame)` pairs (children first) and
+    /// its root key — pure, no I/O. The caller batches these with meta so nodes
+    /// land **before/with** the roots that reference them (crash-safety).
+    pub fn collect_tree<K, V, M>(
+        &self,
+        tree: &Tree<K, V, M>,
+    ) -> (Option<ContentKey>, Vec<(ContentKey, Vec<u8>)>)
+    where
+        K: Persist + Ord + Clone,
+        V: Persist + Clone,
+        M: Measure<K, V>,
+    {
+        let mut out = Vec::new();
+        let ck = collect_nodes(tree, &mut out);
+        (ck, out)
+    }
+
+    /// One atomic write of node frames + meta entries (nodes and the roots that
+    /// reference them land together — the Patch–edition law for the store).
+    pub fn write(&self, nodes: Vec<(ContentKey, Vec<u8>)>, meta: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        let mut batch = self.db.batch();
+        for (k, v) in nodes {
+            batch.insert(&self.nodes, k.to_vec(), v);
+        }
+        for (k, v) in meta {
+            batch.insert(&self.meta, k, v);
+        }
+        batch.commit().map_err(store_err)?;
+        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        Ok(())
+    }
+
+    /// A meta value.
+    pub fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.meta.get(key).map_err(store_err)?.map(|s| s.as_ref().to_vec()))
+    }
+
+    /// All meta `(key, value)` pairs whose key starts with `prefix`.
+    pub fn meta_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for kv in self.meta.prefix(prefix) {
+            let (k, v) = kv.into_inner().map_err(store_err)?;
+            out.push((k.as_ref().to_vec(), v.as_ref().to_vec()));
+        }
+        Ok(out)
     }
 
     /// Persist `tree`, returning its root content key (`None` if empty). Writes

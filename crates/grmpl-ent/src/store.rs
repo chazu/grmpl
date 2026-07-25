@@ -1,21 +1,21 @@
-//! **The ent-native store (E1a, in-memory).**
+//! **The ent-native store (E1, Edition + Fact enfilades).**
 //!
-//! The first realization of "the Ent *is* the store" (plan §1), built from the
-//! [`Tree`] enfilade primitive, over two coordinated enfilades per relation:
+//! The realization of "the Ent *is* the store" (plan §1), built from the [`Tree`]
+//! enfilade primitive over two coordinated enfilades per relation:
 //!
 //! * the **Fact enfilade** — net-per-tuple state, tuple-keyed, *versioned by
-//!   edition* (one persistent root per edition, sharing structure with its
-//!   predecessor), so `read_at(rel, at)` is a root lookup + in-order walk (MVCC by
-//!   root); zero-weight tuples are absent.
+//!   edition* (one persistent root per edition, structurally shared), so
+//!   `read_at(rel, at)` is a root lookup + in-order walk (MVCC by root);
 //! * the **Edition enfilade** — the raw commit-order delta log, keyed by
 //!   `(edition, submit_index)` with the submit index as immutable payload, so
-//!   `scan_updates` returns the raw, per-multiplicity updates in exact submit
-//!   order (plan v4.1 CRITICAL-2/MAJOR fixes).
+//!   `scan_updates` returns raw, per-multiplicity updates in exact submit order.
 //!
-//! It implements the `grmpl-core` store traits, so the whole semantic core runs
-//! over it unchanged. This in-memory cut validates the architecture against
-//! `FjallStore` as an oracle (see the conformance test); granfilade persistence
-//! (content-interned nodes on fjall) is the next increment.
+//! [`EntStore::open`] backs the store with a [`Granfilade`]: on each commit the
+//! touched Edition enfilades are persisted as content-addressed nodes (structural
+//! sharing across editions) with the roots + clock in one atomic write; on open
+//! the state is rebuilt from the persisted enfilades. The **persisted form is the
+//! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
+//! is a pure in-memory store (used by the conformance oracle).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -24,6 +24,7 @@ use grmpl_core::{
     Diff, Edition, EditionStore, Error, RelId, Result, Time, TraceStore, Tuple, Update,
 };
 
+use crate::granfilade::{ContentKey, Granfilade};
 use crate::measure::Count;
 use crate::tree::Tree;
 
@@ -32,10 +33,11 @@ type FactTree = Tree<Tuple, Diff, Count>;
 /// The Edition enfilade: `(edition, submit_index) → (tuple, diff)` raw log.
 type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
 
-/// An in-memory ent store: a family of per-relation Fact + Edition enfilades
-/// behind one commit clock (single-writer, like the domain's edition lock).
+/// An ent store: a family of per-relation Fact + Edition enfilades behind one
+/// commit clock, optionally durable on a [`Granfilade`].
 pub struct EntStore {
     inner: Mutex<Inner>,
+    gran: Option<Granfilade>,
 }
 
 struct Inner {
@@ -54,39 +56,110 @@ impl Default for EntStore {
 }
 
 impl EntStore {
+    /// A pure in-memory ent store (no durability).
     pub fn new() -> EntStore {
-        EntStore {
-            inner: Mutex::new(Inner {
-                current: 0,
-                watermark: 0,
-                fact: HashMap::new(),
-                log: HashMap::new(),
-            }),
+        EntStore { inner: Mutex::new(Inner::empty()), gran: None }
+    }
+
+    /// Open (or create) a durable ent store on a granfilade at `path`, rebuilding
+    /// its state from the persisted enfilades.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<EntStore> {
+        let gran = Granfilade::open(path)?;
+        let inner = Inner::rebuild(&gran)?;
+        Ok(EntStore { inner: Mutex::new(inner), gran: Some(gran) })
+    }
+
+    /// Persist the clock plus the touched relations' Edition enfilades (roots +
+    /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
+    fn persist(&self, inner: &Inner, touched: &[RelId], all_ckpts: bool) -> Result<()> {
+        let gran = match &self.gran {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        let mut nodes = Vec::new();
+        let mut meta = vec![
+            (b"cur".to_vec(), inner.current.to_be_bytes().to_vec()),
+            (b"wm".to_vec(), inner.watermark.to_be_bytes().to_vec()),
+        ];
+        for rel in touched {
+            let log = inner.log.get(rel).cloned().unwrap_or_default();
+            let (ck, ns) = gran.collect_tree(&log);
+            nodes.extend(ns);
+            meta.push((log_key(*rel), opt_ck_bytes(ck)));
         }
+        // On consolidate the Fact checkpoint (@ watermark) changes for every rel.
+        if all_ckpts {
+            for (rel, facts) in &inner.fact {
+                let ckpt = facts.range(..=inner.watermark).next_back().map(|(_, t)| t.clone());
+                let ck = ckpt.map(|t| {
+                    let (ck, ns) = gran.collect_tree(&t);
+                    nodes.extend(ns);
+                    ck
+                });
+                meta.push((ckpt_key(*rel), opt_ck_bytes(ck.flatten())));
+            }
+        }
+        gran.write(nodes, meta)
     }
 }
 
 impl Inner {
-    /// Apply `updates` as edition `e` (= current + 1): append each to the Edition
-    /// enfilade in submit order and fold each into a fresh Fact root. A later
-    /// update to the same rel in the batch builds on the root just produced at `e`
-    /// (so repeated tuples net correctly); a tuple reaching net 0 is removed.
+    fn empty() -> Inner {
+        Inner { current: 0, watermark: 0, fact: HashMap::new(), log: HashMap::new() }
+    }
+
+    /// Rebuild in-memory state from a granfilade: the clock, each rel's Fact
+    /// checkpoint (@ watermark) and Edition-log tail, then replay the tail to
+    /// reconstruct the versioned Fact roots above the watermark.
+    fn rebuild(gran: &Granfilade) -> Result<Inner> {
+        let current = gran.meta_get(b"cur")?.map(|b| u64_be(&b)).unwrap_or(0);
+        let watermark = gran.meta_get(b"wm")?.map(|b| u64_be(&b)).unwrap_or(0);
+        let mut inner = Inner { current, watermark, fact: HashMap::new(), log: HashMap::new() };
+
+        // Fact checkpoints (state as-of the watermark).
+        for (key, val) in gran.meta_prefix(b"ckpt:")? {
+            let rel = rel_from_key(&key, b"ckpt:");
+            if let Some(ck) = bytes_opt_ck(&val) {
+                let tree: FactTree = gran.load(Some(ck))?;
+                inner.fact.entry(rel).or_default().insert(watermark, tree);
+            }
+        }
+        // Edition-log tails, then replay to rebuild the Fact roots above wm.
+        for (key, val) in gran.meta_prefix(b"log:")? {
+            let rel = rel_from_key(&key, b"log:");
+            let log: LogTree = gran.load(bytes_opt_ck(&val))?;
+            for ((e, _submit), (tuple, diff)) in log.iter().map(|(k, v)| (*k, v.clone())) {
+                inner.fold_fact(e, rel, &tuple, diff);
+            }
+            inner.log.insert(rel, log);
+        }
+        Ok(inner)
+    }
+
+    /// Fold one update into the Fact enfilade at edition `e`: build a fresh root
+    /// from the latest root ≤ `e`, netting the tuple's weight; drop it at 0.
+    fn fold_fact(&mut self, e: u64, rel: RelId, tuple: &Tuple, diff: Diff) {
+        let facts = self.fact.entry(rel).or_default();
+        let base = facts.range(..=e).next_back().map(|(_, t)| t.clone()).unwrap_or_default();
+        let cur = base.get(tuple).copied().unwrap_or(0);
+        let net = cur + diff;
+        let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
+        facts.insert(e, root);
+    }
+
+    /// Apply `updates` as edition `e`: append to each Edition enfilade in submit
+    /// order and fold each into the Fact enfilade.
     fn apply(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
         for (i, (rel, tuple, diff)) in updates.iter().enumerate() {
-            let log = self.log.entry(*rel).or_default();
-            *log = log.insert((e, i as u64), (tuple.clone(), *diff));
-
-            let facts = self.fact.entry(*rel).or_default();
-            let base = facts.range(..=e).next_back().map(|(_, t)| t.clone()).unwrap_or_default();
-            let cur = base.get(tuple).copied().unwrap_or(0);
-            let net = cur + *diff;
-            let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
-            facts.insert(e, root);
+            {
+                let log = self.log.entry(*rel).or_default();
+                *log = log.insert((e, i as u64), (tuple.clone(), *diff));
+            }
+            self.fold_fact(e, *rel, tuple, *diff);
         }
         self.current = e;
     }
 
-    /// Net weight of `tuple` in `rel` as-of `current` > 0.
     fn holds_now(&self, rel: RelId, tuple: &Tuple) -> bool {
         self.fact
             .get(&rel)
@@ -107,6 +180,7 @@ impl TraceStore for EntStore {
         let mut inner = self.inner.lock().unwrap();
         let e = inner.current + 1;
         inner.apply(e, updates);
+        self.persist(&inner, &touched(updates), false)?;
         Ok(Edition(e))
     }
 
@@ -123,6 +197,7 @@ impl TraceStore for EntStore {
         }
         let e = inner.current + 1;
         inner.apply(e, updates);
+        self.persist(&inner, &touched(updates), false)?;
         Ok(Some(Edition(e)))
     }
 
@@ -131,8 +206,6 @@ impl TraceStore for EntStore {
         if at.0 < inner.watermark {
             return Err(door("read_at", at.0, inner.watermark));
         }
-        // The Fact root as-of `at` is the latest one at an edition ≤ `at`; its
-        // in-order walk is tuple-sorted and holds only nonzero net weights.
         let rows = inner
             .fact
             .get(&rel)
@@ -149,9 +222,9 @@ impl TraceStore for EntStore {
         }
         let mut out = Vec::new();
         if let Some(log) = inner.log.get(&rel) {
-            // Editions in (from, to] = keys in [(from+1, 0), (to+1, 0)); the tree
-            // yields them in (edition, submit_index) order — the raw commit order.
-            for ((edition, _submit), (tuple, diff)) in log.range_collect(&(from.0 + 1, 0), &(to.0 + 1, 0)) {
+            for ((edition, _submit), (tuple, diff)) in
+                log.range_collect(&(from.0 + 1, 0), &(to.0 + 1, 0))
+            {
                 out.push(Update { tuple, time: Time::input(edition), diff });
             }
         }
@@ -168,8 +241,6 @@ impl TraceStore for EntStore {
         if new_wm <= inner.watermark {
             return Ok(Edition(inner.watermark));
         }
-        // Fact: keep the consolidated state as a checkpoint root at `new_wm`, plus
-        // every root strictly after it; drop the rest (their as-of state is gone).
         for facts in inner.fact.values_mut() {
             let checkpoint = facts.range(..=new_wm).next_back().map(|(_, t)| t.clone());
             let mut next: BTreeMap<u64, FactTree> = BTreeMap::new();
@@ -181,8 +252,6 @@ impl TraceStore for EntStore {
             }
             *facts = next;
         }
-        // Edition log: drop every update at an edition ≤ `new_wm` (its raw history
-        // is discarded); keep the tail.
         for log in inner.log.values_mut() {
             let tail = log.range_collect(&(new_wm + 1, 0), &(u64::MAX, u64::MAX));
             let mut next = LogTree::new();
@@ -192,12 +261,61 @@ impl TraceStore for EntStore {
             *log = next;
         }
         inner.watermark = new_wm;
+        // Every rel's checkpoint and log tail changed — persist all.
+        let all_rels: Vec<RelId> = inner.log.keys().copied().collect();
+        self.persist(&inner, &all_rels, true)?;
         Ok(Edition(new_wm))
     }
 }
 
-/// The edition-door error: a read/scan below the consolidation watermark is
-/// answered loudly rather than from truncated history.
+// --- helpers --------------------------------------------------------------
+
+fn touched(updates: &[(RelId, Tuple, Diff)]) -> Vec<RelId> {
+    let mut rels: Vec<RelId> = updates.iter().map(|(r, _, _)| *r).collect();
+    rels.sort();
+    rels.dedup();
+    rels
+}
+
+fn log_key(rel: RelId) -> Vec<u8> {
+    let mut k = b"log:".to_vec();
+    k.extend_from_slice(&rel.0.to_be_bytes());
+    k
+}
+
+fn ckpt_key(rel: RelId) -> Vec<u8> {
+    let mut k = b"ckpt:".to_vec();
+    k.extend_from_slice(&rel.0.to_be_bytes());
+    k
+}
+
+fn rel_from_key(key: &[u8], prefix: &[u8]) -> RelId {
+    let b = &key[prefix.len()..prefix.len() + 4];
+    RelId(u32::from_be_bytes(b.try_into().unwrap()))
+}
+
+fn opt_ck_bytes(ck: Option<ContentKey>) -> Vec<u8> {
+    match ck {
+        None => vec![0],
+        Some(c) => {
+            let mut v = vec![1];
+            v.extend_from_slice(&c);
+            v
+        }
+    }
+}
+
+fn bytes_opt_ck(bytes: &[u8]) -> Option<ContentKey> {
+    match bytes.first() {
+        Some(1) => bytes.get(1..17).map(|b| b.try_into().unwrap()),
+        _ => None,
+    }
+}
+
+fn u64_be(b: &[u8]) -> u64 {
+    u64::from_be_bytes(b[..8].try_into().unwrap())
+}
+
 fn door(op: &str, at: u64, watermark: u64) -> Error {
     Error::Store(format!("{op} at edition {at} below watermark {watermark}"))
 }
