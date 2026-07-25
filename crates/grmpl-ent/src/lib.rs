@@ -12,9 +12,11 @@
 //! and Fact enfilades implementing the `grmpl-core` store traits.
 
 pub mod measure;
+pub mod store;
 pub mod tree;
 
 pub use measure::{Count, Measure};
+pub use store::EntStore;
 pub use tree::Tree;
 
 #[cfg(test)]

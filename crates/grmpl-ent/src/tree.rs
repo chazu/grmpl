@@ -150,6 +150,29 @@ where
         }
     }
 
+    /// The entries with key in `[lo, hi)`, cloned, in order. `O(result + depth)`
+    /// — subtrees wholly outside the span are pruned. Cheap when values are
+    /// `Arc`-backed (a clone is a refcount bump).
+    pub fn range_collect(&self, lo: &K, hi: &K) -> Vec<(K, V)> {
+        let mut out = Vec::new();
+        self.range_into(lo, hi, &mut out);
+        out
+    }
+
+    fn range_into(&self, lo: &K, hi: &K, out: &mut Vec<(K, V)>) {
+        if let Some(n) = &self.root {
+            if &n.key >= lo {
+                n.left.range_into(lo, hi, out);
+            }
+            if lo <= &n.key && &n.key < hi {
+                out.push((n.key.clone(), n.val.clone()));
+            }
+            if &n.key < hi {
+                n.right.range_into(lo, hi, out);
+            }
+        }
+    }
+
     /// In-order `(key, value)` iterator — the **canonical** ordering of the map,
     /// independent of tree shape. This is the identity view.
     pub fn iter(&self) -> Iter<'_, K, V, M> {
