@@ -46,6 +46,20 @@ const CAKE: Entity = Entity(25);
 const CAT: Entity = Entity(30);
 const MERCHANT: Entity = Entity(31);
 
+// The vault TEMPLATE — a self-contained sub-world in the id block
+// [VAULT_BASE, VAULT_BASE+VAULT_SPAN). It is never entered directly; `enter vault`
+// relocates it (DSP `apply_all`) into a fresh instance block, one per visit, so
+// every player explores a private disjoint copy.
+const VAULT_BASE: u64 = 1000;
+const VAULT_SPAN: u64 = 10;
+const VAULT_ANTE: Entity = Entity(1000);
+const VAULT_INNER: Entity = Entity(1001);
+const VAULT_TORCH: Entity = Entity(1002);
+const VAULT_GEM: Entity = Entity(1003);
+// Instances live far above the manor: block k = [INSTANCE_BASE + k·STRIDE, …).
+const INSTANCE_BASE: u64 = 100_000;
+const INSTANCE_STRIDE: u64 = 1_000;
+
 /// The cat's patrol loop (each `tick` follows one edge).
 const PATROL: [(Entity, Entity); 4] = [
     (FOYER, LIBRARY),
@@ -83,6 +97,8 @@ pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), Strin
         watch: None,
         delivered: 0,
         rng: 0x1234_5678_9abc_def0,
+        instances: 0,
+        vault: None,
     };
     repl.banner(world.as_deref());
     repl.loop_forever()
@@ -274,6 +290,24 @@ fn seed_world(store: &EntStore, r: &Rels) -> Result<(), String> {
         b.push((r.patrol, Tuple::from([e(from), e(to)]), 1));
     }
 
+    // The vault TEMPLATE (never entered directly; `enter vault` instances it).
+    // A two-room cluster: an antechamber with a torch, a north passage to the
+    // inner vault holding a gemstone. No `value` rows, so it stays out of the
+    // manor's treasure economy — the vault is about private exploration.
+    loc(VAULT_TORCH, VAULT_ANTE, &mut b);
+    loc(VAULT_GEM, VAULT_INNER, &mut b);
+    for (who, name) in [
+        (VAULT_ANTE, "Vault Antechamber"),
+        (VAULT_INNER, "Inner Vault"),
+        (VAULT_TORCH, "a guttering torch"),
+        (VAULT_GEM, "a great gemstone"),
+    ] {
+        b.push((r.named, Tuple::from([e(who), t(name)]), 1));
+    }
+    for (from, way, to) in [(VAULT_ANTE, "north", VAULT_INNER), (VAULT_INNER, "south", VAULT_ANTE)] {
+        b.push((r.exits, Tuple::from([e(from), t(way), e(to)]), 1));
+    }
+
     store.commit(&b).map_err(|e| format!("seed_world: {e:?}"))?;
     Ok(())
 }
@@ -340,6 +374,11 @@ struct Repl<'a> {
     watch: Option<OnWatch>,
     delivered: usize,
     rng: u64,
+    /// How many vault instances have been minted this session (picks the block).
+    instances: u64,
+    /// If inside a vault: the DSP shift of the current instance and the room to
+    /// return to on `leave`.
+    vault: Option<(i64, Entity)>,
 }
 
 impl Repl<'_> {
@@ -384,6 +423,8 @@ impl Repl<'_> {
                 "hand" | "cards" => self.cmd_cards(),
                 "score" => self.cmd_score(),
                 "watch" => self.cmd_watch()?,
+                "enter" => self.cmd_enter(line)?,
+                "leave" => self.cmd_leave()?,
                 "take" | "drop" | "go" | "say" | "greet" => self.cmd_turn(line)?,
                 other => println!("I don't understand `{other}`. Try `help`."),
             }
@@ -402,6 +443,8 @@ Moving about (each is a TURN — the cat moves too):
   say <word>         speak
 People & world:
   who                the player roster            treasure       coin value per room
+  enter vault        step into a PRIVATE instance of the vault (DSP-relocated copy)
+  leave              climb back out; the instance fades
 Cribbage (scoring is grmpl views; the host only tallies the rows):
   deal               deal a fresh 5-card hand     cards          show your hand
   score              count fifteens + pairs
@@ -597,6 +640,98 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
 
         self.tick_cat()?;
         self.pump_watch()?;
+        Ok(())
+    }
+
+    // --- instanced dungeons: DSP relocation (the Ent's virtual copy) ------
+
+    /// `enter vault` — mint a **private instance** of the vault template by
+    /// relocating its whole sub-world into a fresh id block (DSP `apply_all`), then
+    /// step the player into the instanced antechamber. Every visit is disjoint, so
+    /// two players never collide — the store's `instance_template` does the WID
+    /// read + coordinate shift; the host only picks the block and walks the player.
+    fn cmd_enter(&mut self, line: &str) -> Result<(), String> {
+        if line.split_whitespace().nth(1) != Some("vault") {
+            println!("You can only `enter vault` from here.");
+            return Ok(());
+        }
+        if self.vault.is_some() {
+            println!("You are already inside a vault. `leave` first.");
+            return Ok(());
+        }
+        let home = match self.room_of(PLAYER)? {
+            Some(room) => room,
+            None => {
+                println!("You are nowhere in particular.");
+                return Ok(());
+            }
+        };
+        // Allocate this session's next instance block and the shift onto it.
+        let target_base = INSTANCE_BASE + self.instances * INSTANCE_STRIDE;
+        let shift = target_base as i64 - VAULT_BASE as i64;
+        self.instances += 1;
+        self.store
+            .instance_template(
+                &[self.r.located, self.r.named, self.r.exits],
+                VAULT_BASE,
+                VAULT_BASE + VAULT_SPAN,
+                shift,
+            )
+            .map_err(err)?;
+        // Walk the player out of `home` and into the instanced antechamber.
+        let ante = Entity(VAULT_ANTE.0.wrapping_add(shift as u64));
+        self.store
+            .commit(&[
+                (self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]), -1),
+                (self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(ante)]), 1),
+            ])
+            .map_err(err)?;
+        self.vault = Some((shift, home));
+        println!("You slip into a private instance of the vault — a DSP-relocated copy, yours alone.");
+        self.pump_watch()?;
+        self.cmd_look();
+        Ok(())
+    }
+
+    /// `leave` — walk home and tear the current instance down: retract every fact
+    /// in its id block plus any vault loot you were carrying. The private sub-world
+    /// fades; nothing of it follows you out.
+    fn cmd_leave(&mut self) -> Result<(), String> {
+        let (shift, home) = match self.vault {
+            Some(v) => v,
+            None => {
+                println!("You are not inside a vault.");
+                return Ok(());
+            }
+        };
+        let block_lo = VAULT_BASE.wrapping_add(shift as u64);
+        let block_hi = block_lo + VAULT_SPAN;
+        let in_block = |e: Entity| e.0 >= block_lo && e.0 < block_hi;
+        let cur = self.room_of(PLAYER)?.unwrap_or(Entity(block_lo));
+        let at = self.store.current();
+        let mut b: Vec<(RelId, Tuple, Diff)> = Vec::new();
+        // Retract the instance's rooms/items/passages (block-keyed lead entity).
+        for rel in [self.r.located, self.r.named, self.r.exits] {
+            for (t, d) in self.store.read_at(rel, at).map_err(err)? {
+                if d > 0 && matches!(t.as_slice().first(), Some(Value::Ent(e)) if in_block(*e)) {
+                    b.push((rel, t, -d));
+                }
+            }
+        }
+        // Drop any vault item you carried out (held owner is you, thing in block).
+        for (t, d) in self.store.read_at(self.r.held, at).map_err(err)? {
+            if d > 0 && matches!(t.as_slice().get(1), Some(Value::Ent(e)) if in_block(*e)) {
+                b.push((self.r.held, t, -d));
+            }
+        }
+        // Walk the player home.
+        b.push((self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(cur)]), -1));
+        b.push((self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]), 1));
+        self.store.commit(&b).map_err(err)?;
+        self.vault = None;
+        println!("You climb back out. The instance fades — it was only ever yours.");
+        self.pump_watch()?;
+        self.cmd_look();
         Ok(())
     }
 
