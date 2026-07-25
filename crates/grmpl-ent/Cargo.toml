@@ -16,3 +16,4 @@ grmpl-store = { path = "../grmpl-store" }
 # Semantic-core crates, used ONLY to prove the language runs over the ent store.
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-proc = { path = "../grmpl-proc" }
+grmpl-session = { path = "../grmpl-session" }
