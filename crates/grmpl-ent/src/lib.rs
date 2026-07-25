@@ -12,6 +12,7 @@
 //! and Fact enfilades implementing the `grmpl-core` store traits.
 
 pub mod canopy;
+pub mod context;
 pub mod dsp;
 pub mod granfilade;
 pub mod measure;
@@ -19,6 +20,7 @@ pub mod store;
 pub mod tree;
 
 pub use canopy::{Canopy, InterestId};
+pub use context::Context;
 pub use dsp::{Dsp, DspEnf};
 pub use granfilade::{ContentKey, Granfilade, Persist};
 pub use measure::{Count, Measure};
