@@ -7,6 +7,7 @@ description = "The Ent: a family of persistent, measured, versioned enfilades ov
 
 [dependencies]
 grmpl-core = { workspace = true }
+fjall = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

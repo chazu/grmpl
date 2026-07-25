@@ -11,10 +11,12 @@
 //! Next: the granfilade (content-interned node store on fjall), then the Edition
 //! and Fact enfilades implementing the `grmpl-core` store traits.
 
+pub mod granfilade;
 pub mod measure;
 pub mod store;
 pub mod tree;
 
+pub use granfilade::{ContentKey, Granfilade, Persist};
 pub use measure::{Count, Measure};
 pub use store::EntStore;
 pub use tree::Tree;

@@ -185,6 +185,21 @@ where
         Iter { stack }
     }
 
+    /// The root node's parts `(key, val, left, right)`, or `None` if empty. For
+    /// persistence and inspection — lets the granfilade walk the exact tree
+    /// shape without a rebalancing reconstruction.
+    pub fn root_parts(&self) -> Option<(&K, &V, &Self, &Self)> {
+        self.root.as_ref().map(|n| (&n.key, &n.val, &n.left, &n.right))
+    }
+
+    /// Reconstruct a node from its exact parts **without rebalancing** (the
+    /// public `mk`). Used on load to round-trip the persisted shape exactly, so
+    /// content keys are stable. `left`/`right` must already be valid subtrees
+    /// with all keys `< key` / `> key`.
+    pub fn from_parts(key: K, val: V, left: Self, right: Self) -> Self {
+        Self::mk(key, val, left, right)
+    }
+
     // --- internals --------------------------------------------------------
 
     fn singleton(key: K, val: V) -> Self {
