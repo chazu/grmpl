@@ -37,11 +37,18 @@ The authoritative representation is a family of measured enfilades sharing one
 node substrate. Each is a first-class citizen (mirroring Gold's `Ent` = `oroots`
 *content* + `fulltrace` *history*), all committed atomically together:
 
-1. **Edition enfilade** — the version/history trace, keyed by `(edition, counter)`,
-   measured. **This is the faithful home of the raw commit-order log**: every
-   update is an entry in commit order, so `scan_updates(from,to)` is a range query
-   that returns the *raw, per-multiplicity, commit-ordered* `Update`s exactly as
-   the contract requires. The "log" is not gone — it *is* an enfilade now.
+1. **Edition enfilade** — grmpl's linear commit-order delta log (a *differential
+   extension* of the Ent, distinct from Gold's version-DAG `fulltrace`; see below),
+   keyed by `(edition, submit_index)` and measured. Each update is an entry whose
+   `submit_index` is the **immutable per-batch submit order stored as node
+   payload** — *not* derived from tree rank — so `scan_updates(from,to)` returns
+   the *raw, per-multiplicity, commit-ordered* `Update`s exactly as the contract
+   requires, and that order is **invariant under rebalance, consolidate, and GC**.
+   `scan_updates` runs along a **single totally-ordered branch ancestry** (one
+   root-to-leaf DAG path); within any branch path `(edition, submit_index)` is
+   total. The **`fulltrace`** proper is the Gold-faithful `DagWood` version/branch
+   structure (§3), with per-node history membership — the log is *threaded through*
+   it, not identical to it.
 2. **Fact enfilade** — net-per-tuple state, tuple-keyed, measured (WID: count,
    key-bounds, Σdiff, dirty, interest). Serves `read_at`/`holds`/joins with WID
    pruning. Multiple **Arrangements** (one measured tree per column order) make
@@ -73,12 +80,17 @@ content-hashing alone cannot do). GC is reachability from retained roots ≥ the
 watermark, native to the substrate.
 
 **Node identity (three roles, three mechanisms — kept from v3, the one place a
-naïve single id fails):** a **content key** (structural hash, sort-before-hash)
-interns nodes for dedup/sharing/canonicity; a **monotonic `phys_id`** places them
-for locality; equality is at the **leaf/query level**, not tree shape (heuristic
-balance-on-insertion means internal shape legitimately varies — Gold does the
-same). The `phys_id` cursor lives in a derived keyspace, never in the identity of
-the world.
+naïve single id fails):** a **content key** interns nodes for
+dedup/sharing/canonicity, computed as
+`hash(kind, measure-relevant fields, child content_keys)` — **closed over child
+*content-keys* only, with `phys_id` and allocation order excluded by
+construction**, so two logically-identical subtrees built in different orders
+intern to one node (structural sharing is order-independent; a property test
+asserts one content key for the same logical subtree under two insertion orders).
+A **monotonic `phys_id`** places nodes for locality; equality is at the
+**leaf/query level**, not tree shape (heuristic balance-on-insertion means
+internal shape legitimately varies — Gold does the same). The `phys_id` cursor
+lives in a derived keyspace, never in the identity of the world.
 
 ---
 
@@ -95,15 +107,21 @@ full P0–P15 suite on the ent every step:
   tuples absent.
 * **Patch–edition law — atomic next edition** → one transaction over the granfilade
   writes all touched enfilade nodes + the new roots (Edition, Fact, …) + the edition
-  bump in a **single batch**, one `SyncAll`; crash leaves all-old or all-new.
+  bump in a **single batch**, one `SyncAll` — with **node writes ordered before (or
+  in the same batch as) the roots that reference them**, so a crash may strand
+  unreachable nodes (GC reclaims them) but a root can never point at a
+  non-durable node. Crash leaves all-old or all-new.
 * **Replay / determinism** → the enfilades compute deterministic **logical content**
   (sort-before-hash; no HashMap-order, RNG, or pointer input to the content key).
-* **`canonical_dump` / fork identity** → defined over the **logical projection**
-  (`edition → sorted (tuple, diff)` per rel, reconstructable from the Edition
-  enfilade), **not** raw node bytes — so two histories that reach the same logical
-  world compare equal even if their trees are shaped differently. *(Faithful: Gold
-  guarantees content/version identity, never byte-identical node layout.)* P10
-  fork/replay tests are re-expressed over this projection.
+* **`canonical_dump` / fork identity** → defined over the **logical projection in
+  `(edition, submit_index)` order per rel** — precisely the concatenation of
+  `scan_updates(rel, ZERO, current)` over all rels — **not** raw node bytes and
+  **not** re-sorted by `(tuple, diff)` (which would drop same-edition order and
+  stop witnessing Determinism). So "logically equal" ⟺ "`scan_updates`-equal for
+  every range": tree-shape-independent yet commit-order-faithful — exactly the
+  identity replay/fork must prove. *(Faithful: Gold guarantees content/version
+  identity, never byte-identical node layout.)* P10 fork/replay tests are
+  re-expressed over this projection.
 * **Edition doors** → the watermark check runs first, before any index consult;
   `read_at`/`scan_updates`/`fork_edition` below the watermark **error**.
 * **Authority law** → one commit, one authority domain (unchanged).
@@ -130,6 +148,8 @@ Grounded in the Gold source (`udanax-top.st`, verified):
   rebalanced, refcounted; conservative interest routing (superset of the pump).
 * **Backfollow / version-compare** — `Loaf»compare:with:`-style provenance: "this
   content is the same as edition E, relocated" — the read side of the trace.
+  **Trace membership is carried as a WID upward measure** (Gold's `HistoryCrum
+  inTrace:`), so version-compare is `O(measure)` (subtree-pruned), not a scan.
 
 ---
 
