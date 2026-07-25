@@ -1,0 +1,248 @@
+// ============================================================================
+// moo.grmpl — a small MOO world defined entirely in the grmpl language surface.
+//
+// The whole point of grmpl: a MOO is not a bespoke engine. Reading the world is
+// a relational VIEW (a join); changing it is an `on parse` behavior that lowers
+// each verb to a guarded PATCH over the same commit machinery as everything
+// else. The host binary (`grmpl run`) runs the views for read commands
+// (look / inventory / who / census) and drives this behavior for the mutation
+// verbs (take / drop / go / say). No verb is a privileged operation.
+// ============================================================================
+
+// ---- relations (typed columns; the schema is enforced at the commit boundary)
+rel located(thing: Ent, place: Ent)         // where each entity is
+rel named(thing: Ent, name: Text)           // display name
+rel held(owner: Ent, thing: Ent)            // carried objects
+rel exits(from: Ent, way: Text, to: Ent)    // one-way passages between rooms
+rel players(who: Ent, name: Text)           // the roster
+rel value(thing: Ent, coins: Int)           // an object's worth, in coins
+
+// --- identity & people ---
+rel person(thing: Ent)                       // entities the "fog of identity" covers
+rel label(thing: Ent, text: Text)            // a person's PUBLIC descriptor ("a cat")
+rel knows(viewer: Ent, thing: Ent)           // viewer has learned thing's true name
+
+// --- NPCs: an autonomous mover walks its patrol, one step per `tick` ---
+rel patrol(from: Ent, to: Ent)               // an NPC's next room from each room
+
+// --- cribbage: state AND rules are relations; scoring is a view, not code -----
+rel card(holder: Ent, slot: Int, code: Int)  // slot 0..3 = hand, 4 = starter; code 0..51
+rel cardval(code: Int, pips: Int)            // code -> pip value (A=1, 2..9 face, 10/J/Q/K=10)
+rel cardrank(code: Int, rank: Int)           // code -> rank 0..12 (for pairs)
+rel slotpair(i: Int, j: Int)                 // the 10 unordered slot pairs
+rel slottrio(i: Int, j: Int, k: Int)         // the 10 unordered slot triples
+rel sum15two(a: Int, b: Int)                 // value pairs that total 15 (both orders)
+rel sum15three(a: Int, b: Int, c: Int)       // value triples that total 15 (all orders)
+
+rel tell(player: Ent, text: Text)           // outbound text to a client
+rel inbox(process: Ent, seq: Int, body: Tuple)  // per-player command inbox
+rel cursor(process: Ent, pos: Int)              // inbox read cursor
+
+// on-watch reactive plumbing (named here so the `on watch` handler can wire them)
+rel wmail(who: Ent, seq: Int, body: Tuple)  // activation inbox
+rel wcursor(watch: Ent, edition: Int)       // durable exactly-once watch cursor
+rel wseq(inbox: Ent, target: Ent, n: Int)   // shared activation seq counter
+
+// ---- views: reading the world is just a query ------------------------------
+
+// Everything in my room, with names. `visible(you)` *is* a three-way join.
+view here(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    named(thing, name)
+    yield thing, name
+}
+
+// What I'm carrying.
+view inventory(owner) {
+    held(owner, thing)
+    named(thing, name)
+    yield thing, name
+}
+
+// The name of the room I'm standing in.
+view whereami(viewer) {
+    located(viewer, room)
+    named(room, rname)
+    yield rname
+}
+
+// The exits leading out of my room.
+view ways(viewer) {
+    located(viewer, room)
+    exits(room, way, dest)
+    yield way, dest
+}
+
+// The player roster (host counts the rows for `who`).
+view roster() {
+    players(who, name)
+    yield name
+}
+
+// Aggregate (lowers to Query::Reduce): the total coin value of the things in
+// each named room — `sum` folds the value column over each room group.
+view treasure() {
+    located(thing, room)
+    value(thing, coins)
+    named(room, rname)
+    yield rname, sum(coins)
+}
+
+// Every named thing and where the watcher should react to it appearing/leaving.
+view world() {
+    located(thing, room)
+    named(thing, name)
+    yield thing, name
+}
+
+// --- identity-fog views (the host composes these into the room description) ---
+
+// The raw entities sharing my room (host decides how to render each).
+view contents(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    yield thing
+}
+
+// The public label of every *person* in my room — what a stranger looks like
+// before you know their name.
+view folks(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    label(thing, text)
+    yield thing, text
+}
+
+// The true names I have learned — an entity is unmasked only once I `knows` it.
+view acquainted(viewer) {
+    knows(viewer, thing)
+    named(thing, name)
+    yield thing, name
+}
+
+// --- cribbage scoring: each combo is a JOIN; the host just counts the rows ----
+
+// A pair: two of my cards (some slot pair) sharing a rank. `slotpair` supplies
+// the distinct i<j combinations (views can't say i != j), and the shared `r`
+// forces equal rank.
+view crib_pairs(who) {
+    slotpair(i, j)
+    card(who, i, c1)
+    card(who, j, c2)
+    cardrank(c1, r)
+    cardrank(c2, r)
+    yield i, j
+}
+
+// A two-card fifteen: pip values summing to 15 (the `sum15two` table is the
+// arithmetic, precomputed as data).
+view crib_fif2(who) {
+    slotpair(i, j)
+    card(who, i, c1)
+    card(who, j, c2)
+    cardval(c1, a)
+    cardval(c2, b)
+    sum15two(a, b)
+    yield i, j
+}
+
+// A three-card fifteen.
+view crib_fif3(who) {
+    slottrio(i, j, k)
+    card(who, i, c1)
+    card(who, j, c2)
+    card(who, k, c3)
+    cardval(c1, a)
+    cardval(c2, b)
+    cardval(c3, c)
+    sum15three(a, b, c)
+    yield i, j, k
+}
+
+// ---- the command grammar: text -> tagged verb ------------------------------
+// A `form` is a structural parser; each rule matches a token pattern and builds
+// a tagged tuple the handler below dispatches on. `noun`/`dir`/`msg` bind one
+// token each.
+form command {
+    "take" noun -> Take(noun)
+    "drop" noun -> Drop(noun)
+    "go" dir    -> Go(dir)
+    "say" msg   -> Say(msg)
+    "greet" who -> Greet(who)
+    "tick"      -> Tick()
+}
+
+// ---- behavior: each verb lowers to a guarded patch -------------------------
+// One handler, several `match` arms, mixing the two coexisting surfaces:
+//   `take` is the point-free CONCATENATIVE body (P11) — proven byte-identical
+//   to the statement form; the rest are the STATEMENT body (v1).
+on inbox parse command {
+    // take <noun> — concatenative / point-free. Reads bottom-to-top like a
+    // stack machine: resolve the noun to a thing, look up its room, move it
+    // from the room into `held`, and reply. A `resolve` miss aborts with no
+    // change (you can't take what you can't see).
+    match Take(noun) [
+        self swap resolve here name ~
+        drop
+        dup find located 1
+        dup2 expect located
+        retract located
+        self swap assert held
+        self "Taken." emit tell
+    ]
+
+    // drop <noun> — statement surface. The mirror of take.
+    match Drop(noun) {
+        resolve inventory(self) where name ~ noun
+        find located(self, loc)
+        expect held(self, thing)
+        retract held(self, thing)
+        assert located(thing, loc)
+        emit tell(self, "Dropped.")
+    }
+
+    // go <way> — statement surface. Guarded on still being in the room, so a
+    // stale move can't teleport (the precondition is the optimistic race point).
+    match Go(dir) {
+        find located(self, loc)
+        resolve ways(self) where way = dir
+        expect located(self, loc)
+        retract located(self, loc)
+        assert located(self, dest)
+        emit tell(self, "You go.")
+    }
+
+    // say <word> — statement surface. Echoes back to the speaker.
+    match Say(msg) {
+        emit tell(self, msg)
+    }
+
+    // greet <who> — the identity handshake. Resolve a person present by their
+    // public label, then make acquaintance MUTUAL (each learns the other), and
+    // tell yourself the name you just learned. `knows` is what lifts the fog.
+    match Greet(who) {
+        resolve folks(self) where text ~ who
+        find named(thing, tname)
+        assert knows(self, thing)
+        assert knows(thing, self)
+        emit tell(self, tname)
+    }
+
+    // tick — an NPC's autonomous step. `self` is the NPC process: find where I
+    // am, look up my next patrol room, and move there (guarded, so a stale tick
+    // can't teleport me). This is the whole "AI" — a behavior over relations.
+    match Tick() {
+        find located(self, loc)
+        find patrol(loc, dest)
+        expect located(self, loc)
+        retract located(self, loc)
+        assert located(self, dest)
+    }
+}
+
+// ---- reactive: stream world changes to a subscriber's mailbox --------------
+// `on watch world` maintains the view incrementally and pumps each delta into
+// `wmail` exactly once (durable cursor in `wcursor`, seqs from `wseq`).
+// `including current` delivers the initial world once on the first pump.
+on watch world including current { inbox wmail cursor wcursor seqs wseq }
