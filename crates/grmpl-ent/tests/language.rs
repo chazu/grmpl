@@ -196,6 +196,54 @@ fn structural_sharing_fork_diverges_independently() {
 }
 
 #[test]
+fn dsp_instancing_makes_disjoint_private_sub_worlds() {
+    const EXITS: RelId = RelId(3);
+    const VALUE: RelId = RelId(4);
+    let store = EntStore::new();
+
+    // A self-contained vault template in the id block [1000, 1010): an antechamber
+    // (1000) with a torch (1002) in it, a north exit to the vault proper (1001).
+    store
+        .commit(&[
+            (LOCATED, Tuple::from([e(Entity(1002)), e(Entity(1000))]), 1),
+            (NAMED, Tuple::from([e(Entity(1000)), Value::text("Antechamber")]), 1),
+            (NAMED, Tuple::from([e(Entity(1001)), Value::text("Vault")]), 1),
+            (NAMED, Tuple::from([e(Entity(1002)), Value::text("torch")]), 1),
+            (EXITS, Tuple::from([e(Entity(1000)), Value::text("north"), e(Entity(1001))]), 1),
+            (VALUE, Tuple::from([e(Entity(1002)), Value::Int(5)]), 1),
+        ])
+        .unwrap();
+
+    let rels = [LOCATED, NAMED, EXITS, VALUE];
+    // Two players enter: instance the template into disjoint blocks.
+    store.instance_template(&rels, 1000, 1010, 1000).unwrap(); // block 2000s
+    store.instance_template(&rels, 1000, 1010, 2000).unwrap(); // block 3000s
+
+    let at = store.current();
+    let located: Vec<(Tuple, i64)> = store.read_at(LOCATED, at).unwrap();
+    let has = |t: Tuple| located.iter().any(|(x, d)| *d > 0 && *x == t);
+    // The template survives, and each instance has its own relocated torch.
+    assert!(has(Tuple::from([e(Entity(1002)), e(Entity(1000))])), "template torch gone");
+    assert!(has(Tuple::from([e(Entity(2002)), e(Entity(2000))])), "instance A torch missing");
+    assert!(has(Tuple::from([e(Entity(3002)), e(Entity(3000))])), "instance B torch missing");
+
+    // The exit relocated with both endpoints together; the direction text is kept.
+    let exits: Vec<(Tuple, i64)> = store.read_at(EXITS, at).unwrap();
+    assert!(exits.iter().any(|(t, d)| *d > 0
+        && *t == Tuple::from([e(Entity(2000)), Value::text("north"), e(Entity(2001))])));
+
+    // Mutating instance A (take the torch: it leaves LOCATED) touches neither
+    // instance B nor the template — the sub-worlds are genuinely disjoint.
+    store.commit(&[(LOCATED, Tuple::from([e(Entity(2002)), e(Entity(2000))]), -1)]).unwrap();
+    let at2 = store.current();
+    let located2: Vec<(Tuple, i64)> = store.read_at(LOCATED, at2).unwrap();
+    let has2 = |t: Tuple| located2.iter().any(|(x, d)| *d > 0 && *x == t);
+    assert!(!has2(Tuple::from([e(Entity(2002)), e(Entity(2000))])), "A's torch should be gone");
+    assert!(has2(Tuple::from([e(Entity(3002)), e(Entity(3000))])), "B's torch wrongly affected");
+    assert!(has2(Tuple::from([e(Entity(1002)), e(Entity(1000))])), "template wrongly affected");
+}
+
+#[test]
 fn fork_family_records_ancestry_in_the_dagwood() {
     // The DagWood (fulltrace branch structure): forks share one branch DAG, so
     // ancestry is queryable across the whole family even as each branch diverges.

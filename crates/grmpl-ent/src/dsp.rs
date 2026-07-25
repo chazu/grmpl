@@ -49,6 +49,24 @@ impl Dsp {
         }
     }
 
+    /// Relocate a whole relational tuple: shift **every** entity column together,
+    /// leaving non-entity columns (names, directions, weights) untouched. This is
+    /// the cluster relocation `located(thing, place)` / `exits(from, way, to)` need
+    /// — both endpoints move by the same displacement so the sub-world stays
+    /// internally connected, while its text and numbers are preserved. (For a
+    /// single-entity-column key this is exactly [`apply`](Self::apply).)
+    pub fn apply_all(&self, tuple: &Tuple) -> Tuple {
+        let cols: Vec<Value> = tuple
+            .as_slice()
+            .iter()
+            .map(|v| match v {
+                Value::Ent(e) => Value::Ent(Entity(e.0.wrapping_add(self.shift as u64))),
+                other => other.clone(),
+            })
+            .collect();
+        Tuple::new(cols)
+    }
+
     /// The inverse displacement (`apply` then `inverse().apply` is the identity).
     pub fn inverse(&self) -> Dsp {
         Dsp { shift: self.shift.wrapping_neg() }
@@ -127,6 +145,29 @@ mod tests {
 
     fn ent(n: u64) -> Tuple {
         Tuple::from([Value::Ent(Entity(n)), Value::Int(1)])
+    }
+
+    #[test]
+    fn apply_all_relocates_every_entity_column() {
+        let d = Dsp::by(1000);
+        // located(thing=2, place=10): both entity columns shift, together.
+        let located = Tuple::from([Value::Ent(Entity(2)), Value::Ent(Entity(10))]);
+        assert_eq!(
+            d.apply_all(&located),
+            Tuple::from([Value::Ent(Entity(1002)), Value::Ent(Entity(1010))])
+        );
+        // exits(from=10, way="north", to=11): endpoints shift, the direction text
+        // and any non-entity column are preserved.
+        let exit = Tuple::from([Value::Ent(Entity(10)), Value::text("north"), Value::Ent(Entity(11))]);
+        assert_eq!(
+            d.apply_all(&exit),
+            Tuple::from([Value::Ent(Entity(1010)), Value::text("north"), Value::Ent(Entity(1011))])
+        );
+        // value(thing=20, coins=5): entity shifts, the Int weight does not.
+        let value = Tuple::from([Value::Ent(Entity(20)), Value::Int(5)]);
+        assert_eq!(d.apply_all(&value), Tuple::from([Value::Ent(Entity(1020)), Value::Int(5)]));
+        // Relocation is invertible column-wise, and composes.
+        assert_eq!(d.inverse().apply_all(&d.apply_all(&exit)), exit);
     }
 
     #[test]

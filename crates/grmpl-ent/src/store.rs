@@ -21,10 +21,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
-    Diff, Edition, EditionStore, Error, RelId, Result, Time, TraceStore, Tuple, Update,
+    Diff, Edition, EditionStore, Entity, Error, RelId, Result, Time, TraceStore, Tuple, Update,
+    Value,
 };
 
 use crate::dag::{BranchId, Dag};
+use crate::dsp::Dsp;
 use crate::granfilade::{ContentKey, Granfilade};
 use crate::measure::Count;
 use crate::tree::Tree;
@@ -244,6 +246,40 @@ impl EntStore {
             .lock()
             .unwrap()
             .common_ancestor(self.branch, here, other.branch, there)
+    }
+
+    /// **DSP template instancing (E6).** Read every fact of `rels` whose lead
+    /// entity lies in the template block `[block_lo, block_hi)` — a WID range read
+    /// (E2) over each relation — relocate **all** of its entity coordinates by
+    /// `shift` ([`Dsp::apply_all`]), and commit the relocated facts as one new
+    /// edition: a private, independently-mutable copy of the template sub-world,
+    /// its rooms/exits/items renamed only in *coordinate* (their text and weights
+    /// preserved). Returns the new edition.
+    ///
+    /// Distinct `shift`s give disjoint instances that never collide, so N players
+    /// can each `enter` the same template into their own block. Building an
+    /// instance is `O(template facts)` — a self-contained vault is a handful of
+    /// facts, so it is effectively instant; an `O(1)` displaced-overlay that shares
+    /// the template until an instance diverges (true copy-on-write) is the next
+    /// increment on this same DSP relocation.
+    ///
+    /// Precondition: the template is self-contained — every template fact is keyed
+    /// by an in-block lead entity (so the lead-column WID range collects it), and
+    /// all of a fact's entity columns lie in the block (so the relocation keeps it
+    /// internally connected). The target block `[block_lo+shift, block_hi+shift)`
+    /// must be otherwise unused.
+    pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
+        let at = self.current();
+        let dsp = Dsp::by(shift);
+        let lo = Tuple::from([Value::Ent(Entity(block_lo))]);
+        let hi = Tuple::from([Value::Ent(Entity(block_hi))]);
+        let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
+        for &rel in rels {
+            for (tuple, diff) in self.range_at(rel, at, &lo, &hi)? {
+                updates.push((rel, dsp.apply_all(&tuple), diff));
+            }
+        }
+        self.commit(&updates)
     }
 
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
