@@ -152,9 +152,20 @@ grammar of windows the runtime layer may build:
 | **Snapshot** | degenerate `[⊥, E]`; whole consolidated state at `E` | yes — *is* state-mode matching over `find(q, E)`; unifies with today's tuple matching |
 | **Tumbling** | disjoint consecutive `[t₀,t₁), [t₁,t₂), …` | yes |
 | **Sliding** | overlapping, advance by `step < size` | yes |
-| **Session** | gap-based (close after N idle editions) | **deferred** |
-| **Count** | last N updates / last N tuples | **deferred** (needs a counter cursor over commit order; edition ranges cover the common case) |
+| **Session** | gap-based (close after N idle editions) | **deferred** — *landed as `grmpl_diff::sessions` / `Window::sessions` (TKT-117)* |
+| **Count** | last N updates / last N tuples | **deferred** (needs a counter cursor over commit order; edition ranges cover the common case) — *landed as `grmpl_diff::CountWindow` (TKT-117); see the note below* |
 
+**Follow-on note (TKT-117).** Both deferred shapes now exist, and building them
+confirmed the distinction the table draws between them. A **session** window is
+still an edition interval, so it is pure edition arithmetic exactly like
+tumbling/sliding — it partitions the *active* editions (those actually carrying
+updates) at every gap exceeding a timeout, and hands back one tight
+`(first − 1, last]` window per session, over which both materializations work
+unchanged. A **count** window is not an edition shape at all: its boundary
+generally falls *inside* an edition, and a boundary inside an edition has no
+snapshot to anchor against, so it is **event mode only** — a maintained cursor
+over commit order rather than a `Window`, with no state-mode `consolidate`. That
+is the sharpened version of "needs a counter cursor over commit order".
 `iter` (the fixpoint sub-coordinate of `Time`) is **not** a window axis — windows
 range over commit editions only; `iter` is internal to `Iterate`.
 
@@ -194,6 +205,30 @@ differential* incremental parser (DBSP-style incremental matching over
 sequences) would be more efficient and is a real research problem. It is
 **explicitly out of scope** here and should be filed as a distinct follow-on
 ticket, not attempted under this phase.
+
+> **Follow-on resolution (TKT-117): `grmpl_diff::differential`.** The research
+> question is answered, and the answer is a **match arrangement** — the matching
+> analogue of the query arrangement `Arrangements` (§3.2): a sub-computation
+> evaluated once and referenced many times, keyed by the *content the parser
+> actually read*. `SequenceParser::parses_at` reports, beside an anchor's parses,
+> the **reach** — one past the furthest item it inspected — and the arrangement
+> keys parses by `(consumed span, ends-here?)`. Two anchors whose consumed spans
+> agree therefore share one parse, whether they are two positions in one window
+> or the same position across two advances, so an advance re-parses only where a
+> consumed span changed. Appending to an event log costs a grammar-bounded
+> handful of re-parses rather than the whole window (the incremental-lexing
+> invariant), and the state-mode sequence is maintained rather than rebuilt: the
+> anchor snapshot at `from` is evaluated once and each advance folds in only
+> `eval_delta(q, prev_to, to)`.
+>
+> Two things worth carrying forward. First, the key is **content**, not a
+> pointer: the query arrangement's `(Arc::as_ptr, edition)` key is why it must be
+> built fresh per evaluation (the P13b ABA hazard), and a match arrangement is
+> meant to outlive an advance, so a transient identity was not available to it.
+> Second, the acceptance law is an *equivalence* — the differential maintainer
+> must emit the identical delta the §6 window-recompute maintainer emits, step
+> for step, in both modes — which makes it a drop-in acceleration rather than a
+> second semantics.
 
 ## 7. What this costs the substrate (bright line, wire, tests)
 
@@ -245,6 +280,7 @@ should be filed as sub-tickets of TKT-81 for the orchestrator to route:
    *Size M–L.*
 5. **Deferred / follow-on (separate tickets, not this phase):** session &
    count windows; a truly differential incremental parser (shared arrangements).
+   *All three landed under TKT-117; see the notes in §5 and §6.*
 
 ## 9. Summary of findings
 
@@ -260,6 +296,8 @@ should be filed as sub-tickets of TKT-81 for the orchestrator to route:
 * **Incremental parse maintenance reuses DRed.** A `DeltaStream` of parses is
   window-recompute + `set_difference` — the exact recursive-view strategy the
   substrate already ships — obeying a lifted Snapshot–stream law. True
-  differential parsing is deferred research.
+  differential parsing was deferred research; TKT-117 answered it with a
+  content-keyed **match arrangement** that satisfies the same law by equivalence
+  with this recompute path (§6).
 * **The bright line and wire format are untouched.** No store dependency in the
   algebra, no new serialized tag, no FORMAT_VERSION bump.
