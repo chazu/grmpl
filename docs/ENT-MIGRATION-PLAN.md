@@ -14,6 +14,25 @@ trait evolution, "measured need" gating, and any performance hedge that would ke
 the ent from being the heart. The LSM (`grmpl-store`) survives **only** as a
 throwaway construction-time differential oracle and is **deleted at completion**.
 
+> ## Implementation status — LANDED (`grmpl-ent`)
+> The ent is built and the language runs on it (each step tested, committed, pushed):
+> - **E0** enfilade primitive — persistent measured weight-balanced tree (deterministic; WID range measures).
+> - **E0b** granfilade — content-addressed node persistence; structural sharing on disk.
+> - **E1** the store *is* the ent (Edition + Fact enfilades) — conforms to `FjallStore` (16 seeds × 150 rounds); **durable** (survives reopen); the real `grmpl-diff`/`grmpl-proc` and the **full MOO session runtime** run over it.
+> - **E2a** WID range reads + O(log n) range counts. **E3a** structural-sharing **fork** (O(edit) virtual copy). **E3b** reachability **GC**. **E4a** **canopy** interest routing. **E5** **context** enfilade (inherited scopes). **E6a** **DSP** coordinate transforms (O(1) relocation). **E6b** **backfollow / version-compare**.
+> - **E7** the playable `grmpl run` binary is **cut over to the ent store**.
+>
+> `grmpl-store` (LSM) is **retained as the construction-time conformance oracle**,
+> the showcase's substrate demos, and the `grmpl-bench` baseline — deleted only
+> after a soak window, kept meanwhile as the independent third leg.
+>
+> *Deeper refinements deferred (each faithful-but-optimized version of a landed
+> property):* multi-order Arrangements + wiring `range_at` into `grmpl-diff`'s join
+> path; the in-store branch **DAG** (`fork_edition → Edition` + `ancestry`) and
+> persistent fork; a measured interval-tree canopy with the endorsement
+> flag-lattice; lazy Dsp threaded through the tree traversal; node content-key
+> caching to persist only the new path per commit.
+
 **The one thing preserved (also per the original directive — "*while preserving
 the systems features*"):** the **seven design laws** and the **P0–P15 language
 features**. The bright line makes this free: the language and the process layer
