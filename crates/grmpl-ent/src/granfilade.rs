@@ -13,16 +13,30 @@
 //! (plan v5 §G-2b, settled: identity is logical, witnessed by `iter` /
 //! `scan_updates`, exactly as `tree.rs` and `DESIGN.md` already had it).
 //!
-//! A commit adds only the `O(log n)` new distinct nodes on the edited path to the
-//! store — every untouched subtree already hashes to a key that is present, so
-//! re-inserting it is idempotent and on-disk growth is path-sized. (The
-//! *traversal* is still `O(n)`: it re-serializes each node to recompute its
-//! content key. Skipping already-persisted subtrees without revisiting — true
-//! path-only *work* — needs a content-key memoized on each node, an enfilade
-//! change deferred as a pure optimization; the on-disk sharing it would speed up
-//! already holds.) A load reconstructs the exact tree shape, so content keys
-//! round-trip. Values are serialized through the single `grmpl_core::wire` value
-//! codec ([`Persist`]).
+//! **Path-only, in work as well as in bytes (G-1).** A commit adds only the
+//! `O(log n)` new nodes on the edited path, *and* only visits them: each node
+//! memoizes its content key ([`Tree::ck_cell`]), and a node whose key is both
+//! memoized and already durable here is returned without being re-serialized —
+//! and so are all its descendants, since a node's key closes over its children's.
+//! Previously the *traversal* was `O(n)` per commit even though the growth was
+//! path-sized.
+//!
+//! The memo alone is not enough, which is the subtlety that had this deferred: a
+//! memoized key says "this is its key", not "it is on *this* disk". A fork
+//! clones nodes whose keys were memoized against its parent's granfilade, so
+//! each granfilade also tracks the keys it knows are durable, and a subtree is
+//! skipped only when both hold. (There is no pointer-ABA to worry about: nodes
+//! are immutable and `Arc`-held, so the key is a pure function of the node and
+//! caching it is plain memoization.)
+//!
+//! A load reconstructs the exact tree shape — and memoizes each key it read — so
+//! content keys round-trip and re-persisting a reloaded tree writes nothing.
+//! Values are serialized through the single `grmpl_core::wire` value codec
+//! ([`Persist`]).
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
@@ -106,6 +120,19 @@ pub struct Granfilade {
     db: Database,
     nodes: fjall::Keyspace,
     meta: fjall::Keyspace,
+    /// **Keys known to be durable in *this* granfilade (G-1).** A memoized
+    /// content key on a node says "this is its key", not "it is on this disk" —
+    /// a fork clones nodes whose keys were memoized against the *parent's*
+    /// granfilade. Without this set, a commit would skip writing them and leave
+    /// a root pointing at a node that was never stored. Populated on every write
+    /// and every load.
+    present: Mutex<HashSet<ContentKey>>,
+    /// **Ops counter (G-0a).** Node frames serialized+hashed since this handle
+    /// was opened. Sublinear claims about the commit path are otherwise only
+    /// prose; this is what lets a test *fail* when an `O(log n)` walk quietly
+    /// becomes a scan. One relaxed atomic add per node, against a SHA-256 — not
+    /// measurable.
+    encoded: AtomicU64,
 }
 
 impl Granfilade {
@@ -114,7 +141,13 @@ impl Granfilade {
         let db = Database::builder(path.as_ref()).open().map_err(store_err)?;
         let nodes = db.keyspace("nodes", KeyspaceCreateOptions::default).map_err(store_err)?;
         let meta = db.keyspace("meta", KeyspaceCreateOptions::default).map_err(store_err)?;
-        Ok(Granfilade { db, nodes, meta })
+        Ok(Granfilade {
+            db,
+            nodes,
+            meta,
+            present: Mutex::new(HashSet::new()),
+            encoded: AtomicU64::new(0),
+        })
     }
 
     /// Collect a tree's nodes as `(content_key, frame)` pairs (children first) and
@@ -130,22 +163,46 @@ impl Granfilade {
         M: Measure<K, V>,
     {
         let mut out = Vec::new();
-        let ck = collect_nodes(tree, &mut out);
+        let ck = {
+            let present = self.present.lock().unwrap();
+            collect_nodes(tree, &mut out, &present)
+        };
+        self.encoded.fetch_add(out.len() as u64, Ordering::Relaxed);
         (ck, out)
     }
 
     /// One atomic write of node frames + meta entries (nodes and the roots that
     /// reference them land together — the Patch–edition law for the store).
     pub fn write(&self, nodes: Vec<(ContentKey, Vec<u8>)>, meta: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        self.write_full(nodes, meta, Vec::new())
+    }
+
+    /// [`write`](Self::write), plus meta keys to drop in the same batch — used by
+    /// consolidation to retire the Fact roots below the new watermark atomically
+    /// with the checkpoint that replaces them.
+    pub fn write_full(
+        &self,
+        nodes: Vec<(ContentKey, Vec<u8>)>,
+        meta: Vec<(Vec<u8>, Vec<u8>)>,
+        drop_meta: Vec<Vec<u8>>,
+    ) -> Result<()> {
         let mut batch = self.db.batch();
+        let mut written = Vec::with_capacity(nodes.len());
         for (k, v) in nodes {
             batch.insert(&self.nodes, k.to_vec(), v);
+            written.push(k);
         }
         for (k, v) in meta {
             batch.insert(&self.meta, k, v);
         }
+        for k in drop_meta {
+            batch.remove(&self.meta, k);
+        }
         batch.commit().map_err(store_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        // Only after the batch is durable may these count as present — otherwise
+        // a crash mid-write would leave the memo claiming a node is on disk.
+        self.present.lock().unwrap().extend(written);
         Ok(())
     }
 
@@ -174,14 +231,8 @@ impl Granfilade {
         V: Persist + Clone,
         M: Measure<K, V>,
     {
-        let mut out: Vec<(ContentKey, Vec<u8>)> = Vec::new();
-        let ck = collect_nodes(tree, &mut out);
-        let mut batch = self.db.batch();
-        for (k, v) in out {
-            batch.insert(&self.nodes, k.to_vec(), v);
-        }
-        batch.commit().map_err(store_err)?;
-        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        let (ck, out) = self.collect_tree(tree);
+        self.write(out, Vec::new())?;
         Ok(ck)
     }
 
@@ -214,7 +265,9 @@ impl Granfilade {
                     entries.push((key, val));
                     pos = p;
                 }
-                Ok(Tree::leaf_of(entries))
+                let tree = Tree::leaf_of(entries);
+                self.note_loaded(&tree, ck);
+                Ok(tree)
             }
             TAG_INTERNAL => {
                 let mut keys = Vec::with_capacity(count);
@@ -230,10 +283,35 @@ impl Granfilade {
                 if keys.len() + 1 != children.len() {
                     return Err(Error::Codec("granfilade: malformed internal node".into()));
                 }
-                Ok(Tree::internal_of(keys, children))
+                let tree = Tree::internal_of(keys, children);
+                self.note_loaded(&tree, ck);
+                Ok(tree)
             }
             _ => Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
         }
+    }
+
+    /// A just-loaded node already has a content key and is by definition durable:
+    /// memoize both, so re-persisting a reloaded tree writes nothing.
+    fn note_loaded<K, V, M>(&self, tree: &Tree<K, V, M>, ck: ContentKey)
+    where
+        K: Persist + Ord + Clone,
+        V: Persist + Clone,
+        M: Measure<K, V>,
+    {
+        if let Some(cell) = tree.ck_cell() {
+            let _ = cell.set(ck);
+        }
+        self.present.lock().unwrap().insert(ck);
+    }
+
+    /// Node frames serialized and hashed since this handle was opened — the
+    /// [`encoded`](Self::encoded) ops counter. A commit's delta is the *work* it
+    /// did, as distinct from the nodes it added: before G-1 the two diverged
+    /// wildly, because an untouched subtree was re-serialized to rediscover a
+    /// key the store already had.
+    pub fn frames_encoded(&self) -> u64 {
+        self.encoded.load(Ordering::Relaxed)
     }
 
     /// Number of distinct nodes stored — for structural-sharing verification.
@@ -242,7 +320,7 @@ impl Granfilade {
     }
 
     /// **Reachability GC (E3).** Collect every node unreachable from a live root
-    /// (the `log:*` and `ckpt:*` roots recorded in meta): mark reachable nodes by
+    /// (the `log:*`, `fact:*` and `ctx:*` roots recorded in meta): mark reachable nodes by
     /// walking their child keys from the roots, then sweep the rest. Returns the
     /// number of nodes collected. Type-agnostic — it reads only the leading child
     /// keys of each frame. (Serialize this with commits at the store level.)
@@ -251,7 +329,7 @@ impl Granfilade {
         let mut stack: Vec<ContentKey> = Vec::new();
         // `ctx:` is a root too: the catalog and schema registry live in the
         // context enfilade, and collecting them would lose the world's names.
-        for prefix in [b"log:".as_ref(), b"ckpt:".as_ref(), b"ctx:".as_ref()] {
+        for prefix in [b"log:".as_ref(), b"fact:".as_ref(), b"ctx:".as_ref()] {
             for (_k, v) in self.meta_prefix(prefix)? {
                 if v.first() == Some(&1) {
                     if let Some(b) = v.get(1..1 + CK_LEN) {
@@ -344,12 +422,27 @@ fn encode_header(out: &mut Vec<u8>, tag: u8, children: &[ContentKey]) {
 /// One frame is one **node**, and a node holds a whole run of entries
 /// ([`grmpl_ent::tree::B`](crate::tree::B) of them), so the store keeps one
 /// record per run rather than one per tuple.
-fn collect_nodes<K, V, M>(tree: &Tree<K, V, M>, out: &mut Vec<(ContentKey, Vec<u8>)>) -> Option<ContentKey>
+fn collect_nodes<K, V, M>(
+    tree: &Tree<K, V, M>,
+    out: &mut Vec<(ContentKey, Vec<u8>)>,
+    present: &HashSet<ContentKey>,
+) -> Option<ContentKey>
 where
     K: Persist + Ord + Clone,
     V: Persist + Clone,
     M: Measure<K, V>,
 {
+    let cell = tree.ck_cell()?;
+    // **Path-only work (G-1).** A node whose key is memoized *and* already
+    // durable here needs neither re-serializing nor revisiting — and neither do
+    // any of its descendants, since a node's key closes over its children's.
+    // That turns a commit from an O(n) re-walk of the whole tree into O(log n):
+    // only the path copied by the edit is new.
+    if let Some(ck) = cell.get() {
+        if present.contains(ck) {
+            return Some(*ck);
+        }
+    }
     let mut bytes = Vec::new();
     match tree.node()? {
         NodeRef::Leaf(entries) => {
@@ -361,7 +454,8 @@ where
             }
         }
         NodeRef::Internal(keys, children) => {
-            let cks: Vec<ContentKey> = children.iter().filter_map(|c| collect_nodes(c, out)).collect();
+            let cks: Vec<ContentKey> =
+                children.iter().filter_map(|c| collect_nodes(c, out, present)).collect();
             encode_header(&mut bytes, TAG_INTERNAL, &cks);
             bytes.extend_from_slice(&(keys.len() as u32).to_be_bytes());
             for k in keys {
@@ -370,6 +464,7 @@ where
         }
     }
     let ck = crate::hash::sha256(&bytes);
+    let _ = cell.set(ck);
     out.push((ck, bytes));
     Some(ck)
 }

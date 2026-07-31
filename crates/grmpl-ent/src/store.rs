@@ -148,6 +148,13 @@ impl EntStore {
         Ok(root_at(a.0).diff(&root_at(b.0)))
     }
 
+    /// Node frames serialized+hashed since this store was opened — the G-0a ops
+    /// counter, surfaced so tests can assert the commit path stays path-sized.
+    /// `0` for an in-memory store.
+    pub fn frames_encoded(&self) -> u64 {
+        self.gran.as_ref().map_or(0, |g| g.frames_encoded())
+    }
+
     /// **Reachability GC (E3).** Collect granfilade nodes no longer reachable
     /// from a live enfilade root (accumulated as commits path-copy and
     /// `consolidate` truncates). Serialized with commits (holds the edition
@@ -310,7 +317,7 @@ impl EntStore {
 
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
     /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
-    fn persist(&self, inner: &Inner, touched: &[RelId], all_ckpts: bool) -> Result<()> {
+    fn persist(&self, inner: &Inner, touched: &[RelId], drop_below: Option<u64>) -> Result<()> {
         let gran = match &self.gran {
             Some(g) => g,
             None => return Ok(()),
@@ -320,25 +327,37 @@ impl EntStore {
             (b"cur".to_vec(), inner.current.to_be_bytes().to_vec()),
             (b"wm".to_vec(), inner.watermark.to_be_bytes().to_vec()),
         ];
+        let mut drop_meta = Vec::new();
         for rel in touched {
+            // The Edition enfilade (the raw commit-order log).
             let log = inner.log.get(rel).cloned().unwrap_or_default();
             let (ck, ns) = gran.collect_tree(&log);
             nodes.extend(ns);
             meta.push((log_key(*rel), opt_ck_bytes(ck)));
-        }
-        // On consolidate the Fact checkpoint (@ watermark) changes for every rel.
-        if all_ckpts {
-            for (rel, facts) in &inner.fact {
-                let ckpt = facts.range(..=inner.watermark).next_back().map(|(_, t)| t.clone());
-                let ck = ckpt.map(|t| {
-                    let (ck, ns) = gran.collect_tree(&t);
+
+            // **The Fact enfilade, versioned by edition (G-2).** Every live
+            // as-of root is persisted, so `open` is a root lookup rather than a
+            // replay of the log — the Fact enfilade is durable state in its own
+            // right, not an index derived from a log underneath it.
+            if let Some(versions) = inner.fact.get(rel) {
+                for (edition, tree) in versions {
+                    let (ck, ns) = gran.collect_tree(tree);
                     nodes.extend(ns);
-                    ck
-                });
-                meta.push((ckpt_key(*rel), opt_ck_bytes(ck.flatten())));
+                    meta.push((fact_key(*rel, *edition), opt_ck_bytes(ck)));
+                }
             }
         }
-        gran.write(nodes, meta)
+        // Consolidation retires every Fact root below the new watermark, in the
+        // same batch as the checkpoint that replaces them: a crash leaves the
+        // old horizon or the new one, never a half-cut history.
+        if let Some(wm) = drop_below {
+            for (key, _) in gran.meta_prefix(b"fact:")? {
+                if fact_edition(&key).is_some_and(|e| e < wm) {
+                    drop_meta.push(key);
+                }
+            }
+        }
+        gran.write_full(nodes, meta, drop_meta)
     }
 }
 
@@ -353,9 +372,14 @@ impl Inner {
         }
     }
 
-    /// Rebuild in-memory state from a granfilade: the clock, each rel's Fact
-    /// checkpoint (@ watermark) and Edition-log tail, then replay the tail to
-    /// reconstruct the versioned Fact roots above the watermark.
+    /// Rebuild in-memory state from a granfilade: the clock, then each
+    /// relation's persisted Edition-log root and its **versioned Fact roots**.
+    ///
+    /// This is a root lookup per relation-version — no fold, no replay. Before
+    /// G-2 the Fact enfilade was not persisted at all: `open` loaded a
+    /// watermark checkpoint and replayed the whole log tail back through
+    /// `fold_fact`, which is checkpoint-and-replay recovery — the LSM shape the
+    /// mandate rules out from underneath the Ent.
     fn rebuild(gran: &Granfilade) -> Result<Inner> {
         let current = gran.meta_get(b"cur")?.map(|b| u64_be(&b)).unwrap_or(0);
         let watermark = gran.meta_get(b"wm")?.map(|b| u64_be(&b)).unwrap_or(0);
@@ -363,22 +387,16 @@ impl Inner {
         let mut inner =
             Inner { current, watermark, fact: HashMap::new(), log: HashMap::new(), ctx };
 
-        // Fact checkpoints (state as-of the watermark).
-        for (key, val) in gran.meta_prefix(b"ckpt:")? {
-            let rel = rel_from_key(&key, b"ckpt:");
-            if let Some(ck) = bytes_opt_ck(&val) {
-                let tree: FactTree = gran.load(Some(ck))?;
-                inner.fact.entry(rel).or_default().insert(watermark, tree);
-            }
+        for (key, val) in gran.meta_prefix(b"fact:")? {
+            let rel = rel_from_key(&key, b"fact:");
+            let edition = fact_edition(&key)
+                .ok_or_else(|| Error::Codec("granfilade: malformed fact root key".into()))?;
+            let tree: FactTree = gran.load(bytes_opt_ck(&val))?;
+            inner.fact.entry(rel).or_default().insert(edition, tree);
         }
-        // Edition-log tails, then replay to rebuild the Fact roots above wm.
         for (key, val) in gran.meta_prefix(b"log:")? {
             let rel = rel_from_key(&key, b"log:");
-            let log: LogTree = gran.load(bytes_opt_ck(&val))?;
-            for ((e, _submit), (tuple, diff)) in log.iter().map(|(k, v)| (*k, v.clone())) {
-                inner.fold_fact(e, rel, &tuple, diff);
-            }
-            inner.log.insert(rel, log);
+            inner.log.insert(rel, gran.load(bytes_opt_ck(&val))?);
         }
         Ok(inner)
     }
@@ -427,7 +445,7 @@ impl TraceStore for EntStore {
         let mut inner = self.inner.lock().unwrap();
         let e = inner.current + 1;
         inner.apply(e, updates);
-        self.persist(&inner, &touched(updates), false)?;
+        self.persist(&inner, &touched(updates), None)?;
         Ok(Edition(e))
     }
 
@@ -444,7 +462,7 @@ impl TraceStore for EntStore {
         }
         let e = inner.current + 1;
         inner.apply(e, updates);
-        self.persist(&inner, &touched(updates), false)?;
+        self.persist(&inner, &touched(updates), None)?;
         Ok(Some(Edition(e)))
     }
 
@@ -518,9 +536,10 @@ impl TraceStore for EntStore {
             *log = next;
         }
         inner.watermark = new_wm;
-        // Every rel's checkpoint and log tail changed — persist all.
+        // Every rel's Fact versions and log tail changed — persist all, and
+        // retire the roots below the new watermark in the same batch.
         let all_rels: Vec<RelId> = inner.log.keys().copied().collect();
-        self.persist(&inner, &all_rels, true)?;
+        self.persist(&inner, &all_rels, Some(new_wm))?;
         Ok(Edition(new_wm))
     }
 }
@@ -672,10 +691,18 @@ fn log_key(rel: RelId) -> Vec<u8> {
     k
 }
 
-fn ckpt_key(rel: RelId) -> Vec<u8> {
-    let mut k = b"ckpt:".to_vec();
+/// `fact:{rel}{edition}` — one persisted Fact root per live as-of edition.
+fn fact_key(rel: RelId, edition: u64) -> Vec<u8> {
+    let mut k = b"fact:".to_vec();
     k.extend_from_slice(&rel.0.to_be_bytes());
+    k.extend_from_slice(&edition.to_be_bytes());
     k
+}
+
+/// The edition a `fact:` key names.
+fn fact_edition(key: &[u8]) -> Option<u64> {
+    let start = b"fact:".len() + 4;
+    key.get(start..start + 8).map(u64_be)
 }
 
 fn rel_from_key(key: &[u8], prefix: &[u8]) -> RelId {

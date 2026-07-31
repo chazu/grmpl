@@ -27,8 +27,9 @@
 //! Equality the language relies on is at the entry level — [`iter`](Tree::iter)
 //! is canonical — exactly as `DESIGN.md` and the store contract define it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use crate::hash::ContentKey;
 use crate::measure::Measure;
 
 /// One entry difference between two tree versions: `(key, left_value,
@@ -61,6 +62,14 @@ struct Node<K, V, M> {
     size: usize,
     /// The subtree's cached [`Measure`] — the upward WID summary.
     measure: M,
+    /// **Memoized content key (G-1).** A node is immutable and `Arc`-held, so
+    /// its content key is a pure function of it and caching it here is just
+    /// memoizing that function — there is no A-B-A to observe, which was the
+    /// stated worry when this was deferred. Filling it is the granfilade's job
+    /// (this module names no hash of a *frame*, only the cell), and it is what
+    /// lets a commit skip subtrees it has already persisted instead of
+    /// re-serializing the whole tree.
+    ck: OnceLock<ContentKey>,
 }
 
 /// A persistent measured ordered map from `K` to `V` with subtree measure `M`.
@@ -275,6 +284,13 @@ where
 
     // --- persistence surface ------------------------------------------------
 
+    /// This node's memoized content-key cell, or `None` if the tree is empty.
+    /// The granfilade reads it to skip an already-persisted subtree, and fills
+    /// it after hashing.
+    pub fn ck_cell(&self) -> Option<&OnceLock<ContentKey>> {
+        Some(&self.root.as_deref()?.ck)
+    }
+
     /// A borrowed view of this tree's root node, or `None` if empty. For the
     /// granfilade: it walks the exact persisted shape without reconstructing it.
     pub fn node(&self) -> Option<NodeRef<'_, K, V, M>> {
@@ -304,7 +320,14 @@ where
         for (k, v) in &entries {
             measure = measure.combine(&M::entry(k, v));
         }
-        Tree { root: Some(Arc::new(Node { size: entries.len(), measure, kind: Kind::Leaf(entries) })) }
+        Tree {
+            root: Some(Arc::new(Node {
+                size: entries.len(),
+                measure,
+                kind: Kind::Leaf(entries),
+                ck: OnceLock::new(),
+            })),
+        }
     }
 
     fn internal(keys: Vec<K>, children: Vec<Self>) -> Self {
@@ -314,7 +337,14 @@ where
             measure = measure.combine(&c.measure());
             size += c.len();
         }
-        Tree { root: Some(Arc::new(Node { size, measure, kind: Kind::Internal { keys, children } })) }
+        Tree {
+            root: Some(Arc::new(Node {
+                size,
+                measure,
+                kind: Kind::Internal { keys, children },
+                ck: OnceLock::new(),
+            })),
+        }
     }
 
     // --- insert -------------------------------------------------------------
