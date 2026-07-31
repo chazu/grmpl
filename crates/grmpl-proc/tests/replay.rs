@@ -8,12 +8,11 @@
 //! `replay_from` reproduces the identical patches only because it reads as-of.
 
 use grmpl_core::{
-    Authority, DomainId, Edition, EditionStore, Entity, Fact, NoSchemas, Patch, RelId, Scope,
+    Authority, DomainId, Edition, Entity, Fact, NoSchemas, Patch, RelId, Scope,
     TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
 use grmpl_proc::{enqueue, record_run, replay_from, Behavior, Process, Step};
-use grmpl_store::FjallStore;
 
 const INBOX: RelId = RelId(1);
 const CURSOR: RelId = RelId(2);
@@ -80,89 +79,92 @@ fn feed(store: &dyn TraceStore, start: i64, ns: &[i64]) {
 
 #[test]
 fn replay_reproduces_identical_patches() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    let proc = actor();
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let proc = actor();
 
-    feed(&store, 0, &[10, 5, -3, 20, 1]);
-    let live = record_run(&store, &proc, &NoSchemas).unwrap();
-    assert_eq!(live.len(), 5, "all five messages committed");
+        feed(store, 0, &[10, 5, -3, 20, 1]);
+        let live = record_run(store, &proc, &NoSchemas).unwrap();
+        assert_eq!(live.len(), 5, "all five messages committed");
 
-    // Re-derived purely from history, over the whole trace: identical patches.
-    let replayed = replay_from(&store, &proc, Edition::ZERO).unwrap();
-    assert_eq!(
-        live, replayed,
-        "replay reproduces the live log step for step"
-    );
+        // Re-derived purely from history, over the whole trace: identical patches.
+        let replayed = replay_from(store, &proc, Edition::ZERO).unwrap();
+        assert_eq!(
+            live, replayed,
+            "replay reproduces the live log step for step"
+        );
 
-    // Replay is itself deterministic — a second re-derivation matches.
-    let again = replay_from(&store, &proc, Edition::ZERO).unwrap();
-    assert_eq!(replayed, again, "replay is deterministic");
+        // Replay is itself deterministic — a second re-derivation matches.
+        let again = replay_from(store, &proc, Edition::ZERO).unwrap();
+        assert_eq!(replayed, again, "replay is deterministic");
 
-    // Spot-check the stateful shape: the third message (-3) retracts the total
-    // 15 that stood before it and asserts 12. This is only right because replay
-    // read `TOTAL` as-of that step's edition, not the final edition.
-    let third = &replayed[2];
-    assert_eq!(third.seq, 2);
-    assert_eq!(
-        third.patch.retracts,
-        vec![Fact::new(TOTAL, Tuple::from([Value::Int(15)]))]
-    );
-    assert_eq!(
-        third.patch.asserts,
-        vec![Fact::new(TOTAL, Tuple::from([Value::Int(12)]))]
-    );
+        // Spot-check the stateful shape: the third message (-3) retracts the total
+        // 15 that stood before it and asserts 12. This is only right because replay
+        // read `TOTAL` as-of that step's edition, not the final edition.
+        let third = &replayed[2];
+        assert_eq!(third.seq, 2);
+        assert_eq!(
+            third.patch.retracts,
+            vec![Fact::new(TOTAL, Tuple::from([Value::Int(15)]))]
+        );
+        assert_eq!(
+            third.patch.asserts,
+            vec![Fact::new(TOTAL, Tuple::from([Value::Int(12)]))]
+        );
 
-    // The world's final total is the plain sum.
-    let snap = Snapshot::at_current(&store);
-    assert_eq!(total_of(&snap), Some(33));
+        // The world's final total is the plain sum.
+        let snap = Snapshot::at_current(store);
+        assert_eq!(total_of(&snap), Some(33));
+    });
 }
 
 #[test]
 fn replay_from_a_midpoint_covers_only_later_steps() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    let proc = actor();
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let proc = actor();
 
-    // First batch, remembering the edition after it.
-    feed(&store, 0, &[10, 5]);
-    record_run(&store, &proc, &NoSchemas).unwrap();
-    let mid = store.current();
+        // First batch, remembering the edition after it.
+        feed(store, 0, &[10, 5]);
+        record_run(store, &proc, &NoSchemas).unwrap();
+        let mid = store.current();
 
-    // Second batch.
-    feed(&store, 2, &[100, 200]);
-    let later = record_run(&store, &proc, &NoSchemas).unwrap();
+        // Second batch.
+        feed(store, 2, &[100, 200]);
+        let later = record_run(store, &proc, &NoSchemas).unwrap();
 
-    // Replaying from `mid` re-derives exactly the second batch's steps.
-    let replayed = replay_from(&store, &proc, mid).unwrap();
-    assert_eq!(
-        later, replayed,
-        "midpoint replay covers only the post-`mid` steps"
-    );
-    assert_eq!(
-        replayed.iter().map(|s| s.seq).collect::<Vec<_>>(),
-        vec![2, 3]
-    );
+        // Replaying from `mid` re-derives exactly the second batch's steps.
+        let replayed = replay_from(store, &proc, mid).unwrap();
+        assert_eq!(
+            later, replayed,
+            "midpoint replay covers only the post-`mid` steps"
+        );
+        assert_eq!(
+            replayed.iter().map(|s| s.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    });
 }
 
 #[test]
 fn replay_below_watermark_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    let proc = actor();
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let proc = actor();
 
-    feed(&store, 0, &[1, 2, 3, 4]);
-    record_run(&store, &proc, &NoSchemas).unwrap();
+        feed(store, 0, &[1, 2, 3, 4]);
+        record_run(store, &proc, &NoSchemas).unwrap();
 
-    // Consolidate away early history, then a replay reaching below the watermark
-    // must error at the door rather than answer from truncated history.
-    let wm = store.consolidate(store.current()).unwrap();
-    assert!(wm.0 > 0, "consolidation advanced the watermark");
-    let err = replay_from(&store, &proc, Edition::ZERO).unwrap_err();
-    assert!(
-        format!("{err}").contains("watermark"),
-        "replay below the watermark is rejected loudly: {err}"
-    );
+        // Consolidate away early history, then a replay reaching below the watermark
+        // must error at the door rather than answer from truncated history.
+        let wm = store.consolidate(store.current()).unwrap();
+        assert!(wm.0 > 0, "consolidation advanced the watermark");
+        let err = replay_from(store, &proc, Edition::ZERO).unwrap_err();
+        assert!(
+            format!("{err}").contains("watermark"),
+            "replay below the watermark is rejected loudly: {err}"
+        );
+    });
 }
 
 // --- Randomized-churn law oracle (the Replay law under arbitrary history) -----
@@ -230,14 +232,17 @@ fn proc_for(entity: Entity) -> Process {
 
 #[test]
 fn replay_reproduces_history_under_random_churn() {
-    for seed in 1..=24u64 {
-        churn_replay_round(seed);
-    }
+    grmpl_conformance::for_each_store(|c| {
+        for seed in 1..=24u64 {
+            churn_replay_round(c, seed);
+        }
+    });
 }
 
-fn churn_replay_round(seed: u64) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+fn churn_replay_round(case: &grmpl_conformance::Case, seed: u64) {
+    // Fresh store of the same substrate: the round replays its own history.
+    let sib = case.sibling();
+    let store = sib.store();
     let mut rng = Rng::new(seed);
 
     let procs: Vec<Process> = PROCS.iter().map(|e| proc_for(*e)).collect();
@@ -254,27 +259,27 @@ fn churn_replay_round(seed: u64) {
             let batch = 1 + rng.below(4); // 1..=4 messages
             for _ in 0..batch {
                 let n = rng.below(11) as i64 - 5; // -5..=5, negatives force retraction
-                enqueue(&store, INBOX, PROCS[pi], next_seq[pi], Tuple::from([Value::Int(n)]))
+                enqueue(store, INBOX, PROCS[pi], next_seq[pi], Tuple::from([Value::Int(n)]))
                     .unwrap();
                 next_seq[pi] += 1;
             }
         } else {
             // Drive this process to idle, recording its slice of the log.
-            let steps = record_run(&store, &procs[pi], &NoSchemas).unwrap();
+            let steps = record_run(store, &procs[pi], &NoSchemas).unwrap();
             live[pi].extend(steps);
         }
     }
 
     // Drain every process so all enqueued messages are committed history.
     for (i, p) in procs.iter().enumerate() {
-        let steps = record_run(&store, p, &NoSchemas).unwrap();
+        let steps = record_run(store, p, &NoSchemas).unwrap();
         live[i].extend(steps);
     }
 
     let current = store.current();
     for (i, p) in procs.iter().enumerate() {
         // Full replay reproduces the live log step for step, purely from history.
-        let replayed = replay_from(&store, p, Edition::ZERO).unwrap();
+        let replayed = replay_from(store, p, Edition::ZERO).unwrap();
         assert_eq!(
             live[i], replayed,
             "seed {seed}: full replay differs from the live log for {:?}",
@@ -282,13 +287,13 @@ fn churn_replay_round(seed: u64) {
         );
 
         // Replay is deterministic — a second re-derivation matches.
-        let again = replay_from(&store, p, Edition::ZERO).unwrap();
+        let again = replay_from(store, p, Edition::ZERO).unwrap();
         assert_eq!(replayed, again, "seed {seed}: replay not idempotent for {:?}", PROCS[i]);
 
         // A replay from a random midpoint covers exactly the steps this process
         // committed after that edition — the live tail, nothing before it.
         let mid = Edition(rng.below(current.0 + 1));
-        let tail = replay_from(&store, p, mid).unwrap();
+        let tail = replay_from(store, p, mid).unwrap();
         let want_tail: Vec<Step> =
             live[i].iter().filter(|s| s.edition.0 > mid.0).cloned().collect();
         assert_eq!(

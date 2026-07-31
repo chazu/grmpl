@@ -12,14 +12,13 @@
 use std::sync::Arc;
 
 use grmpl_core::{
-    Authority, DomainId, EditionStore, Entity, Fact, Message, Patch, RelId, Result, Scope,
+    Authority, DomainId, Entity, Fact, Message, Patch, RelId, Result, Scope,
     TraceStore, Tuple, Value,
 };
 use grmpl_core::NoSchemas;
 use grmpl_diff::{Query, Snapshot};
 use grmpl_pattern::{Bindings, Form, Pattern, Rule, VarId};
 use grmpl_proc::{enqueue, Behavior, CommitOutcome, Process};
-use grmpl_store::FjallStore;
 
 // ---- schema --------------------------------------------------------------
 const LOCATED: RelId = RelId(1); //  (thing, place)
@@ -160,7 +159,7 @@ fn player_process(viewer: Entity) -> Process {
     }
 }
 
-fn seed_world(store: &FjallStore) {
+fn seed_world(store: &dyn TraceStore) {
     store
         .commit(&[
             (LOCATED, Tuple::from([ent(LAMP), ent(ROOM)]), 1),
@@ -175,20 +174,20 @@ fn seed_world(store: &FjallStore) {
 
 #[test]
 fn take_lamp_end_to_end_with_observer() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    seed_world(&store);
+    grmpl_conformance::for_each_store(|c| {
+    let store = c.store();
+    seed_world(store);
 
     let lamp_named = (Tuple::from([ent(LAMP), Value::text("brass lamp")]), 1i64);
 
     // The bystander watches `visible` and sees the lamp initially.
     let observer_q = visible(BYSTANDER);
-    let mut observer = observer_q.watch(&store, store.current());
+    let mut observer = observer_q.watch(store, store.current());
     assert_eq!(observer.poll().unwrap(), vec![lamp_named.clone()], "observer sees the lamp");
 
     // "take lamp" arrives in the player's inbox.
     enqueue(
-        &store,
+        store,
         INBOX,
         PLAYER,
         0,
@@ -198,7 +197,7 @@ fn take_lamp_end_to_end_with_observer() {
 
     // The player process runs it: parse → resolve → commit.
     let player = player_process(PLAYER);
-    let outcome = player.step(&store, &NoSchemas).unwrap();
+    let outcome = player.step(store, &NoSchemas).unwrap();
     assert!(matches!(outcome, Some(CommitOutcome::Committed(_))), "the take committed");
 
     let cur = store.current();
@@ -222,18 +221,19 @@ fn take_lamp_end_to_end_with_observer() {
     assert_eq!(delta, vec![(lamp_named.0.clone(), -1)], "observer sees `- lamp`");
 
     // And a fresh evaluation confirms the observer now sees nothing.
-    assert!(observer_q.find(&Snapshot::at_current(&store)).unwrap().is_empty());
+    assert!(observer_q.find(&Snapshot::at_current(store)).unwrap().is_empty());
+    });
 }
 
 #[test]
 fn taking_something_not_present_replies_without_changing_the_world() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    seed_world(&store);
+    grmpl_conformance::for_each_store(|c| {
+    let store = c.store();
+    seed_world(store);
 
     // Ask for a "sword" that isn't here.
     enqueue(
-        &store,
+        store,
         INBOX,
         PLAYER,
         0,
@@ -242,7 +242,7 @@ fn taking_something_not_present_replies_without_changing_the_world() {
     .unwrap();
 
     let player = player_process(PLAYER);
-    player.step(&store, &NoSchemas).unwrap();
+    player.step(store, &NoSchemas).unwrap();
 
     let cur = store.current();
     // The lamp is untouched; a "don't see that" reply was told.
@@ -254,4 +254,5 @@ fn taking_something_not_present_replies_without_changing_the_world() {
     assert!(store.read_at(HELD, cur).unwrap().is_empty());
     let told = store.read_at(TELL, cur).unwrap();
     assert_eq!(told, vec![(Tuple::from([ent(PLAYER), Value::text("You don't see that here.")]), 1)]);
+    });
 }

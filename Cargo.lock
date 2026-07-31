@@ -1090,6 +1090,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "grmpl-conformance"
+version = "0.0.1"
+dependencies = [
+ "grmpl-core",
+ "grmpl-ent",
+ "grmpl-store",
+ "tempfile",
+]
+
+[[package]]
 name = "grmpl-core"
 version = "0.0.1"
 
@@ -1120,6 +1130,7 @@ dependencies = [
 name = "grmpl-lang"
 version = "0.0.1"
 dependencies = [
+ "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-pattern",
@@ -1139,6 +1150,7 @@ dependencies = [
 name = "grmpl-proc"
 version = "0.0.1"
 dependencies = [
+ "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-pattern",
@@ -1151,6 +1163,7 @@ dependencies = [
 name = "grmpl-session"
 version = "0.0.1"
 dependencies = [
+ "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-pattern",

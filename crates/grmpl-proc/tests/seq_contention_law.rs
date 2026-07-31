@@ -23,17 +23,16 @@
 //!      exactly-once delivery semantics are preserved.
 //!
 //! Modeled on the P4 `seq_alloc_is_race_safe` test and grmpl-bench's contention
-//! axis (both share a `FjallStore` across a `thread::scope`).
+//! axis (both share one store across a `thread::scope`, on every substrate).
 
 use std::collections::HashMap;
 use std::thread;
 
 use grmpl_core::{
-    Authority, DomainId, EditionStore, Entity, Fact, Message, NoSchemas, Patch, RelId, Scope,
-    TraceStore, Tuple, Value,
+    Authority, DomainId, Entity, Fact, Message, NoSchemas, Patch, RelId, Scope,
+    Tuple, Value,
 };
 use grmpl_proc::{enqueue_seq, outbox_len, seed_seq, CommitOutcome, Domain};
-use grmpl_store::FjallStore;
 use grmpl_transport::InProcessNet;
 
 // ---------------------------------------------------------------------------
@@ -103,11 +102,11 @@ fn wave() -> Patch {
 
 /// Race `threads` concurrent committers, each emitting `per_thread` remote waves
 /// into A's outbox, then assert the three laws over the drained outbox.
-fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let store_a = FjallStore::open(dir_a.path()).unwrap();
-    let store_b = FjallStore::open(dir_b.path()).unwrap();
+fn outbox_law(case: &grmpl_conformance::Case, seed: u64, threads: u64, per_thread: u64) {
+    // Two authority domains on the same substrate, each freshly created so the
+    // race starts from an empty outbox.
+    let (sa, sb) = (case.sibling(), case.sibling());
+    let (store_a, store_b) = (sa.store(), sb.store());
 
     let net = InProcessNet::new();
     let tx_a = net.endpoint(A);
@@ -119,7 +118,7 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
     {
         let da = Domain {
             id: A,
-            store: &store_a,
+            store: store_a,
             transport: &tx_a,
             routes: a_routes(),
             outbox: A_OUTBOX,
@@ -129,7 +128,7 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
         da.seed_outseq().unwrap();
     }
 
-    let store_ref = &store_a;
+    let store_ref = store_a;
     let tx_ref = &tx_a;
     // Each thread returns how many of its commits actually committed.
     let committed: Vec<u64> = thread::scope(|scope| {
@@ -194,7 +193,7 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
     // and the outbox drains — the pre-swap exactly-once delivery semantics.
     let da = Domain {
         id: A,
-        store: &store_a,
+        store: store_a,
         transport: &tx_a,
         routes: a_routes(),
         outbox: A_OUTBOX,
@@ -203,7 +202,7 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
     };
     let db = Domain {
         id: B,
-        store: &store_b,
+        store: store_b,
         transport: &tx_b,
         routes: HashMap::new(),
         outbox: RelId(90),
@@ -213,7 +212,7 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
     let shipped = da.flush_outbox().unwrap();
     assert_eq!(shipped as u64, expected, "seed={seed}: flush ships every committed emit once");
     assert_eq!(
-        outbox_len(&store_a, A_OUTBOX, store_a.current()).unwrap(),
+        outbox_len(store_a, A_OUTBOX, store_a.current()).unwrap(),
         0,
         "seed={seed}: the outbox drains after flush"
     );
@@ -240,12 +239,14 @@ fn outbox_law(seed: u64, threads: u64, per_thread: u64) {
 
 #[test]
 fn outbox_seq_is_race_safe_across_seeds() {
+    grmpl_conformance::for_each_store(|c| {
     for seed in SEEDS {
         let mut rng = Rng::new(seed);
         let threads = rng.in_range(2, 4);
         let per_thread = rng.in_range(6, 16);
-        outbox_law(seed, threads, per_thread);
+        outbox_law(c, seed, threads, per_thread);
     }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -262,16 +263,16 @@ fn player(i: u64) -> Entity {
 /// Race `threads` concurrent appenders over `players` inbox keys, each thread
 /// doing `per_thread` appends to PRNG-chosen keys, then assert the seq laws
 /// per key.
-fn inbox_law(seed: u64, threads: u64, per_thread: u64, players: u64) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+fn inbox_law(case: &grmpl_conformance::Case, seed: u64, threads: u64, per_thread: u64, players: u64) {
+    let sib = case.sibling();
+    let store = sib.store();
 
     // Seed every key once, on this un-raced path.
     for i in 0..players {
-        seed_seq(&store, INBOX_SEQ, player(i)).unwrap();
+        seed_seq(store, INBOX_SEQ, player(i)).unwrap();
     }
 
-    let store_ref = &store;
+    let store_ref = store;
     // Each thread returns the (player_index, seq) it was handed for every append.
     let per_thread_out: Vec<Vec<(u64, i64)>> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -361,11 +362,13 @@ fn inbox_law(seed: u64, threads: u64, per_thread: u64, players: u64) {
 
 #[test]
 fn inbox_seq_is_race_safe_across_seeds() {
+    grmpl_conformance::for_each_store(|c| {
     for seed in SEEDS {
         let mut rng = Rng::new(seed);
         let threads = rng.in_range(2, 4);
         let per_thread = rng.in_range(6, 16);
         let players = rng.in_range(1, 3);
-        inbox_law(seed, threads, per_thread, players);
+        inbox_law(c, seed, threads, per_thread, players);
     }
+    });
 }
