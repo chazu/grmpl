@@ -25,22 +25,22 @@ use grmpl_core::{
     Diff, Edition, EditionStore, Entity, RelId, Result, TraceStore, Tuple, Update, Value,
 };
 use grmpl_diff::{eval_snapshot, eval_snapshot_with, Arrangements, Query};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 use crate::harness::{measure, Report, Sample};
 use crate::scenarios::open_store;
 
 const B: RelId = RelId(50);
 
-/// A `TraceStore` that delegates to fjall but tallies `read_at` calls — the
+/// A `TraceStore` that delegates to the ent but tallies `read_at` calls — the
 /// witness that a shared arrangement is evaluated once, not once per reference.
 pub struct CountingStore {
-    inner: FjallStore,
+    inner: EntStore,
     reads: Mutex<usize>,
 }
 
 impl CountingStore {
-    pub fn new(inner: FjallStore) -> CountingStore {
+    pub fn new(inner: EntStore) -> CountingStore {
         CountingStore { inner, reads: Mutex::new(0) }
     }
     pub fn reads(&self) -> usize {

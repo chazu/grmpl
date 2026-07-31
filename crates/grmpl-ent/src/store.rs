@@ -41,7 +41,10 @@ type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
 /// commit clock, optionally durable on a [`Granfilade`].
 pub struct EntStore {
     inner: Mutex<Inner>,
-    gran: Option<Granfilade>,
+    /// The node substrate, **shared with every fork of this store** (G-6): all
+    /// branches live in one granfilade with their roots namespaced by branch, so
+    /// a durable fork shares nodes with its ancestor instead of copying them.
+    gran: Option<Arc<Granfilade>>,
     /// This store's branch in the fulltrace's DagWood.
     branch: BranchId,
     /// The branch DAG shared with every fork of this store (Xanadu's `DagWood` /
@@ -82,12 +85,18 @@ impl EntStore {
     /// its state from the persisted enfilades.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<EntStore> {
         let gran = Granfilade::open(path)?;
-        let inner = Inner::rebuild(&gran)?;
+        let inner = Inner::rebuild(&gran, Dag::ROOT)?;
+        // The branch graph is durable too: a reopened store that forgot its
+        // forks would have forgotten its history.
+        let dag = gran
+            .meta_get(DAG_KEY)?
+            .and_then(|b| Dag::decode(&b))
+            .unwrap_or_else(Dag::new);
         Ok(EntStore {
             inner: Mutex::new(inner),
-            gran: Some(gran),
+            gran: Some(Arc::new(gran)),
             branch: Dag::ROOT,
-            dag: Arc::new(Mutex::new(Dag::new())),
+            dag: Arc::new(Mutex::new(dag)),
         })
     }
 
@@ -167,13 +176,17 @@ impl EntStore {
         }
     }
 
-    /// **Structural-sharing fork (E3).** A new independent store whose state is
-    /// this store's as-of `at`, **sharing every enfilade node** with the parent
-    /// (the versioned Fact roots are `Arc`-cloned, not copied). Forking at the
-    /// current edition is `O(#relations)`, not the LSM's `O(state)` verbatim copy
-    /// — the cheap virtual copy at the heart of the Ent. The fork then evolves
-    /// independently. (In-memory; a persistent fork sharing the granfilade node
-    /// store is a later increment.)
+    /// **Structural-sharing fork (E3, made durable in G-6).** A new independent
+    /// store whose state is this store's as-of `at`, **sharing every enfilade
+    /// node** with the parent — the versioned Fact roots are `Arc`-cloned in
+    /// memory and, on a durable store, the child's roots are written into the
+    /// *same granfilade* pointing at the *same node keys*. Forking is therefore
+    /// `O(#roots)` meta writes and **zero** node writes: the cheap virtual copy
+    /// at the heart of the Ent, where the LSM must copy `O(state)` bytes.
+    ///
+    /// The fork is a new branch in the shared DagWood, so ancestry stays
+    /// queryable across the whole family, and it survives a reopen
+    /// ([`open_branch`](Self::open_branch)).
     pub fn fork_at(&self, at: Edition) -> Result<EntStore> {
         let inner = self.inner.lock().unwrap();
         if at.0 < inner.watermark {
@@ -208,7 +221,7 @@ impl EntStore {
                 }
             }
         }
-        Ok(EntStore {
+        let child = EntStore {
             inner: Mutex::new(Inner {
                 current: at.0,
                 watermark: inner.watermark,
@@ -216,9 +229,66 @@ impl EntStore {
                 log,
                 ctx: inner.ctx.clone(),
             }),
-            gran: None,
+            gran: self.gran.clone(),
             branch: child_branch,
             dag: Arc::clone(&self.dag),
+        };
+        // Write the child's roots and its branch record. Every node they name is
+        // already durable and memoized, so `collect_tree` returns their keys
+        // without re-encoding anything: the fork writes roots, never nodes.
+        if let Some(gran) = &self.gran {
+            let child_inner = child.inner.lock().unwrap();
+            let rels: Vec<RelId> = child_inner.log.keys().copied().collect();
+            child.persist(&child_inner, &rels, None)?;
+            child.persist_ctx(&child_inner)?;
+            gran.write(
+                Vec::new(),
+                vec![(DAG_KEY.to_vec(), self.dag.lock().unwrap().encode())],
+            )?;
+        }
+        Ok(child)
+    }
+
+    /// A handle on another **branch of this same store**, sharing its granfilade
+    /// and DagWood.
+    ///
+    /// Prefer this over [`open_branch`](Self::open_branch) whenever the parent is
+    /// still live: a granfilade takes an exclusive lock on its directory, so two
+    /// branches of one world are two handles onto *one* granfilade, never two
+    /// opens of the same path. That is the same constraint that makes all
+    /// branches sharing one node store the right design in the first place.
+    pub fn branch(&self, branch: BranchId) -> Result<EntStore> {
+        if self.dag.lock().unwrap().get(branch).is_none() {
+            return Err(Error::Store(format!("unknown branch {branch}")));
+        }
+        let inner = match &self.gran {
+            Some(gran) => Inner::rebuild(gran, branch)?,
+            None => return Err(Error::Store("in-memory store has no persisted branches".into())),
+        };
+        Ok(EntStore {
+            inner: Mutex::new(inner),
+            gran: self.gran.clone(),
+            branch,
+            dag: Arc::clone(&self.dag),
+        })
+    }
+
+    /// Reopen a specific branch of a granfilade — the durable counterpart of
+    /// [`fork_at`](Self::fork_at). [`open`](Self::open) is this at
+    /// [`Dag::ROOT`]. The parent must not be open: use
+    /// [`branch`](Self::branch) when it is.
+    pub fn open_branch(path: impl AsRef<std::path::Path>, branch: BranchId) -> Result<EntStore> {
+        let gran = Granfilade::open(path)?;
+        let inner = Inner::rebuild(&gran, branch)?;
+        let dag = gran
+            .meta_get(DAG_KEY)?
+            .and_then(|b| Dag::decode(&b))
+            .unwrap_or_else(Dag::new);
+        Ok(EntStore {
+            inner: Mutex::new(inner),
+            gran: Some(Arc::new(gran)),
+            branch,
+            dag: Arc::new(Mutex::new(dag)),
         })
     }
 
@@ -312,7 +382,7 @@ impl EntStore {
             None => return Ok(()),
         };
         let (ck, nodes) = gran.collect_tree(&inner.ctx);
-        gran.write(nodes, vec![(CTX_KEY.to_vec(), opt_ck_bytes(ck))])
+        gran.write(nodes, vec![(ctx_key(self.branch), opt_ck_bytes(ck))])
     }
 
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
@@ -324,8 +394,8 @@ impl EntStore {
         };
         let mut nodes = Vec::new();
         let mut meta = vec![
-            (b"cur".to_vec(), inner.current.to_be_bytes().to_vec()),
-            (b"wm".to_vec(), inner.watermark.to_be_bytes().to_vec()),
+            (cur_key(self.branch), inner.current.to_be_bytes().to_vec()),
+            (wm_key(self.branch), inner.watermark.to_be_bytes().to_vec()),
         ];
         let mut drop_meta = Vec::new();
         for rel in touched {
@@ -333,7 +403,7 @@ impl EntStore {
             let log = inner.log.get(rel).cloned().unwrap_or_default();
             let (ck, ns) = gran.collect_tree(&log);
             nodes.extend(ns);
-            meta.push((log_key(*rel), opt_ck_bytes(ck)));
+            meta.push((log_key(self.branch, *rel), opt_ck_bytes(ck)));
 
             // **The Fact enfilade, versioned by edition (G-2).** Every live
             // as-of root is persisted, so `open` is a root lookup rather than a
@@ -343,7 +413,7 @@ impl EntStore {
                 for (edition, tree) in versions {
                     let (ck, ns) = gran.collect_tree(tree);
                     nodes.extend(ns);
-                    meta.push((fact_key(*rel, *edition), opt_ck_bytes(ck)));
+                    meta.push((fact_key(self.branch, *rel, *edition), opt_ck_bytes(ck)));
                 }
             }
         }
@@ -351,7 +421,7 @@ impl EntStore {
         // same batch as the checkpoint that replaces them: a crash leaves the
         // old horizon or the new one, never a half-cut history.
         if let Some(wm) = drop_below {
-            for (key, _) in gran.meta_prefix(b"fact:")? {
+            for (key, _) in gran.meta_prefix(&branch_key(b"fact:", self.branch))? {
                 if fact_edition(&key).is_some_and(|e| e < wm) {
                     drop_meta.push(key);
                 }
@@ -380,21 +450,21 @@ impl Inner {
     /// watermark checkpoint and replayed the whole log tail back through
     /// `fold_fact`, which is checkpoint-and-replay recovery — the LSM shape the
     /// mandate rules out from underneath the Ent.
-    fn rebuild(gran: &Granfilade) -> Result<Inner> {
-        let current = gran.meta_get(b"cur")?.map(|b| u64_be(&b)).unwrap_or(0);
-        let watermark = gran.meta_get(b"wm")?.map(|b| u64_be(&b)).unwrap_or(0);
-        let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(CTX_KEY)?.unwrap_or_default()))?;
+    fn rebuild(gran: &Granfilade, branch: BranchId) -> Result<Inner> {
+        let current = gran.meta_get(&cur_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
+        let watermark = gran.meta_get(&wm_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
+        let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(&ctx_key(branch))?.unwrap_or_default()))?;
         let mut inner =
             Inner { current, watermark, fact: HashMap::new(), log: HashMap::new(), ctx };
 
-        for (key, val) in gran.meta_prefix(b"fact:")? {
+        for (key, val) in gran.meta_prefix(&branch_key(b"fact:", branch))? {
             let rel = rel_from_key(&key, b"fact:");
             let edition = fact_edition(&key)
                 .ok_or_else(|| Error::Codec("granfilade: malformed fact root key".into()))?;
             let tree: FactTree = gran.load(bytes_opt_ck(&val))?;
             inner.fact.entry(rel).or_default().insert(edition, tree);
         }
-        for (key, val) in gran.meta_prefix(b"log:")? {
+        for (key, val) in gran.meta_prefix(&branch_key(b"log:", branch))? {
             let rel = rel_from_key(&key, b"log:");
             inner.log.insert(rel, gran.load(bytes_opt_ck(&val))?);
         }
@@ -681,19 +751,43 @@ fn touched(updates: &[(RelId, Tuple, Diff)]) -> Vec<RelId> {
     rels
 }
 
-/// The meta key holding the context enfilade's root (catalog + schemas + scoped
-/// bindings). GC roots from it, so the catalog is never collected.
-const CTX_KEY: &[u8] = b"ctx:";
+/// The meta key holding the serialized branch graph (the fulltrace's DagWood).
+const DAG_KEY: &[u8] = b"dag";
 
-fn log_key(rel: RelId) -> Vec<u8> {
-    let mut k = b"log:".to_vec();
+/// Meta keys are **namespaced by branch** (G-6), so every branch's roots live in
+/// one granfilade and a fork shares nodes with its ancestor rather than copying
+/// them. GC prefix-scans `log:`/`fact:`/`ctx:` and therefore roots from every
+/// live branch automatically.
+fn branch_key(prefix: &[u8], branch: BranchId) -> Vec<u8> {
+    let mut k = prefix.to_vec();
+    k.extend_from_slice(&branch.to_be_bytes());
+    k
+}
+
+/// `ctx:{branch}` — the context enfilade root (catalog + schemas + bindings).
+fn ctx_key(branch: BranchId) -> Vec<u8> {
+    branch_key(b"ctx:", branch)
+}
+
+/// `cur:{branch}` / `wm:{branch}` — this branch's clock and watermark.
+fn cur_key(branch: BranchId) -> Vec<u8> {
+    branch_key(b"cur:", branch)
+}
+
+fn wm_key(branch: BranchId) -> Vec<u8> {
+    branch_key(b"wm:", branch)
+}
+
+/// `log:{branch}{rel}` — the Edition enfilade root.
+fn log_key(branch: BranchId, rel: RelId) -> Vec<u8> {
+    let mut k = branch_key(b"log:", branch);
     k.extend_from_slice(&rel.0.to_be_bytes());
     k
 }
 
-/// `fact:{rel}{edition}` — one persisted Fact root per live as-of edition.
-fn fact_key(rel: RelId, edition: u64) -> Vec<u8> {
-    let mut k = b"fact:".to_vec();
+/// `fact:{branch}{rel}{edition}` — one Fact root per live as-of edition.
+fn fact_key(branch: BranchId, rel: RelId, edition: u64) -> Vec<u8> {
+    let mut k = branch_key(b"fact:", branch);
     k.extend_from_slice(&rel.0.to_be_bytes());
     k.extend_from_slice(&edition.to_be_bytes());
     k
@@ -701,12 +795,14 @@ fn fact_key(rel: RelId, edition: u64) -> Vec<u8> {
 
 /// The edition a `fact:` key names.
 fn fact_edition(key: &[u8]) -> Option<u64> {
-    let start = b"fact:".len() + 4;
+    let start = b"fact:".len() + 8 + 4;
     key.get(start..start + 8).map(u64_be)
 }
 
+/// The relation a branch-namespaced key names (`prefix || branch || rel || …`).
 fn rel_from_key(key: &[u8], prefix: &[u8]) -> RelId {
-    let b = &key[prefix.len()..prefix.len() + 4];
+    let at = prefix.len() + 8;
+    let b = &key[at..at + 4];
     RelId(u32::from_be_bytes(b.try_into().unwrap()))
 }
 

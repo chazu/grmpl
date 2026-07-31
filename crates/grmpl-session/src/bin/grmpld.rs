@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use grmpl_core::TraceStore;
 use grmpl_session::{serve, Server};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -20,10 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = args.next();
 
     let store: Arc<dyn TraceStore> = match dir {
-        Some(path) => Arc::new(FjallStore::open(path)?),
+        Some(path) => Arc::new(EntStore::open(path)?),
         None => {
             let tmp = std::env::temp_dir().join(format!("grmpld-{}", std::process::id()));
-            Arc::new(FjallStore::open(tmp)?)
+            Arc::new(EntStore::open(tmp)?)
         }
     };
 

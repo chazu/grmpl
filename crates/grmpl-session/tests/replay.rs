@@ -86,11 +86,10 @@ fn replaying_a_session_reproduces_the_world() {
 
 #[test]
 fn a_fork_is_a_replay_checkpoint() {
-    // LSM-only for now. Forking a *durable* store into a new location is
-    // `FjallStore::fork`; the ent's `fork_at` shares structure but yields an
-    // in-memory store, so it cannot yet stand in here. Plan v5 G-6 (durable fork
-    // sharing one granfilade) is what makes this law substrate-neutral; until
-    // then, saying so is more honest than quietly testing one substrate twice.
+    // Ent-native since G-6: forking a durable world is a new branch in the same
+    // granfilade, sharing every node rather than copying `O(state)` bytes. The
+    // LSM's `FjallStore::fork` copies a directory, so the two cannot share one
+    // body here — the law is stated once and driven against each in turn below.
     {
         let dir = tempfile::tempdir().unwrap();
         // Play a session, fork it mid-life, then drive both the source and the fork
@@ -114,6 +113,39 @@ fn a_fork_is_a_replay_checkpoint() {
 
         // Replay identical remaining commands onto both, through independent servers
         // (the fork reconnects `builder` by identity — no re-spawn).
+        for target in [Arc::clone(&store), Arc::clone(&fork)] {
+            let server = Server::new(target as Arc<dyn TraceStore>);
+            let mut builder = server.login("builder").unwrap();
+            builder.submit("go hall").unwrap();
+            builder.submit("create lamp").unwrap();
+        }
+
+        assert_eq!(
+            dump(store.as_ref()),
+            dump(fork.as_ref()),
+            "replaying from the fork must reproduce the source"
+        );
+        assert_eq!(store.current(), fork.current());
+    }
+
+    // The same law on the ent: fork, drive both with identical commands, and the
+    // two branches must hold identical worlds.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(grmpl_ent::EntStore::open(dir.path()).unwrap());
+        let server = Server::new(Arc::clone(&store) as Arc<dyn TraceStore>);
+        server.init().unwrap();
+        let mut builder = server.login("builder").unwrap();
+        builder.submit("dig hall").unwrap();
+
+        // The checkpoint — O(edit), sharing every node with its ancestor.
+        let fork = Arc::new(store.fork_at(store.current()).unwrap());
+        assert_eq!(
+            dump(store.as_ref()),
+            dump(fork.as_ref()),
+            "the fork checkpoint must be a faithful copy"
+        );
+
         for target in [Arc::clone(&store), Arc::clone(&fork)] {
             let server = Server::new(target as Arc<dyn TraceStore>);
             let mut builder = server.login("builder").unwrap();

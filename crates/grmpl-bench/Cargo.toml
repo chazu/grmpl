@@ -3,7 +3,7 @@ name = "grmpl-bench"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "P13 benchmark harness: churn throughput, watch fan-out, precondition cost, contention/retry fairness, and arrangement-memo memory. An edge/tooling crate above the bright line (it names fjall via grmpl-store, exactly as an application would); it gates the P13 engine-statefulness work on real numbers."
+description = "P13 benchmark harness: churn throughput, watch fan-out, precondition cost, contention/retry fairness, and arrangement-memo memory. An edge/tooling crate above the bright line (it names fjall via grmpl-ent, exactly as an application would); it gates the P13 engine-statefulness work on real numbers."
 
 [[bin]]
 name = "grmpl-bench"
@@ -13,7 +13,7 @@ path = "src/main.rs"
 grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-proc = { path = "../grmpl-proc" }
-grmpl-store = { path = "../grmpl-store" }
+grmpl-ent = { path = "../grmpl-ent" }
 tempfile = "3"
 
 [dev-dependencies]

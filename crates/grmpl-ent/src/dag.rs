@@ -106,6 +106,58 @@ impl Dag {
         false
     }
 
+    /// Encode the whole branch graph: `count || [id, has_parent, parent, at]*`.
+    /// The DagWood is the fulltrace's branch structure, so it is durable like
+    /// every other part of the world — a reopened store that forgot its forks
+    /// would have forgotten its history.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.branches.len() as u32).to_be_bytes());
+        for b in self.branches.values() {
+            out.extend_from_slice(&b.id.to_be_bytes());
+            match b.parent {
+                None => out.push(0),
+                Some((p, at)) => {
+                    out.push(1);
+                    out.extend_from_slice(&p.to_be_bytes());
+                    out.extend_from_slice(&at.to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode a graph written by [`encode`](Self::encode). An empty or absent
+    /// blob is a fresh DAG holding only the root branch.
+    pub fn decode(bytes: &[u8]) -> Option<Dag> {
+        if bytes.is_empty() {
+            return Some(Dag::new());
+        }
+        let n = u32::from_be_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+        let mut branches = BTreeMap::new();
+        let mut next = 0u64;
+        let mut pos = 4;
+        for _ in 0..n {
+            let id = u64::from_be_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?);
+            pos += 8;
+            let parent = match bytes.get(pos)? {
+                0 => {
+                    pos += 1;
+                    None
+                }
+                _ => {
+                    let p = u64::from_be_bytes(bytes.get(pos + 1..pos + 9)?.try_into().ok()?);
+                    let at = u64::from_be_bytes(bytes.get(pos + 9..pos + 17)?.try_into().ok()?);
+                    pos += 17;
+                    Some((p, at))
+                }
+            };
+            branches.insert(id, Branch { id, parent });
+            next = next.max(id + 1);
+        }
+        Some(Dag { branches, next })
+    }
+
     /// The latest point shared by `(ba, ea)` and `(bb, eb)` — their merge base:
     /// the branch nearest both where their histories last coincided, at the lesser
     /// of the two editions there. `None` only if the two points are in disjoint
