@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use grmpl_core::{
-    Authority, DomainId, Entity, NoSchemas, RelId, Scope, TraceStore, Tuple, Value,
+    Authority, DomainId, Entity, NoSchemas, RelId, Scope, Tuple, Value,
 };
 use grmpl_lang::ast::MatchOp;
 use grmpl_lang::behavior::{decode_behavior, encode_behavior};
@@ -31,7 +31,6 @@ use grmpl_lang::{
 };
 use grmpl_diff::Snapshot;
 use grmpl_proc::commit_patch;
-use grmpl_store::FjallStore;
 
 /// Deterministic, seedable xorshift64\* — the crate-wide test idiom (no external
 /// `rand`/`proptest`). Identical math to `grmpl-store/tests/determinism.rs`.
@@ -218,135 +217,140 @@ fn model_select(
 
 #[test]
 fn dispatch_matches_model_under_random_churn() {
-    // A fixed pool of distinct behaviors, each guarding a message tag (plus one
-    // match-all). Their stored bytes give the deterministic selection order.
-    let tags = ["a", "b", "c"];
-    let pool: Vec<(StoredBehavior, Value)> = {
-        let mut v: Vec<StoredBehavior> = tags
-            .iter()
-            .map(|t| {
-                StoredBehavior::new(
-                    PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(Value::text(*t))),
-                    vec![Word::SelfEntity, Word::Assert("greeted".into())],
-                )
-            })
-            .collect();
-        v.push(StoredBehavior::new(PredExpr::And(vec![]), vec![Word::Drop]));
-        v.into_iter().map(|b| (b.clone(), b.to_value())).collect()
-    };
-    let messages: Vec<Tuple> =
-        tags.iter().map(|t| Tuple::from([Value::text(*t)])).chain([Tuple::from([Value::text("z")])]).collect();
+    grmpl_conformance::for_each_store(|c| {
+        // A fixed pool of distinct behaviors, each guarding a message tag (plus one
+        // match-all). Their stored bytes give the deterministic selection order.
+        let tags = ["a", "b", "c"];
+        let pool: Vec<(StoredBehavior, Value)> = {
+            let mut v: Vec<StoredBehavior> = tags
+                .iter()
+                .map(|t| {
+                    StoredBehavior::new(
+                        PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(Value::text(*t))),
+                        vec![Word::SelfEntity, Word::Assert("greeted".into())],
+                    )
+                })
+                .collect();
+            v.push(StoredBehavior::new(PredExpr::And(vec![]), vec![Word::Drop]));
+            v.into_iter().map(|b| (b.clone(), b.to_value())).collect()
+        };
+        let messages: Vec<Tuple> =
+            tags.iter().map(|t| Tuple::from([Value::text(*t)])).chain([Tuple::from([Value::text("z")])]).collect();
 
-    const NE: u64 = 5;
-    // Declares the relation a selected body names (`greeted`); compiled once.
-    // `direct_behavior`/`prototype` are read by RelId, not name.
-    let prog = Program::compile("rel greeted(who)", 100).unwrap();
+        const NE: u64 = 5;
+        // Declares the relation a selected body names (`greeted`); compiled once.
+        // `direct_behavior`/`prototype` are read by RelId, not name.
+        let prog = Program::compile("rel greeted(who)", 100).unwrap();
 
-    for seed in 1..=24u64 {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
-        let mut rng = Rng::new(seed);
-        let mut direct: HashSet<(u64, usize)> = HashSet::new();
-        let mut proto: HashSet<(u64, u64)> = HashSet::new();
+        for seed in 1..=24u64 {
+            // A fresh store of the same substrate each round: behaviors committed
+            // by an earlier seed would otherwise still be dispatchable.
+            let sib = c.sibling();
+            let store = sib.store();
+            let mut rng = Rng::new(seed);
+            let mut direct: HashSet<(u64, usize)> = HashSet::new();
+            let mut proto: HashSet<(u64, u64)> = HashSet::new();
 
-        let rounds = 20 + rng.below(25);
-        for _ in 0..rounds {
-            // A batch of random toggles keeps row weights in {0,1} so the store's
-            // consolidated read equals the model set exactly.
-            let mut batch: Vec<(RelId, Tuple, i64)> = Vec::new();
-            let edits = 1 + rng.below(4);
-            for _ in 0..edits {
-                if rng.bool() {
-                    let e = rng.below(NE);
-                    let bidx = rng.below(pool.len() as u64) as usize;
-                    let row = (e, bidx);
-                    let diff = if direct.remove(&row) { -1 } else { direct.insert(row); 1 };
-                    batch.push((DIRECT, Tuple::from([Value::Ent(Entity(e)), pool[bidx].1.clone()]), diff));
-                } else {
-                    let e = rng.below(NE);
-                    let p = rng.below(NE);
-                    let row = (e, p);
-                    let diff = if proto.remove(&row) { -1 } else { proto.insert(row); 1 };
-                    batch.push((PROTO, Tuple::from([Value::Ent(Entity(e)), Value::Ent(Entity(p))]), diff));
+            let rounds = 20 + rng.below(25);
+            for _ in 0..rounds {
+                // A batch of random toggles keeps row weights in {0,1} so the store's
+                // consolidated read equals the model set exactly.
+                let mut batch: Vec<(RelId, Tuple, i64)> = Vec::new();
+                let edits = 1 + rng.below(4);
+                for _ in 0..edits {
+                    if rng.bool() {
+                        let e = rng.below(NE);
+                        let bidx = rng.below(pool.len() as u64) as usize;
+                        let row = (e, bidx);
+                        let diff = if direct.remove(&row) { -1 } else { direct.insert(row); 1 };
+                        batch.push((DIRECT, Tuple::from([Value::Ent(Entity(e)), pool[bidx].1.clone()]), diff));
+                    } else {
+                        let e = rng.below(NE);
+                        let p = rng.below(NE);
+                        let row = (e, p);
+                        let diff = if proto.remove(&row) { -1 } else { proto.insert(row); 1 };
+                        batch.push((PROTO, Tuple::from([Value::Ent(Entity(e)), Value::Ent(Entity(p))]), diff));
+                    }
                 }
-            }
-            let ed = store.commit(&batch).unwrap();
-            let snap = Snapshot::new(&store, ed);
+                let ed = store.commit(&batch).unwrap();
+                let snap = Snapshot::new(store, ed);
 
-            for e in 0..NE {
-                for msg in &messages {
-                    let want = model_select(&direct, &proto, &pool, e, msg);
-                    let got = select_behavior(DIRECT, PROTO, Entity(e), &snap, msg).unwrap();
-                    assert_eq!(
-                        got, want,
-                        "seed {seed}: dispatch selection disagrees for entity {e}, msg {msg:?}"
-                    );
+                for e in 0..NE {
+                    for msg in &messages {
+                        let want = model_select(&direct, &proto, &pool, e, msg);
+                        let got = select_behavior(DIRECT, PROTO, Entity(e), &snap, msg).unwrap();
+                        assert_eq!(
+                            got, want,
+                            "seed {seed}: dispatch selection disagrees for entity {e}, msg {msg:?}"
+                        );
 
-                    // dispatch() runs iff a behavior was selected; the two agree
-                    // on *whether* something fires.
-                    let ran = dispatch(&prog, DIRECT, PROTO, Entity(e), &snap, msg).unwrap();
-                    assert_eq!(
-                        ran.is_some(),
-                        want.is_some(),
-                        "seed {seed}: dispatch fired ≠ selected for entity {e}, msg {msg:?}"
-                    );
+                        // dispatch() runs iff a behavior was selected; the two agree
+                        // on *whether* something fires.
+                        let ran = dispatch(&prog, DIRECT, PROTO, Entity(e), &snap, msg).unwrap();
+                        assert_eq!(
+                            ran.is_some(),
+                            want.is_some(),
+                            "seed {seed}: dispatch fired ≠ selected for entity {e}, msg {msg:?}"
+                        );
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 // ---- Fixed witness: live redefinition through a prototype ----------------
 
 #[test]
 fn live_redefinition_through_prototype() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    let prog = Program::compile(
-        "rel direct_behavior(entity, code)\nrel prototype(entity, parent)\nrel greeted(who)\nrel waved(who)",
-        1,
-    )
-    .unwrap();
-    let direct = prog.rel_id("direct_behavior").unwrap();
-    let proto = prog.rel_id("prototype").unwrap();
-    let greeted = prog.rel_id("greeted").unwrap();
-    let waved = prog.rel_id("waved").unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let prog = Program::compile(
+            "rel direct_behavior(entity, code)\nrel prototype(entity, parent)\nrel greeted(who)\nrel waved(who)",
+            1,
+        )
+        .unwrap();
+        let direct = prog.rel_id("direct_behavior").unwrap();
+        let proto = prog.rel_id("prototype").unwrap();
+        let greeted = prog.rel_id("greeted").unwrap();
+        let waved = prog.rel_id("waved").unwrap();
 
-    let auth = Authority::new(
-        DomainId(1),
-        vec![Scope::whole(direct), Scope::whole(proto), Scope::whole(greeted), Scope::whole(waved)],
-    );
-    let player = Entity(10);
-    let avatar = Entity(20);
-    let msg = Tuple::from([]);
+        let auth = Authority::new(
+            DomainId(1),
+            vec![Scope::whole(direct), Scope::whole(proto), Scope::whole(greeted), Scope::whole(waved)],
+        );
+        let player = Entity(10);
+        let avatar = Entity(20);
+        let msg = Tuple::from([]);
 
-    // A behavior that greets, and one that waves — both stored as data.
-    let greet = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("greeted".into())]);
-    let wave = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("waved".into())]);
+        // A behavior that greets, and one that waves — both stored as data.
+        let greet = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("greeted".into())]);
+        let wave = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("waved".into())]);
 
-    // Install: player inherits from avatar, avatar directly has `greet`.
-    let install = grmpl_core::Patch::new()
-        .assert(grmpl_core::Fact::new(proto, Tuple::from([Value::Ent(player), Value::Ent(avatar)])))
-        .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])));
-    commit_patch(&store, &NoSchemas, &install, &auth).unwrap();
+        // Install: player inherits from avatar, avatar directly has `greet`.
+        let install = grmpl_core::Patch::new()
+            .assert(grmpl_core::Fact::new(proto, Tuple::from([Value::Ent(player), Value::Ent(avatar)])))
+            .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])));
+        commit_patch(store, &NoSchemas, &install, &auth).unwrap();
 
-    // The player dispatches the *inherited* behavior via the implements view.
-    let snap = Snapshot::at_current(&store);
-    let behaviors = implemented_behaviors(direct, proto, player, &snap).unwrap();
-    assert_eq!(behaviors, vec![greet.clone()], "player must inherit avatar's behavior");
-    let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
-    assert_eq!(patch.asserts.len(), 1);
-    assert_eq!(patch.asserts[0].rel, greeted, "inherited dispatch greets");
+        // The player dispatches the *inherited* behavior via the implements view.
+        let snap = Snapshot::at_current(store);
+        let behaviors = implemented_behaviors(direct, proto, player, &snap).unwrap();
+        assert_eq!(behaviors, vec![greet.clone()], "player must inherit avatar's behavior");
+        let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
+        assert_eq!(patch.asserts.len(), 1);
+        assert_eq!(patch.asserts[0].rel, greeted, "inherited dispatch greets");
 
-    // Redefine the prototype's behavior with an *ordinary Patch* — no new
-    // mechanism. The next dispatch through the same player follows immediately.
-    let redefine = grmpl_core::Patch::new()
-        .retract(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])))
-        .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), wave.to_value()])));
-    commit_patch(&store, &NoSchemas, &redefine, &auth).unwrap();
+        // Redefine the prototype's behavior with an *ordinary Patch* — no new
+        // mechanism. The next dispatch through the same player follows immediately.
+        let redefine = grmpl_core::Patch::new()
+            .retract(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])))
+            .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), wave.to_value()])));
+        commit_patch(store, &NoSchemas, &redefine, &auth).unwrap();
 
-    let snap = Snapshot::at_current(&store);
-    let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
-    assert_eq!(patch.asserts.len(), 1);
-    assert_eq!(patch.asserts[0].rel, waved, "after redefinition, dispatch waves — live code");
+        let snap = Snapshot::at_current(store);
+        let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
+        assert_eq!(patch.asserts.len(), 1);
+        assert_eq!(patch.asserts[0].rel, waved, "after redefinition, dispatch waves — live code");
+    });
 }

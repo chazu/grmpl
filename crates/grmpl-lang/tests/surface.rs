@@ -7,7 +7,6 @@ use std::sync::Arc;
 use grmpl_core::{Diff, Entity, TraceStore, Tuple, Value};
 use grmpl_diff::Snapshot;
 use grmpl_lang::Program;
-use grmpl_store::FjallStore;
 
 const SRC: &str = r#"
     // relations
@@ -40,44 +39,45 @@ fn e(x: Entity) -> Value {
     Value::Ent(x)
 }
 
-fn find_sorted(q: &grmpl_diff::Query, store: &FjallStore) -> Vec<(Tuple, Diff)> {
+fn find_sorted(q: &grmpl_diff::Query, store: &dyn TraceStore) -> Vec<(Tuple, Diff)> {
     q.find(&Snapshot::at_current(store)).unwrap()
 }
 
 #[test]
 fn view_compiles_to_a_relational_query() {
-    let prog = Program::compile(SRC, 1).unwrap();
-    let located = prog.rel_id("located").unwrap();
-    let named = prog.rel_id("named").unwrap();
-    let permits = prog.rel_id("permits").unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        let prog = Program::compile(SRC, 1).unwrap();
+        let located = prog.rel_id("located").unwrap();
+        let named = prog.rel_id("named").unwrap();
+        let permits = prog.rel_id("permits").unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    store
-        .commit(&[
-            (located, Tuple::from([e(LAMP), e(ROOM)]), 1),
-            (located, Tuple::from([e(P), e(ROOM)]), 1),
-            (located, Tuple::from([e(Q), e(ROOM)]), 1),
-            (named, Tuple::from([e(LAMP), Value::text("brass lamp")]), 1),
-            // Only Q is permitted to see the lamp.
-            (permits, Tuple::from([e(Q), Value::text("see"), e(LAMP)]), 1),
-        ])
-        .unwrap();
+        let store = c.store();
+        store
+            .commit(&[
+                (located, Tuple::from([e(LAMP), e(ROOM)]), 1),
+                (located, Tuple::from([e(P), e(ROOM)]), 1),
+                (located, Tuple::from([e(Q), e(ROOM)]), 1),
+                (named, Tuple::from([e(LAMP), Value::text("brass lamp")]), 1),
+                // Only Q is permitted to see the lamp.
+                (permits, Tuple::from([e(Q), Value::text("see"), e(LAMP)]), 1),
+            ])
+            .unwrap();
 
-    // visible(Q) yields the lamp with its name.
-    let vis_q = prog.view("visible", &[e(Q)]).unwrap();
-    assert_eq!(
-        find_sorted(&vis_q, &store),
-        vec![(Tuple::from([e(LAMP), Value::text("brass lamp")]), 1)]
-    );
+        // visible(Q) yields the lamp with its name.
+        let vis_q = prog.view("visible", &[e(Q)]).unwrap();
+        assert_eq!(
+            find_sorted(&vis_q, store),
+            vec![(Tuple::from([e(LAMP), Value::text("brass lamp")]), 1)]
+        );
 
-    // visible(P) is empty — P has no `see` permission (parameter + literal filter).
-    let vis_p = prog.view("visible", &[e(P)]).unwrap();
-    assert!(find_sorted(&vis_p, &store).is_empty());
+        // visible(P) is empty — P has no `see` permission (parameter + literal filter).
+        let vis_p = prog.view("visible", &[e(P)]).unwrap();
+        assert!(find_sorted(&vis_p, store).is_empty());
 
-    // Remove the lamp from the room: the recursive-free join now yields nothing.
-    store.commit(&[(located, Tuple::from([e(LAMP), e(ROOM)]), -1)]).unwrap();
-    assert!(find_sorted(&vis_q, &store).is_empty());
+        // Remove the lamp from the room: the recursive-free join now yields nothing.
+        store.commit(&[(located, Tuple::from([e(LAMP), e(ROOM)]), -1)]).unwrap();
+        assert!(find_sorted(&vis_q, store).is_empty());
+    });
 }
 
 #[test]

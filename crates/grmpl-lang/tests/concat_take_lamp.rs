@@ -15,11 +15,10 @@ use std::sync::Arc;
 
 use grmpl_core::NoSchemas;
 use grmpl_core::{
-    Authority, Diff, DomainId, EditionStore, Entity, RelId, Scope, TraceStore, Tuple, Value,
+    Authority, Diff, DomainId, Entity, RelId, Scope, TraceStore, Tuple, Value,
 };
 use grmpl_lang::Program;
 use grmpl_proc::{enqueue, CommitOutcome, Process};
-use grmpl_store::FjallStore;
 
 /// Shared preamble: relations, the `visible` view, and the `command` form. Both
 /// programs below embed this verbatim — the point-free change is confined to the
@@ -124,7 +123,7 @@ impl World {
 /// Compile `src`, seed the identical starting world, enqueue `take lamp`, and
 /// run one step of the player process. Returns the world and store so the
 /// caller can read the resulting editions.
-fn run(src: &str) -> (World, FjallStore, tempfile::TempDir) {
+fn run(store: &dyn TraceStore, src: &str) -> World {
     let prog = Arc::new(Program::compile(src, 1).unwrap());
     let rid = |n: &str| prog.rel_id(n).unwrap();
     let w = World {
@@ -137,8 +136,6 @@ fn run(src: &str) -> (World, FjallStore, tempfile::TempDir) {
         cursor: rid("cursor"),
         prog,
     };
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
     store
         .commit(&[
             (w.located, Tuple::from([e(LAMP), e(ROOM)]), 1),
@@ -149,7 +146,7 @@ fn run(src: &str) -> (World, FjallStore, tempfile::TempDir) {
         .unwrap();
 
     enqueue(
-        &store,
+        store,
         w.inbox,
         PLAYER,
         0,
@@ -172,13 +169,13 @@ fn run(src: &str) -> (World, FjallStore, tempfile::TempDir) {
         cursor_rel: w.cursor,
         behavior,
     };
-    let outcome = player.step(&store, &NoSchemas).unwrap();
+    let outcome = player.step(store, &NoSchemas).unwrap();
     assert!(matches!(outcome, Some(CommitOutcome::Committed(_))));
 
-    (w, store, dir)
+    w
 }
 
-fn snapshot(w: &World, store: &FjallStore) -> Vec<(RelId, Vec<(Tuple, Diff)>)> {
+fn snapshot(w: &World, store: &dyn TraceStore) -> Vec<(RelId, Vec<(Tuple, Diff)>)> {
     let cur = store.current();
     w.rels()
         .into_iter()
@@ -188,93 +185,100 @@ fn snapshot(w: &World, store: &FjallStore) -> Vec<(RelId, Vec<(Tuple, Diff)>)> {
 
 #[test]
 fn concatenative_take_lamp_matches_v1_editions() {
-    let (wc, sc, _dc) = run(&concat_src());
-    let (wv, sv, _dv) = run(&v1_src());
+    grmpl_conformance::for_each_store(|c| {
+        let sc_case = c.sibling();
+        let sc = sc_case.store();
+        let wc = run(sc, &concat_src());
+        let sv_case = c.sibling();
+        let sv = sv_case.store();
+        let wv = run(sv, &v1_src());
 
-    // Same commit clock: the concatenative handler allocated exactly the
-    // editions the statement handler did.
-    assert_eq!(sc.current(), sv.current());
+        // Same commit clock: the concatenative handler allocated exactly the
+        // editions the statement handler did.
+        assert_eq!(sc.current(), sv.current());
 
-    // Same world, relation by relation: the lamp left the room, the player
-    // holds it, and "Taken." was told — identical facts at identical editions.
-    assert_eq!(snapshot(&wc, &sc), snapshot(&wv, &sv));
+        // Same world, relation by relation: the lamp left the room, the player
+        // holds it, and "Taken." was told — identical facts at identical editions.
+        assert_eq!(snapshot(&wc, sc), snapshot(&wv, sv));
 
-    // And spot-check the actual outcome, so a doubly-empty world can't pass.
-    let cur = sc.current();
-    assert_eq!(
-        sc.read_at(wc.held, cur).unwrap(),
-        vec![(Tuple::from([e(PLAYER), e(LAMP)]), 1)]
-    );
-    assert_eq!(
-        sc.read_at(wc.tell, cur).unwrap(),
-        vec![(Tuple::from([e(PLAYER), Value::text("Taken.")]), 1)]
-    );
-    assert!(!sc
-        .read_at(wc.located, cur)
-        .unwrap()
-        .into_iter()
-        .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
+        // And spot-check the actual outcome, so a doubly-empty world can't pass.
+        let cur = sc.current();
+        assert_eq!(
+            sc.read_at(wc.held, cur).unwrap(),
+            vec![(Tuple::from([e(PLAYER), e(LAMP)]), 1)]
+        );
+        assert_eq!(
+            sc.read_at(wc.tell, cur).unwrap(),
+            vec![(Tuple::from([e(PLAYER), Value::text("Taken.")]), 1)]
+        );
+        assert!(!sc
+            .read_at(wc.located, cur)
+            .unwrap()
+            .into_iter()
+            .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
+    });
 }
 
 #[test]
 fn concatenative_absent_thing_makes_no_change() {
-    // A `resolve` miss aborts the point-free arm with no change, exactly as the
-    // statement surface does.
-    let prog = Arc::new(Program::compile(&concat_src(), 1).unwrap());
-    let rid = |n: &str| prog.rel_id(n).unwrap();
-    let (located, held, tell, inbox, cursor) = (
-        rid("located"),
-        rid("held"),
-        rid("tell"),
-        rid("inbox"),
-        rid("cursor"),
-    );
-    let named = rid("named");
-    let permits = rid("permits");
+    grmpl_conformance::for_each_store(|c| {
+        // A `resolve` miss aborts the point-free arm with no change, exactly as the
+        // statement surface does.
+        let prog = Arc::new(Program::compile(&concat_src(), 1).unwrap());
+        let rid = |n: &str| prog.rel_id(n).unwrap();
+        let (located, held, tell, inbox, cursor) = (
+            rid("located"),
+            rid("held"),
+            rid("tell"),
+            rid("inbox"),
+            rid("cursor"),
+        );
+        let named = rid("named");
+        let permits = rid("permits");
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    store
-        .commit(&[
-            (located, Tuple::from([e(LAMP), e(ROOM)]), 1),
-            (located, Tuple::from([e(PLAYER), e(ROOM)]), 1),
-            (named, Tuple::from([e(LAMP), Value::text("brass lamp")]), 1),
-            (permits, Tuple::from([e(PLAYER), Value::text("see"), e(LAMP)]), 1),
-        ])
+        let store = c.store();
+        store
+            .commit(&[
+                (located, Tuple::from([e(LAMP), e(ROOM)]), 1),
+                (located, Tuple::from([e(PLAYER), e(ROOM)]), 1),
+                (named, Tuple::from([e(LAMP), Value::text("brass lamp")]), 1),
+                (permits, Tuple::from([e(PLAYER), Value::text("see"), e(LAMP)]), 1),
+            ])
+            .unwrap();
+        enqueue(
+            store,
+            inbox,
+            PLAYER,
+            0,
+            Tuple::from([Value::text("take"), Value::text("sword")]),
+        )
         .unwrap();
-    enqueue(
-        &store,
-        inbox,
-        PLAYER,
-        0,
-        Tuple::from([Value::text("take"), Value::text("sword")]),
-    )
-    .unwrap();
 
-    let behavior = Program::behavior(&prog, "inbox", PLAYER).unwrap();
-    let player = Process {
-        entity: PLAYER,
-        authority: Authority::new(
-            DomainId(1),
-            vec![Scope::whole(located), Scope::whole(held), Scope::whole(cursor)],
-        ),
-        inbox,
-        cursor_rel: cursor,
-        behavior,
-    };
-    player.step(&store, &NoSchemas).unwrap();
+        let behavior = Program::behavior(&prog, "inbox", PLAYER).unwrap();
+        let player = Process {
+            entity: PLAYER,
+            authority: Authority::new(
+                DomainId(1),
+                vec![Scope::whole(located), Scope::whole(held), Scope::whole(cursor)],
+            ),
+            inbox,
+            cursor_rel: cursor,
+            behavior,
+        };
+        player.step(store, &NoSchemas).unwrap();
 
-    let cur = store.current();
-    // Lamp untouched, nothing held or told.
-    assert!(store
-        .read_at(located, cur)
-        .unwrap()
-        .into_iter()
-        .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
-    assert!(store.read_at(held, cur).unwrap().is_empty());
-    assert!(store.read_at(tell, cur).unwrap().is_empty());
-    // The message was still consumed — re-stepping is idle.
-    assert!(player.step(&store, &NoSchemas).unwrap().is_none());
+        let cur = store.current();
+        // Lamp untouched, nothing held or told.
+        assert!(store
+            .read_at(located, cur)
+            .unwrap()
+            .into_iter()
+            .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
+        assert!(store.read_at(held, cur).unwrap().is_empty());
+        assert!(store.read_at(tell, cur).unwrap().is_empty());
+        // The message was still consumed — re-stepping is idle.
+        assert!(player.step(store, &NoSchemas).unwrap().is_none());
+    });
 }
 
 // --- Randomized-churn law oracle ---------------------------------------------
@@ -346,10 +350,11 @@ const NAMES: [&str; 4] = ["brass lamp", "iron sword", "gold coin", "silver key"]
 const NOUNS: [&str; 5] = ["lamp", "sword", "coin", "key", "gem"];
 
 /// Compile `src` and open a fresh empty store, without seeding or enqueuing.
-fn compile_world(src: &str) -> (World, FjallStore, tempfile::TempDir) {
+fn compile_world(_store: &dyn TraceStore, src: &str) -> World {
     let prog = Arc::new(Program::compile(src, 1).unwrap());
     let rid = |n: &str| prog.rel_id(n).unwrap();
-    let w = World {
+    
+    World {
         located: rid("located"),
         named: rid("named"),
         permits: rid("permits"),
@@ -358,10 +363,7 @@ fn compile_world(src: &str) -> (World, FjallStore, tempfile::TempDir) {
         inbox: rid("inbox"),
         cursor: rid("cursor"),
         prog,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    (w, store, dir)
+    }
 }
 
 /// The `PLAYER` process for `w`, owning exactly the relations the take-lamp
@@ -431,7 +433,7 @@ fn gen_messages(rng: &mut Rng) -> Vec<Tuple> {
 }
 
 /// Commit `spec` to `store`, resolving each relation name against `w`.
-fn commit_world(w: &World, store: &FjallStore, spec: &[(R, Tuple)]) {
+fn commit_world(w: &World, store: &dyn TraceStore, spec: &[(R, Tuple)]) {
     let batch: Vec<(RelId, Tuple, Diff)> =
         spec.iter().map(|(r, t)| (r.rel(w), t.clone(), 1)).collect();
     store.commit(&batch).unwrap();
@@ -441,9 +443,9 @@ fn commit_world(w: &World, store: &FjallStore, spec: &[(R, Tuple)]) {
 fn assert_lockstep(
     seed: u64,
     wc: &World,
-    sc: &FjallStore,
+    sc: &dyn TraceStore,
     wv: &World,
-    sv: &FjallStore,
+    sv: &dyn TraceStore,
     at: &str,
 ) {
     assert_eq!(
@@ -460,38 +462,42 @@ fn assert_lockstep(
 
 /// One churn round: returns how many `take`s actually changed `held` (an
 /// anti-vacuity signal — the world/messages must exercise the effect seam).
-fn surface_churn_round(seed: u64) -> u64 {
+fn surface_churn_round(c: &grmpl_conformance::Case, seed: u64) -> u64 {
     let mut rng = Rng::new(seed);
-    let (wc, sc, _dc) = compile_world(&concat_src());
-    let (wv, sv, _dv) = compile_world(&v1_src());
+    let sc_case = c.sibling();
+    let sc = sc_case.store();
+    let wc = compile_world(sc, &concat_src());
+    let sv_case = c.sibling();
+    let sv = sv_case.store();
+    let wv = compile_world(sv, &v1_src());
     let pc = make_process(&wc);
     let pv = make_process(&wv);
 
     // Identical random starting world, committed to both stores.
     let world = gen_world(&mut rng);
-    commit_world(&wc, &sc, &world);
-    commit_world(&wv, &sv, &world);
-    assert_lockstep(seed, &wc, &sc, &wv, &sv, "after world seed");
+    commit_world(&wc, sc, &world);
+    commit_world(&wv, sv, &world);
+    assert_lockstep(seed, &wc, sc, &wv, sv, "after world seed");
 
     // Identical random message stream, stepped in lockstep.
     let msgs = gen_messages(&mut rng);
     let mut changed = 0u64;
     for (i, body) in msgs.into_iter().enumerate() {
         let seq = i as i64;
-        enqueue(&sc, wc.inbox, PLAYER, seq, body.clone()).unwrap();
-        enqueue(&sv, wv.inbox, PLAYER, seq, body.clone()).unwrap();
-        assert_lockstep(seed, &wc, &sc, &wv, &sv, "after enqueue");
+        enqueue(sc, wc.inbox, PLAYER, seq, body.clone()).unwrap();
+        enqueue(sv, wv.inbox, PLAYER, seq, body.clone()).unwrap();
+        assert_lockstep(seed, &wc, sc, &wv, sv, "after enqueue");
 
         let held_before = sc.read_at(wc.held, sc.current()).unwrap();
-        let oc = pc.step(&sc, &NoSchemas).unwrap();
-        let ov = pv.step(&sv, &NoSchemas).unwrap();
+        let oc = pc.step(sc, &NoSchemas).unwrap();
+        let ov = pv.step(sv, &NoSchemas).unwrap();
         // Both surfaces make the identical scheduling decision.
         assert!(
             matches!(oc, Some(CommitOutcome::Committed(_)))
                 && matches!(ov, Some(CommitOutcome::Committed(_))),
             "seed {seed}: step {i} did not commit on both surfaces (concat={oc:?}, v1={ov:?})"
         );
-        assert_lockstep(seed, &wc, &sc, &wv, &sv, "after step");
+        assert_lockstep(seed, &wc, sc, &wv, sv, "after step");
 
         let held_after = sc.read_at(wc.held, sc.current()).unwrap();
         if held_after != held_before {
@@ -503,9 +509,10 @@ fn surface_churn_round(seed: u64) -> u64 {
 
 #[test]
 fn concatenative_matches_v1_editions_under_random_churn() {
+    grmpl_conformance::for_each_store(|c| {
     let mut takes_changed_held = 0u64;
     for seed in 1..=24u64 {
-        takes_changed_held += surface_churn_round(seed);
+        takes_changed_held += surface_churn_round(c, seed);
     }
     // Guard against a vacuous pass: across 24 seeds, some `take` must have
     // actually retracted a thing and asserted `held`, so the effect seam — the
@@ -514,4 +521,5 @@ fn concatenative_matches_v1_editions_under_random_churn() {
         takes_changed_held > 0,
         "vacuous oracle: no take ever changed `held` across all seeds"
     );
+    });
 }

@@ -6,12 +6,11 @@
 use std::sync::Arc;
 
 use grmpl_core::{
-    Authority, DomainId, EditionStore, Entity, RelId, Scope, TraceStore, Tuple, Value,
+    Authority, DomainId, Entity, RelId, Scope, TraceStore, Tuple, Value,
 };
 use grmpl_core::NoSchemas;
 use grmpl_lang::Program;
 use grmpl_proc::{enqueue, CommitOutcome, Process};
-use grmpl_store::FjallStore;
 
 const SRC: &str = r#"
     rel located(thing, place)
@@ -66,7 +65,7 @@ struct World {
     cursor: RelId,
 }
 
-fn setup() -> (World, FjallStore, tempfile::TempDir) {
+fn setup(store: &dyn TraceStore) -> World {
     let prog = Arc::new(Program::compile(SRC, 1).unwrap());
     let rid = |n: &str| prog.rel_id(n).unwrap();
     let w = World {
@@ -79,8 +78,6 @@ fn setup() -> (World, FjallStore, tempfile::TempDir) {
         cursor: rid("cursor"),
         prog,
     };
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
     store
         .commit(&[
             (w.located, Tuple::from([e(LAMP), e(ROOM)]), 1),
@@ -89,7 +86,7 @@ fn setup() -> (World, FjallStore, tempfile::TempDir) {
             (w.permits, Tuple::from([e(PLAYER), Value::text("see"), e(LAMP)]), 1),
         ])
         .unwrap();
-    (w, store, dir)
+    w
 }
 
 fn player_process(w: &World) -> Process {
@@ -108,44 +105,50 @@ fn player_process(w: &World) -> Process {
 
 #[test]
 fn take_lamp_defined_entirely_in_text() {
-    let (w, store, _dir) = setup();
-    enqueue(&store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("lamp")])).unwrap();
+    grmpl_conformance::for_each_store(|c| {
+    let store = c.store();
+        let w = setup(store);
+        enqueue(store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("lamp")])).unwrap();
 
-    let player = player_process(&w);
-    let outcome = player.step(&store, &NoSchemas).unwrap();
-    assert!(matches!(outcome, Some(CommitOutcome::Committed(_))));
+        let player = player_process(&w);
+        let outcome = player.step(store, &NoSchemas).unwrap();
+        assert!(matches!(outcome, Some(CommitOutcome::Committed(_))));
 
-    let cur = store.current();
-    // Lamp left the room, player holds it, "Taken." was told — all from text.
-    assert!(!store
-        .read_at(w.located, cur)
-        .unwrap()
-        .into_iter()
-        .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
-    assert_eq!(store.read_at(w.held, cur).unwrap(), vec![(Tuple::from([e(PLAYER), e(LAMP)]), 1)]);
-    assert_eq!(
-        store.read_at(w.tell, cur).unwrap(),
-        vec![(Tuple::from([e(PLAYER), Value::text("Taken.")]), 1)]
-    );
+        let cur = store.current();
+        // Lamp left the room, player holds it, "Taken." was told — all from text.
+        assert!(!store
+            .read_at(w.located, cur)
+            .unwrap()
+            .into_iter()
+            .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
+        assert_eq!(store.read_at(w.held, cur).unwrap(), vec![(Tuple::from([e(PLAYER), e(LAMP)]), 1)]);
+        assert_eq!(
+            store.read_at(w.tell, cur).unwrap(),
+            vec![(Tuple::from([e(PLAYER), Value::text("Taken.")]), 1)]
+        );
+    });
 }
 
 #[test]
 fn taking_absent_thing_makes_no_change() {
-    let (w, store, _dir) = setup();
-    enqueue(&store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("sword")])).unwrap();
+    grmpl_conformance::for_each_store(|c| {
+    let store = c.store();
+        let w = setup(store);
+        enqueue(store, w.inbox, PLAYER, 0, Tuple::from([Value::text("take"), Value::text("sword")])).unwrap();
 
-    let player = player_process(&w);
-    player.step(&store, &NoSchemas).unwrap();
+        let player = player_process(&w);
+        player.step(store, &NoSchemas).unwrap();
 
-    let cur = store.current();
-    // The lamp is untouched; nothing was held or told (resolve found nothing).
-    assert!(store
-        .read_at(w.located, cur)
-        .unwrap()
-        .into_iter()
-        .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
-    assert!(store.read_at(w.held, cur).unwrap().is_empty());
-    assert!(store.read_at(w.tell, cur).unwrap().is_empty());
-    // But the message was consumed (cursor advanced), so re-stepping is idle.
-    assert!(player.step(&store, &NoSchemas).unwrap().is_none());
+        let cur = store.current();
+        // The lamp is untouched; nothing was held or told (resolve found nothing).
+        assert!(store
+            .read_at(w.located, cur)
+            .unwrap()
+            .into_iter()
+            .any(|(t, d)| d > 0 && t == Tuple::from([e(LAMP), e(ROOM)])));
+        assert!(store.read_at(w.held, cur).unwrap().is_empty());
+        assert!(store.read_at(w.tell, cur).unwrap().is_empty());
+        // But the message was consumed (cursor advanced), so re-stepping is idle.
+        assert!(player.step(store, &NoSchemas).unwrap().is_none());
+    });
 }

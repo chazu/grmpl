@@ -23,10 +23,9 @@
 //! dependency (mirrors grmpl-store's determinism.rs and grmpl-lang's
 //! catalog.rs); every assertion prints its `seed` so a failure replays.
 
-use grmpl_core::{Diff, Entity, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Entity, RelId, Tuple, Value};
 use grmpl_diff::{Query, Snapshot};
 use grmpl_lang::{NamedAgg, Program};
-use grmpl_store::FjallStore;
 
 fn ent(x: u64) -> Value {
     Value::Ent(Entity(x))
@@ -44,66 +43,68 @@ const TEAM_TOTALS: &str = r#"
 
 #[test]
 fn sum_yield_groups_and_folds() {
-    let prog = Program::compile(TEAM_TOTALS, 1).unwrap();
-    let score = prog.rel_id("score").unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        let prog = Program::compile(TEAM_TOTALS, 1).unwrap();
+        let score = prog.rel_id("score").unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    store
-        .commit(&[
-            (score, Tuple::from([ent(1), ent(10), Value::Int(3)]), 1),
-            (score, Tuple::from([ent(2), ent(10), Value::Int(5)]), 1),
-            (score, Tuple::from([ent(3), ent(20), Value::Int(7)]), 1),
-        ])
-        .unwrap();
+        let store = c.store();
+        store
+            .commit(&[
+                (score, Tuple::from([ent(1), ent(10), Value::Int(3)]), 1),
+                (score, Tuple::from([ent(2), ent(10), Value::Int(5)]), 1),
+                (score, Tuple::from([ent(3), ent(20), Value::Int(7)]), 1),
+            ])
+            .unwrap();
 
-    let q = prog.view("team_totals", &[]).unwrap();
-    assert_eq!(
-        q.find(&Snapshot::at_current(&store)).unwrap(),
-        vec![
-            (Tuple::from([ent(10), Value::Int(8)]), 1),
-            (Tuple::from([ent(20), Value::Int(7)]), 1),
-        ]
-    );
+        let q = prog.view("team_totals", &[]).unwrap();
+        assert_eq!(
+            q.find(&Snapshot::at_current(store)).unwrap(),
+            vec![
+                (Tuple::from([ent(10), Value::Int(8)]), 1),
+                (Tuple::from([ent(20), Value::Int(7)]), 1),
+            ]
+        );
+    });
 }
 
 #[test]
 fn count_yield_counts_distinct_projected_rows() {
-    // `count()` folds the size of each group *after* the view's `Distinct`, so
-    // it counts the distinct **projected** rows per group — exactly what the
-    // TKT-74 `NamedAgg::Count` surface does (set-semantics, see `reduce_view`).
-    //
-    // A subtle consequence worth pinning: because a `count()` yield adds no
-    // column of its own, the projection is just the grouping columns, so every
-    // group collapses to a single distinct row and the count is `1`. Counting
-    // the *rows* of a group would need a non-group column in the projection,
-    // which this set-valued surface cannot express — a faithful inheritance of
-    // the P2 reduce, not a defect of the grammar. (Recorded as a follow-on.)
-    let src = r#"
-        rel score(player: Ent, team: Ent, points: Int)
-        view roster() { score(p, t, pts) yield t, count() }
-    "#;
-    let prog = Program::compile(src, 1).unwrap();
-    let score = prog.rel_id("score").unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        // `count()` folds the size of each group *after* the view's `Distinct`, so
+        // it counts the distinct **projected** rows per group — exactly what the
+        // TKT-74 `NamedAgg::Count` surface does (set-semantics, see `reduce_view`).
+        //
+        // A subtle consequence worth pinning: because a `count()` yield adds no
+        // column of its own, the projection is just the grouping columns, so every
+        // group collapses to a single distinct row and the count is `1`. Counting
+        // the *rows* of a group would need a non-group column in the projection,
+        // which this set-valued surface cannot express — a faithful inheritance of
+        // the P2 reduce, not a defect of the grammar. (Recorded as a follow-on.)
+        let src = r#"
+            rel score(player: Ent, team: Ent, points: Int)
+            view roster() { score(p, t, pts) yield t, count() }
+        "#;
+        let prog = Program::compile(src, 1).unwrap();
+        let score = prog.rel_id("score").unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    store
-        .commit(&[
-            (score, Tuple::from([ent(1), ent(10), Value::Int(3)]), 1),
-            (score, Tuple::from([ent(2), ent(10), Value::Int(5)]), 1),
-            (score, Tuple::from([ent(3), ent(20), Value::Int(7)]), 1),
-        ])
-        .unwrap();
+        let store = c.store();
+        store
+            .commit(&[
+                (score, Tuple::from([ent(1), ent(10), Value::Int(3)]), 1),
+                (score, Tuple::from([ent(2), ent(10), Value::Int(5)]), 1),
+                (score, Tuple::from([ent(3), ent(20), Value::Int(7)]), 1),
+            ])
+            .unwrap();
 
-    let q = prog.view("roster", &[]).unwrap();
-    assert_eq!(
-        q.find(&Snapshot::at_current(&store)).unwrap(),
-        vec![
-            (Tuple::from([ent(10), Value::Int(1)]), 1),
-            (Tuple::from([ent(20), Value::Int(1)]), 1),
-        ]
-    );
+        let q = prog.view("roster", &[]).unwrap();
+        assert_eq!(
+            q.find(&Snapshot::at_current(store)).unwrap(),
+            vec![
+                (Tuple::from([ent(10), Value::Int(1)]), 1),
+                (Tuple::from([ent(20), Value::Int(1)]), 1),
+            ]
+        );
+    });
 }
 
 #[test]
@@ -168,29 +169,34 @@ fn choose_agg(rng: &mut Rng) -> (String, NamedAgg, Option<&'static str>) {
 /// edition), then materialize `q`. Committing in different orders is how the
 /// determinism sub-law is exercised: the result must not depend on it.
 fn find_committed(
+    case: &grmpl_conformance::Case,
     score: RelId,
     tuples: &[[Value; 4]],
     order: &[usize],
     q: &Query,
 ) -> Vec<(Tuple, Diff)> {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    // A fresh store of the same substrate: the whole point is that the result
+    // depends on the committed set, not on commit order or on leftovers.
+    let sib = case.sibling();
+    let store = sib.store();
     for &i in order {
         store
             .commit(&[(score, Tuple::from(tuples[i].clone()), 1)])
             .unwrap();
     }
-    q.find(&Snapshot::at_current(&store)).unwrap()
+    q.find(&Snapshot::at_current(store)).unwrap()
 }
 
 #[test]
 fn grammar_yield_equals_programmatic_reduce_under_random_churn() {
-    for seed in 1..=32u64 {
-        law_round(seed);
-    }
+    grmpl_conformance::for_each_store(|c| {
+        for seed in 1..=32u64 {
+            law_round(c, seed);
+        }
+    });
 }
 
-fn law_round(seed: u64) {
+fn law_round(case: &grmpl_conformance::Case, seed: u64) {
     let mut rng = Rng::new(seed);
 
     // Grouping columns: a non-empty subset of the two `Ent` variables, in a
@@ -247,9 +253,9 @@ fn law_round(seed: u64) {
     let fwd: Vec<usize> = (0..n).collect();
     let rev: Vec<usize> = (0..n).rev().collect();
 
-    let grammar_fwd = find_committed(score, &tuples, &fwd, &grammar_q);
-    let prog_fwd = find_committed(score, &tuples, &fwd, &prog_q);
-    let grammar_rev = find_committed(score, &tuples, &rev, &grammar_q);
+    let grammar_fwd = find_committed(case, score, &tuples, &fwd, &grammar_q);
+    let prog_fwd = find_committed(case, score, &tuples, &fwd, &prog_q);
+    let grammar_rev = find_committed(case, score, &tuples, &rev, &grammar_q);
 
     // (1) Grammar ≡ programmatic: the text surface lowers to the same reduce.
     assert_eq!(

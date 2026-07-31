@@ -164,6 +164,34 @@ pub fn fjall() -> Case {
     Case { name: "fjall", store: Arc::new(store), _dir: dir }
 }
 
+/// The **logical projection** of a store: for each relation, its raw updates in
+/// `(edition, submit_index)` order — the concatenation of
+/// `scan_updates(rel, ZERO, current)`.
+///
+/// This is the identity replay and fork must prove, and plan v4 §2 says so
+/// explicitly: identity is defined here and **not** over raw node bytes, because
+/// two substrates (and two tree shapes) legitimately lay the same world out
+/// differently — Gold guarantees content/version identity, never byte-identical
+/// node layout. `FjallStore::canonical_dump` compares physical keyspace bytes,
+/// which no other substrate can answer and which would fail across a rebalance
+/// even on one.
+///
+/// It is also the *stronger* statement in the way that matters: the projection
+/// keeps same-edition submit order, so it witnesses Determinism, where a dump
+/// re-sorted by `(tuple, diff)` would not.
+pub fn logical_dump(
+    store: &dyn TraceStore,
+    rels: &[grmpl_core::RelId],
+) -> grmpl_core::Result<Vec<(grmpl_core::RelId, Vec<grmpl_core::Update>)>> {
+    let current = store.current();
+    let from = store.watermark();
+    let mut out = Vec::with_capacity(rels.len());
+    for &rel in rels {
+        out.push((rel, store.scan_updates(rel, from, current)?));
+    }
+    Ok(out)
+}
+
 /// Run one law body against every substrate.
 ///
 /// ```ignore

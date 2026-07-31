@@ -31,13 +31,12 @@
 use std::collections::BTreeMap;
 
 use grmpl_core::{
-    Authority, DomainId, Edition, EditionStore, Entity, NoSchemas, RelId, Scope, TraceStore, Tuple,
+    Authority, DomainId, Edition, Entity, NoSchemas, RelId, Scope, TraceStore, Tuple,
     Value,
 };
 use grmpl_diff::{eval_snapshot, multiset, Query};
 use grmpl_lang::Program;
 use grmpl_proc::{decode_activation, CommitOutcome, OnWatch};
-use grmpl_store::FjallStore;
 
 const REL_BASE: u32 = 10;
 const WATCH: Entity = Entity(9); // cursor key
@@ -105,12 +104,8 @@ fn programmatic(w: &Wiring) -> OnWatch {
     }
 }
 
-fn store_at(path: &std::path::Path) -> FjallStore {
-    FjallStore::open(path).unwrap()
-}
-
 /// One world change to `base` — the "world" moving, outside the pump's authority.
-fn churn(store: &FjallStore, base: RelId, a: i64, b: i64, diff: i64) {
+fn churn(store: &dyn TraceStore, base: RelId, a: i64, b: i64, diff: i64) {
     store
         .commit(&[(base, Tuple::from([Value::Int(a), Value::Int(b)]), diff)])
         .unwrap();
@@ -118,7 +113,7 @@ fn churn(store: &FjallStore, base: RelId, a: i64, b: i64, diff: i64) {
 
 /// `TARGET`'s inbox activations sorted by seq: `(seq, diff, a)`. Every row must be
 /// weight-1 (exactly-once witness).
-fn activations(store: &FjallStore, inbox: RelId) -> Vec<(i64, i64, i64)> {
+fn activations(store: &dyn TraceStore, inbox: RelId) -> Vec<(i64, i64, i64)> {
     let at = store.current();
     let mut v: Vec<(i64, i64, i64)> = Vec::new();
     for (t, d) in store.read_at(inbox, at).unwrap() {
@@ -138,7 +133,7 @@ fn activations(store: &FjallStore, inbox: RelId) -> Vec<(i64, i64, i64)> {
 }
 
 /// The single live cursor edition for `WATCH`.
-fn cursor(store: &FjallStore, cursor_rel: RelId) -> Option<Edition> {
+fn cursor(store: &dyn TraceStore, cursor_rel: RelId) -> Option<Edition> {
     let at = store.current();
     let rows: Vec<i64> = store
         .read_at(cursor_rel, at)
@@ -156,7 +151,7 @@ fn cursor(store: &FjallStore, cursor_rel: RelId) -> Option<Edition> {
 
 /// The view result at `current` as `a -> weight` — the ground-truth
 /// `find(view, current)`.
-fn view_now(store: &FjallStore, base: RelId) -> BTreeMap<i64, i64> {
+fn view_now(store: &dyn TraceStore, base: RelId) -> BTreeMap<i64, i64> {
     let q = Query::rel(base).project([0]).distinct();
     let snap = eval_snapshot(&q, store, store.current()).unwrap();
     let mut m = BTreeMap::new();
@@ -214,9 +209,10 @@ struct Run {
 /// mode, then interleave random churn with pumps. The rand stream is a pure
 /// function of `seed`, and install issues the *same* one commit on both paths, so
 /// the two paths' commit sequences stay in lockstep and are directly comparable.
-fn run_path(seed: u64, including_current: bool, path: Path) -> Run {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store_at(dir.path());
+fn run_path(case: &grmpl_conformance::Case, seed: u64, including_current: bool, path: Path) -> Run {
+    // Fresh store of the same substrate: the run must be a function of the seed.
+    let sib = case.sibling();
+    let store = sib.store();
     let prog = compile(including_current);
     let w = wiring(&prog);
 
@@ -227,9 +223,9 @@ fn run_path(seed: u64, including_current: bool, path: Path) -> Run {
     for _ in 0..pre {
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
-        churn(&store, w.base, a, b, 1);
+        churn(store, w.base, a, b, 1);
     }
-    let initial = view_now(&store, w.base);
+    let initial = view_now(store, w.base);
 
     // Install the watcher via the path under test, then confirm it committed.
     let ow = match path {
@@ -241,7 +237,7 @@ fn run_path(seed: u64, including_current: bool, path: Path) -> Run {
                     WATCH,
                     TARGET,
                     authority(&w),
-                    &store,
+                    store,
                     &NoSchemas,
                 )
                 .unwrap();
@@ -251,9 +247,9 @@ fn run_path(seed: u64, including_current: bool, path: Path) -> Run {
         Path::Programmatic => {
             let ow = programmatic(&w);
             let outcome = if including_current {
-                ow.install_including_current(&store, &NoSchemas).unwrap()
+                ow.install_including_current(store, &NoSchemas).unwrap()
             } else {
-                ow.install(&store, &NoSchemas).unwrap()
+                ow.install(store, &NoSchemas).unwrap()
             };
             assert!(matches!(outcome, CommitOutcome::Committed(_)));
             ow
@@ -267,28 +263,29 @@ fn run_path(seed: u64, including_current: bool, path: Path) -> Run {
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
         let diff = if next_rand(&mut st).is_multiple_of(2) { 1 } else { -1 };
-        churn(&store, w.base, a, b, diff);
+        churn(store, w.base, a, b, diff);
         if !next_rand(&mut st).is_multiple_of(3) {
-            ow.pump(&store, &NoSchemas).unwrap();
+            ow.pump(store, &NoSchemas).unwrap();
         }
     }
     // Final drain, then confirm caught up.
-    ow.pump(&store, &NoSchemas).unwrap();
-    assert_eq!(ow.pump(&store, &NoSchemas).unwrap(), 0, "seed {seed}: not caught up");
+    ow.pump(store, &NoSchemas).unwrap();
+    assert_eq!(ow.pump(store, &NoSchemas).unwrap(), 0, "seed {seed}: not caught up");
 
     Run {
-        acts: activations(&store, w.inbox),
-        view_now: view_now(&store, w.base),
+        acts: activations(store, w.inbox),
+        view_now: view_now(store, w.base),
         initial,
-        cursor: cursor(&store, w.cursor),
+        cursor: cursor(store, w.cursor),
     }
 }
 
 /// The core law across a spread of seeds and *both* initial-delivery modes.
 fn oracle(including_current: bool) {
+    grmpl_conformance::for_each_store(|c| {
     for seed in 0..24u64 {
-        let g = run_path(seed, including_current, Path::Grammar);
-        let p = run_path(seed, including_current, Path::Programmatic);
+        let g = run_path(c, seed, including_current, Path::Grammar);
+        let p = run_path(c, seed, including_current, Path::Programmatic);
 
         // THE LAW: the grammar surface delivers the identical activation stream
         // (same seqs, same signed rows, same order) as the programmatic install.
@@ -328,6 +325,7 @@ fn oracle(including_current: bool) {
             );
         }
     }
+    });
 }
 
 #[test]
@@ -348,24 +346,25 @@ fn grammar_watch_equals_programmatic_skip_initial() {
 /// reopened `OnWatch` reads back the same cursor edition and is already caught up.
 #[test]
 fn watch_cursor_is_durable_across_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    grmpl_conformance::for_each_world(|world| {
     let prog = compile(false);
     let w = wiring(&prog);
 
     let (ow, cursor_before, acts_before) = {
-        let store = store_at(dir.path());
+        let store = world.open();
+        let store = store.as_ref();
         for i in 0..5 {
-            churn(&store, w.base, i, 0, 1);
+            churn(store, w.base, i, 0, 1);
         }
         let (ow, _) = prog
-            .install_watch("v", &[], WATCH, TARGET, authority(&w), &store, &NoSchemas)
+            .install_watch("v", &[], WATCH, TARGET, authority(&w), store, &NoSchemas)
             .unwrap();
         for i in 5..10 {
-            churn(&store, w.base, i, 0, 1);
-            ow.pump(&store, &NoSchemas).unwrap();
+            churn(store, w.base, i, 0, 1);
+            ow.pump(store, &NoSchemas).unwrap();
         }
-        ow.pump(&store, &NoSchemas).unwrap();
-        (ow, cursor(&store, w.cursor), activations(&store, w.inbox))
+        ow.pump(store, &NoSchemas).unwrap();
+        (ow, cursor(store, w.cursor), activations(store, w.inbox))
     }; // store dropped — fjall persisted.
 
     assert!(cursor_before.is_some(), "cursor should be installed");
@@ -373,23 +372,25 @@ fn watch_cursor_is_durable_across_reopen() {
 
     // Reopen at the same path: the cursor persisted, and the same handler picks
     // up exactly where it left off — no re-delivery, nothing new.
-    let reopened = store_at(dir.path());
+    let reopened = world.open();
+    let reopened = reopened.as_ref();
     assert_eq!(
-        cursor(&reopened, w.cursor),
+        cursor(reopened, w.cursor),
         cursor_before,
         "watch cursor did not survive reopen"
     );
     assert_eq!(
-        activations(&reopened, w.inbox),
+        activations(reopened, w.inbox),
         acts_before,
         "inbox changed across reopen"
     );
     assert_eq!(
-        ow.pump(&reopened, &NoSchemas).unwrap(),
+        ow.pump(reopened, &NoSchemas).unwrap(),
         0,
         "reopened watcher re-delivered or was not caught up"
     );
-    assert_eq!(cursor(&reopened, w.cursor), cursor_before, "cursor moved on reopen");
+    assert_eq!(cursor(reopened, w.cursor), cursor_before, "cursor moved on reopen");
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -400,52 +401,54 @@ fn watch_cursor_is_durable_across_reopen() {
 /// replayed; only post-install changes stream.
 #[test]
 fn witness_default_skips_initial_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store_at(dir.path());
-    let prog = compile(false);
-    let w = wiring(&prog);
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let prog = compile(false);
+        let w = wiring(&prog);
 
-    churn(&store, w.base, 1, 10, 1);
-    churn(&store, w.base, 2, 20, 1);
+        churn(store, w.base, 1, 10, 1);
+        churn(store, w.base, 2, 20, 1);
 
-    let (ow, _) = prog
-        .install_watch("v", &[], WATCH, TARGET, authority(&w), &store, &NoSchemas)
-        .unwrap();
+        let (ow, _) = prog
+            .install_watch("v", &[], WATCH, TARGET, authority(&w), store, &NoSchemas)
+            .unwrap();
 
-    // First pump delivers nothing: the pre-existing snapshot is skipped.
-    assert_eq!(ow.pump(&store, &NoSchemas).unwrap(), 0);
-    assert!(activations(&store, w.inbox).is_empty());
+        // First pump delivers nothing: the pre-existing snapshot is skipped.
+        assert_eq!(ow.pump(store, &NoSchemas).unwrap(), 0);
+        assert!(activations(store, w.inbox).is_empty());
 
-    // A post-install value streams as one `+` activation.
-    churn(&store, w.base, 3, 30, 1);
-    assert_eq!(ow.pump(&store, &NoSchemas).unwrap(), 1);
-    assert_eq!(activations(&store, w.inbox), vec![(0, 1, 3)]);
+        // A post-install value streams as one `+` activation.
+        churn(store, w.base, 3, 30, 1);
+        assert_eq!(ow.pump(store, &NoSchemas).unwrap(), 1);
+        assert_eq!(activations(store, w.inbox), vec![(0, 1, 3)]);
 
-    assert_eq!(prog.watch_including_current("v"), Some(false));
+        assert_eq!(prog.watch_including_current("v"), Some(false));
+    });
 }
 
 /// `on watch v including current { … }`: the whole pre-existing view is delivered
 /// once, as `+` rows, on the first pump.
 #[test]
 fn witness_including_current_delivers_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store_at(dir.path());
-    let prog = compile(true);
-    let w = wiring(&prog);
+    grmpl_conformance::for_each_store(|c| {
+        let store = c.store();
+        let prog = compile(true);
+        let w = wiring(&prog);
 
-    churn(&store, w.base, 1, 10, 1);
-    churn(&store, w.base, 2, 20, 1);
-    churn(&store, w.base, 2, 21, 1); // a second row for a=2; distinct still one `2`
+        churn(store, w.base, 1, 10, 1);
+        churn(store, w.base, 2, 20, 1);
+        churn(store, w.base, 2, 21, 1); // a second row for a=2; distinct still one `2`
 
-    let (ow, _) = prog
-        .install_watch("v", &[], WATCH, TARGET, authority(&w), &store, &NoSchemas)
-        .unwrap();
+        let (ow, _) = prog
+            .install_watch("v", &[], WATCH, TARGET, authority(&w), store, &NoSchemas)
+            .unwrap();
 
-    // First pump delivers the current view {1, 2} as two `+1` activations.
-    assert_eq!(ow.pump(&store, &NoSchemas).unwrap(), 2);
-    let acts = activations(&store, w.inbox);
-    assert_eq!(acts, vec![(0, 1, 1), (1, 1, 2)]);
-    assert_eq!(delivered_net(&acts), view_now(&store, w.base));
+        // First pump delivers the current view {1, 2} as two `+1` activations.
+        assert_eq!(ow.pump(store, &NoSchemas).unwrap(), 2);
+        let acts = activations(store, w.inbox);
+        assert_eq!(acts, vec![(0, 1, 1), (1, 1, 2)]);
+        assert_eq!(delivered_net(&acts), view_now(store, w.base));
 
-    assert_eq!(prog.watch_including_current("v"), Some(true));
+        assert_eq!(prog.watch_including_current("v"), Some(true));
+    });
 }

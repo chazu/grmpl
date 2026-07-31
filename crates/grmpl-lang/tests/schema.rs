@@ -12,7 +12,6 @@ use grmpl_core::{
 };
 use grmpl_lang::Program;
 use grmpl_proc::{commit_patch, CommitOutcome};
-use grmpl_store::FjallStore;
 
 /// `Program` intentionally has no `Debug`, so `unwrap_err` is unavailable —
 /// recover the error string directly.
@@ -89,36 +88,37 @@ fn resolve_column_maps_name_to_index() {
 
 #[test]
 fn register_schemas_then_commit_boundary_enforces_types() {
-    let prog =
-        Program::compile("rel located(thing: Ent, place: Ent)", 1).unwrap();
-    let located = prog.rel_id("located").unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        let prog =
+            Program::compile("rel located(thing: Ent, place: Ent)", 1).unwrap();
+        let located = prog.rel_id("located").unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
-    // Register name→id and the schema into the durable registry as-of edition 1.
-    prog.register_schemas(&store, &store, grmpl_core::Edition(1)).unwrap();
+        let store = c.world();
+        // Register name→id and the schema into the durable registry as-of edition 1.
+        prog.register_schemas(store, store, grmpl_core::Edition(1)).unwrap();
 
-    // The catalog and schema registry now agree with the program.
-    assert_eq!(grmpl_core::Catalog::rel_id(&store, "located").unwrap(), Some(located));
-    assert_eq!(prog.schema("located"), grmpl_core::SchemaCatalog::schema(&store, located).unwrap());
+        // The catalog and schema registry now agree with the program.
+        assert_eq!(grmpl_core::Catalog::rel_id(store, "located").unwrap(), Some(located));
+        assert_eq!(prog.schema("located"), grmpl_core::SchemaCatalog::schema(store, located).unwrap());
 
-    let authority = Authority::new(grmpl_core::DomainId(1), vec![Scope::whole(located)]);
+        let authority = Authority::new(grmpl_core::DomainId(1), vec![Scope::whole(located)]);
 
-    // Well-typed write commits.
-    let good = Patch::new().assert(Fact::new(
-        located,
-        Tuple::from([Value::Ent(Entity(100)), Value::Ent(Entity(7))]),
-    ));
-    assert!(matches!(
-        commit_patch(&store, &store, &good, &authority).unwrap(),
-        CommitOutcome::Committed(_)
-    ));
+        // Well-typed write commits.
+        let good = Patch::new().assert(Fact::new(
+            located,
+            Tuple::from([Value::Ent(Entity(100)), Value::Ent(Entity(7))]),
+        ));
+        assert!(matches!(
+            commit_patch(store, store, &good, &authority).unwrap(),
+            CommitOutcome::Committed(_)
+        ));
 
-    // Ill-typed write (place must be Ent) is rejected at the boundary.
-    let bad = Patch::new().assert(Fact::new(
-        located,
-        Tuple::from([Value::Ent(Entity(100)), Value::text("hallway")]),
-    ));
-    let err = commit_patch(&store, &store, &bad, &authority).unwrap_err();
-    assert!(matches!(err, Error::Schema(_)), "got {err:?}");
+        // Ill-typed write (place must be Ent) is rejected at the boundary.
+        let bad = Patch::new().assert(Fact::new(
+            located,
+            Tuple::from([Value::Ent(Entity(100)), Value::text("hallway")]),
+        ));
+        let err = commit_patch(store, store, &bad, &authority).unwrap_err();
+        assert!(matches!(err, Error::Schema(_)), "got {err:?}");
+    });
 }

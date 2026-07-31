@@ -11,7 +11,6 @@ use std::sync::Mutex;
 
 use grmpl_core::{Catalog, RelId, Result};
 use grmpl_lang::Program;
-use grmpl_store::FjallStore;
 
 /// A minimal in-memory [`Catalog`] — enough to exercise resolve/allocate
 /// without touching disk. Mirrors the store contract: append-only, rebinding to
@@ -83,50 +82,53 @@ fn fresh_ids_never_collide_with_ids_below_the_base() {
 
 #[test]
 fn ids_are_stable_across_a_store_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    grmpl_conformance::for_each_world(|w| {
+        // First open: compile against the durable catalog, capturing the ids.
+        let (a, b, cc) = {
+            let store = w.open();
+            let store = store.as_ref();
+            let prog =
+                Program::compile_with_catalog("rel a(x)\nrel b(y)\nrel c(z)", store, 1).unwrap();
+            (
+                prog.rel_id("a").unwrap(),
+                prog.rel_id("b").unwrap(),
+                prog.rel_id("c").unwrap(),
+            )
+        };
 
-    // First open: compile against the durable catalog, capturing the ids.
-    let (a, b, c) = {
-        let store = FjallStore::open(dir.path()).unwrap();
+        // Reopen the same directory and recompile with the declarations reordered.
+        // The persisted catalog recovers each id regardless of source layout.
+        let store = w.open();
+        let store = store.as_ref();
         let prog =
-            Program::compile_with_catalog("rel a(x)\nrel b(y)\nrel c(z)", &store, 1).unwrap();
-        (
-            prog.rel_id("a").unwrap(),
-            prog.rel_id("b").unwrap(),
-            prog.rel_id("c").unwrap(),
-        )
-    };
-
-    // Reopen the same directory and recompile with the declarations reordered.
-    // The persisted catalog recovers each id regardless of source layout.
-    let store = FjallStore::open(dir.path()).unwrap();
-    let prog =
-        Program::compile_with_catalog("rel b(y)\nrel c(z)\nrel a(x)", &store, 1).unwrap();
-    assert_eq!(prog.rel_id("a"), Some(a));
-    assert_eq!(prog.rel_id("b"), Some(b));
-    assert_eq!(prog.rel_id("c"), Some(c));
+            Program::compile_with_catalog("rel b(y)\nrel c(z)\nrel a(x)", store, 1).unwrap();
+        assert_eq!(prog.rel_id("a"), Some(a), "{}: `a` moved across a reopen", w.name);
+        assert_eq!(prog.rel_id("b"), Some(b), "{}: `b` moved across a reopen", w.name);
+        assert_eq!(prog.rel_id("c"), Some(cc), "{}: `c` moved across a reopen", w.name);
+    });
 }
 
 #[test]
 fn register_schemas_is_idempotent_after_compile_with_catalog() {
-    // Compiling against the catalog binds ids; a subsequent `register_schemas`
-    // against the same catalog re-binds the *same* ids (a no-op) and only adds
-    // the schemas — the two paths compose without conflict.
-    let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    grmpl_conformance::for_each_store(|c| {
+        // Compiling against the catalog binds ids; a subsequent `register_schemas`
+        // against the same catalog re-binds the *same* ids (a no-op) and only adds
+        // the schemas — the two paths compose without conflict.
+        let store = c.world();
 
-    let prog =
-        Program::compile_with_catalog("rel located(thing: Ent, place: Ent)", &store, 1).unwrap();
-    let located = prog.rel_id("located").unwrap();
+        let prog =
+            Program::compile_with_catalog("rel located(thing: Ent, place: Ent)", store, 1).unwrap();
+        let located = prog.rel_id("located").unwrap();
 
-    prog.register_schemas(&store, &store, grmpl_core::Edition(1))
-        .unwrap();
+        prog.register_schemas(store, store, grmpl_core::Edition(1))
+            .unwrap();
 
-    assert_eq!(Catalog::rel_id(&store, "located").unwrap(), Some(located));
-    assert_eq!(
-        prog.schema("located"),
-        grmpl_core::SchemaCatalog::schema(&store, located).unwrap()
-    );
+        assert_eq!(Catalog::rel_id(store, "located").unwrap(), Some(located));
+        assert_eq!(
+            prog.schema("located"),
+            grmpl_core::SchemaCatalog::schema(store, located).unwrap()
+        );
+    });
 }
 
 // --- Randomized-churn law oracle (TKT-90) -----------------------------------
