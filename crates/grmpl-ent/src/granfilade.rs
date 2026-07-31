@@ -1,11 +1,17 @@
 //! **The granfilade: content-addressed node persistence.**
 //!
 //! An enfilade [`Tree`] is made durable by storing each node under its **content
-//! key** — a hash of `(key, value, left-child-key, right-child-key)`. Because the
-//! key is a pure function of *content* (never `phys_id` or allocation order, per
-//! plan v4.1), **equal subtrees store once**: two versions of a tree that differ
-//! by one edited path share every untouched node on disk (Xanadu structural
-//! sharing / Gold's granfilade, modernised as a content-addressed blob store).
+//! key** — the [`sha256`](crate::hash::sha256) of its frame, which closes over
+//! the node's entries and its children's content keys. Because the key is a pure
+//! function of *content* (never `phys_id` or allocation order), **equal subtrees
+//! store once**: two versions of a tree that differ by one edited path share
+//! every untouched node on disk (Xanadu structural sharing / Gold's granfilade,
+//! modernised as a content-addressed blob store).
+//!
+//! Sharing is **within a version lineage** — a content key identifies a *shape*,
+//! and two histories reaching the same logical map may build different shapes
+//! (plan v5 §G-2b, settled: identity is logical, witnessed by `iter` /
+//! `scan_updates`, exactly as `tree.rs` and `DESIGN.md` already had it).
 //!
 //! A commit adds only the `O(log n)` new distinct nodes on the edited path to the
 //! store — every untouched subtree already hashes to a key that is present, so
@@ -18,19 +24,21 @@
 //! round-trip. Values are serialized through the single `grmpl_core::wire` value
 //! codec ([`Persist`]).
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
-
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
 
 use crate::measure::Measure;
 use crate::tree::{NodeRef, Tree};
 
-/// A 128-bit content key (two salted `SipHash` passes; `DefaultHasher` has fixed
-/// keys, so the key is deterministic across processes — required to reload a
-/// persisted store).
-pub type ContentKey = [u8; 16];
+pub use crate::hash::ContentKey;
+
+/// The width of a [`ContentKey`] on the wire.
+const CK_LEN: usize = 32;
+
+/// The node-frame format version. Bump on any change to the frame layout, the
+/// content hash, or the tag set — a decoder must reject an evolved layout
+/// loudly rather than misread it (`CLAUDE.md`, "one serialization, versioned").
+const NODE_FORMAT_VERSION: u8 = 1;
 
 /// A type that can be (de)serialized into a node frame. Payloads reuse the one
 /// `grmpl_core::wire` codec, so "one serialization" holds.
@@ -246,7 +254,7 @@ impl Granfilade {
         for prefix in [b"log:".as_ref(), b"ckpt:".as_ref(), b"ctx:".as_ref()] {
             for (_k, v) in self.meta_prefix(prefix)? {
                 if v.first() == Some(&1) {
-                    if let Some(b) = v.get(1..17) {
+                    if let Some(b) = v.get(1..1 + CK_LEN) {
                         stack.push(b.try_into().unwrap());
                     }
                 }
@@ -292,14 +300,21 @@ fn children_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
     Ok(children)
 }
 
-/// Frame header: `tag(1) || n_children(u32 BE) || [content_key; 16]*n`. Returns
-/// the tag, the child keys, and the offset where the payload count begins.
+/// Frame header: `version(1) || tag(1) || n_children(u32 BE) || [content_key]*n`.
+/// Returns the tag, the child keys, and the offset where the payload count
+/// begins. The child-key run leads the frame so GC can walk references without
+/// knowing `K` or `V`.
 fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
-    let tag = *frame.first().ok_or_else(|| trunc("node tag"))?;
-    let (n, mut pos) = decode_u32(frame, 1)?;
+    match frame.first() {
+        Some(&NODE_FORMAT_VERSION) => {}
+        Some(v) => return Err(Error::Codec(format!("granfilade: node format version {v}"))),
+        None => return Err(trunc("node version")),
+    }
+    let tag = *frame.get(1).ok_or_else(|| trunc("node tag"))?;
+    let (n, mut pos) = decode_u32(frame, 2)?;
     let mut children = Vec::with_capacity(n);
     for _ in 0..n {
-        let end = pos + 16;
+        let end = pos + CK_LEN;
         let b = frame.get(pos..end).ok_or_else(|| trunc("content key"))?;
         children.push(b.try_into().unwrap());
         pos = end;
@@ -314,6 +329,7 @@ fn decode_u32(bytes: &[u8], pos: usize) -> Result<(usize, usize)> {
 }
 
 fn encode_header(out: &mut Vec<u8>, tag: u8, children: &[ContentKey]) {
+    out.push(NODE_FORMAT_VERSION);
     out.push(tag);
     out.extend_from_slice(&(children.len() as u32).to_be_bytes());
     for c in children {
@@ -353,24 +369,9 @@ where
             }
         }
     }
-    let ck = hash128(&bytes);
+    let ck = crate::hash::sha256(&bytes);
     out.push((ck, bytes));
     Some(ck)
-}
-
-/// 128-bit content hash: two `SipHash` passes over the frame with distinct salts.
-fn hash128(bytes: &[u8]) -> ContentKey {
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&salted(0xA1, bytes).to_be_bytes());
-    out[8..].copy_from_slice(&salted(0xB2, bytes).to_be_bytes());
-    out
-}
-
-fn salted(salt: u8, bytes: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    h.write_u8(salt);
-    h.write(bytes);
-    h.finish()
 }
 
 fn trunc(what: &str) -> Error {

@@ -696,7 +696,7 @@ fn opt_ck_bytes(ck: Option<ContentKey>) -> Vec<u8> {
 
 fn bytes_opt_ck(bytes: &[u8]) -> Option<ContentKey> {
     match bytes.first() {
-        Some(1) => bytes.get(1..17).map(|b| b.try_into().unwrap()),
+        Some(1) => bytes.get(1..1 + std::mem::size_of::<ContentKey>()).map(|b| b.try_into().unwrap()),
         _ => None,
     }
 }
