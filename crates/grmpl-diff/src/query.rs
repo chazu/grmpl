@@ -80,6 +80,46 @@ pub enum Query {
 }
 
 impl Query {
+    /// Every base relation this query reads.
+    ///
+    /// A view's answer can only change when one of these changes, which is what
+    /// lets a reactive watcher be *routed*: given the relations a commit touched,
+    /// a view whose inputs are disjoint from them is provably unaffected and need
+    /// not be re-evaluated at all (`grmpl_proc::OnWatch::pump`).
+    ///
+    /// `Recur` contributes nothing — it names the enclosing `Iterate`'s value,
+    /// not a base relation — and a `Shared` arrangement contributes its inner
+    /// query's relations.
+    pub fn base_relations(&self) -> std::collections::BTreeSet<RelId> {
+        let mut out = std::collections::BTreeSet::new();
+        self.collect_base_relations(&mut out);
+        out
+    }
+
+    fn collect_base_relations(&self, out: &mut std::collections::BTreeSet<RelId>) {
+        match self {
+            Query::Rel(r) | Query::RangeRel { rel: r, .. } => {
+                out.insert(*r);
+            }
+            Query::Recur => {}
+            Query::Map { input, .. }
+            | Query::Filter { input, .. }
+            | Query::Project { input, .. }
+            | Query::Negate(input)
+            | Query::Distinct(input)
+            | Query::Reduce { input, .. } => input.collect_base_relations(out),
+            Query::Join { left, right, .. } | Query::Union(left, right) => {
+                left.collect_base_relations(out);
+                right.collect_base_relations(out);
+            }
+            Query::Iterate { init, step } => {
+                init.collect_base_relations(out);
+                step.collect_base_relations(out);
+            }
+            Query::Shared(inner) => inner.collect_base_relations(out),
+        }
+    }
+
     pub fn rel(r: RelId) -> Query {
         Query::Rel(r)
     }

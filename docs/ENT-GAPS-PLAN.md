@@ -13,17 +13,21 @@ underneath it in the end state.
 > under a node-format version) · G-1 (path-only persistence — commit work flat in
 > relation size) · G-2 (Fact roots persisted; `open` no longer replays the log)
 > · G-6 (durable forks sharing one granfilade — a 5000-row fork encodes **zero**
-> node frames — plus a persistent DagWood).
+> node frames — plus a persistent DagWood) · G-4 (the canopy is an enfilade, and
+> the reactive pump routes through the substrate instead of re-evaluating).
 >
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
 > — ~90 laws including every seeded oracle — now run on the ent *and* the LSM.
 > `grmpl run`, `grmpld` and `grmpl-bench` open an `EntStore`.
 >
-> **Remaining.** G-0c (doc truth) · G-0d (measured version-compare) · G-2a (Rel +
-> Version enfilades) · G-3 (the WID measure family) · G-4 (canopy as enfilade,
-> wired to the pump) · G-7 (DSP overlay instancing) · G-8 (Derived enfilades) ·
-> G-9 (multi-order arrangements) · G-10 (showcase cutover, soak, delete the LSM).
+> G-0c (doc truth) is done — the book now describes what the code does, in both
+> directions.
+>
+> **Remaining.** G-0d (measured version-compare) · G-2a (Rel + Version enfilades)
+> · G-3 (the WID measure family) · G-7 (DSP overlay instancing) · G-8 (Derived
+> enfilades) · G-9 (multi-order arrangements) · G-10 (showcase cutover, soak,
+> delete the LSM).
 >
 > **One estimate was wrong.** G-0d is filed below as small; it is not. Pruning a
 > diff at every node needs the B+ tree to split at an arbitrary key so the two

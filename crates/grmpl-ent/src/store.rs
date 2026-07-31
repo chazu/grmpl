@@ -576,6 +576,29 @@ impl TraceStore for EntStore {
         self.range_at(rel, at, lo, hi)
     }
 
+    /// **Measured interest routing (G-4).** The Edition enfilade is keyed by
+    /// `(edition, submit_index)`, so "did anything land in `(from, to]`?" is a
+    /// **WID range measure** over that span — `O(log n)` from cached subtree
+    /// counts, materializing nothing. The default implementation must answer
+    /// `true` for every store; the Ent can answer *no* and prove it, which is
+    /// what lets the reactive pump skip a view it cannot have changed.
+    fn touched_since(&self, from: Edition, to: Edition, rels: &[RelId]) -> Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        if from.0 < inner.watermark {
+            // Below the door we cannot prove anything; stay conservative and let
+            // the caller's own read hit the door with a proper error.
+            return Ok(true);
+        }
+        for rel in rels {
+            if let Some(log) = inner.log.get(rel) {
+                if log.measure_range(&(from.0 + 1, 0), &(to.0 + 1, 0)).0 > 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn watermark(&self) -> Edition {
         Edition(self.inner.lock().unwrap().watermark)
     }

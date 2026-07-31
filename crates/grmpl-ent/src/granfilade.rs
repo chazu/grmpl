@@ -83,6 +83,31 @@ impl Persist for u64 {
     }
 }
 
+impl Persist for u32 {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_be_bytes());
+    }
+    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
+        let end = pos + 4;
+        let b = bytes.get(pos..end).ok_or_else(|| trunc("u32"))?;
+        Ok((u32::from_be_bytes(b.try_into().unwrap()), end))
+    }
+}
+
+impl<A: Persist, B: Persist, C: Persist> Persist for (A, B, C) {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.0.encode(out);
+        self.1.encode(out);
+        self.2.encode(out);
+    }
+    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
+        let (a, pos) = A::decode(bytes, pos)?;
+        let (b, pos) = B::decode(bytes, pos)?;
+        let (c, pos) = C::decode(bytes, pos)?;
+        Ok(((a, b, c), pos))
+    }
+}
+
 impl<A: Persist, B: Persist> Persist for (A, B) {
     fn encode(&self, out: &mut Vec<u8>) {
         self.0.encode(out);

@@ -101,6 +101,11 @@ impl OnWatch {
         vec![Value::Int(self.inbox.0 as i64), Value::Ent(self.target)]
     }
 
+    /// The base relations this watch's view reads — the interest it routes on.
+    fn view_relations(&self) -> Vec<RelId> {
+        self.view.base_relations().into_iter().collect()
+    }
+
     fn cursor_tuple(&self, edition: Edition) -> Tuple {
         Tuple::from([Value::Ent(self.watch), Value::Int(edition.0 as i64)])
     }
@@ -188,6 +193,18 @@ impl OnWatch {
             let to = store.current();
             if to <= from {
                 return Ok(0); // nothing new
+            }
+
+            // **Interest routing (G-4).** A view can only change when one of its
+            // base relations does, so ask the substrate whether anything in
+            // `(from, to]` touched them before doing any differential work. The
+            // answer is conservative — `false` is a proof of no change, `true`
+            // merely means "possibly" — so this can only ever save an evaluation,
+            // never lose a delta. On a store with a measured commit log (the
+            // Ent's Edition enfilade) it is an `O(log n)` measure; on any other
+            // it is the default `true` and the pump behaves exactly as before.
+            if !store.touched_since(from, to, &self.view_relations())? {
+                return Ok(0);
             }
 
             let delta = eval_delta(&self.view, store, from, to)?;

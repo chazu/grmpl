@@ -21,6 +21,20 @@ pub trait Measure<K, V>: Clone {
     fn combine(&self, right: &Self) -> Self;
 }
 
+/// Tuple measures compose: a tree may carry several upward summaries at once
+/// without any new tree code, since a product of monoids is a monoid.
+impl<K, V, A: Measure<K, V>, B: Measure<K, V>> Measure<K, V> for (A, B) {
+    fn empty() -> Self {
+        (A::empty(), B::empty())
+    }
+    fn entry(key: &K, val: &V) -> Self {
+        (A::entry(key, val), B::entry(key, val))
+    }
+    fn combine(&self, right: &Self) -> Self {
+        (self.0.combine(&right.0), self.1.combine(&right.1))
+    }
+}
+
 /// The trivial measure — just the entry count. Useful on its own (size), and as
 /// the identity building block; every enfilade tracks at least this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

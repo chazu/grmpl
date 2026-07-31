@@ -8,22 +8,30 @@
 //! change *could* affect (a superset), never a subset — so no watcher ever misses
 //! a delta (the Snapshot–stream law).
 //!
-//! Routing is answered by a **measured interval tree** (Gold's CanopyCrum): per
-//! relation, the interests are held in an array sorted by low endpoint, augmented
-//! with a segment tree of the **maximum high endpoint** over every subrange (the
-//! upward `wid`-style summary). A point stab descends only into subranges whose
-//! `max-hi` clears the point, so routing is `O(log n + k)` in the number of hit
-//! interests rather than `O(n)` over all of them — the same measure-pruning that
-//! powers the Fact enfilade's WID range read. Each interest also carries an
-//! **endorsement** (a monotone flag-lattice element); [`route_endorsed`] gates
-//! delivery on an interest holding every required flag — Gold's authority
-//! endorsement, the lattice test `required ⊑ endorsement`.
+//! Routing is answered by a **measured interval enfilade** (Gold's CanopyCrum):
+//! the interests live in the same persistent measured [`Tree`] as everything else
+//! in the plex, keyed by `(rel, lo, id)` so one relation's interests are a
+//! contiguous span in low-endpoint order, and carrying an upward measure of the
+//! **maximum high endpoint** plus the **join of the endorsements** beneath each
+//! node. A point stab prunes any subtree whose `max-hi` does not clear the point
+//! — the same WID pruning that powers the Fact enfilade's range read — and any
+//! subtree whose joined endorsement cannot satisfy the requirement.
+//!
+//! It is an enfilade rather than an array-plus-segment-tree (G-4) so that
+//! registering an interest is an `O(log n)` persistent insert instead of an
+//! `O(n log n)` rebuild, and so the canopy **versions, persists and GCs with the
+//! rest of the world** rather than sitting beside it in memory.
+//!
+//! Each interest carries an **endorsement** (a monotone flag-lattice element);
+//! [`route_endorsed`] gates delivery on an interest holding every required flag —
+//! Gold's authority endorsement, the lattice test `required ⊑ endorsement`.
 //!
 //! [`route_endorsed`]: Canopy::route_endorsed
 
-use std::collections::BTreeMap;
-
 use grmpl_core::{Diff, RelId, Tuple};
+
+use crate::measure::Measure;
+use crate::tree::{NodeRef, Tree};
 
 /// A handle to a registered interest.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -49,107 +57,69 @@ impl Endorsement {
     }
 }
 
-/// One standing interest: rows of `rel` whose key lies in `[lo, hi)`, carrying an
-/// endorsement.
-#[derive(Clone)]
-struct Interest {
-    id: InterestId,
-    rel: RelId,
-    lo: Tuple,
-    hi: Tuple,
-    endorse: Endorsement,
+/// The upward measure of a canopy subtree: the greatest `hi` endpoint under it,
+/// and the join (union) of every endorsement under it.
+///
+/// `max-hi` is what makes a stab prune — a subtree whose intervals all end at or
+/// before the point cannot contain it — and the endorsement join is what lets a
+/// gated stab skip a subtree none of whose interests could satisfy the
+/// requirement. Both are monoids, so they ride the ordinary enfilade.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Reach {
+    /// The greatest `hi` under this subtree; `None` for the empty subtree.
+    pub max_hi: Option<Tuple>,
+    /// The union of endorsements under this subtree.
+    pub endorse: Endorsement,
 }
 
-/// The parameters of one stabbing query, bundled so the recursion stays a
-/// two-index walk.
-struct Stab<'a> {
-    point: &'a Tuple,
-    min_endorse: Endorsement,
-    /// Right bound: candidates are `items[..qr]` (those with `lo ≤ point`).
-    qr: usize,
-}
+/// The key of a canopy entry: `(relation, low endpoint, interest id)`. Ordering
+/// by `(rel, lo)` puts one relation's interests in a contiguous, low-endpoint-
+/// ordered span; the id breaks ties so two identical intervals both survive.
+pub type InterestKey = (u32, Tuple, u64);
 
-/// A per-relation interval index: interests sorted by `lo`, with a segment tree of
-/// the maximum `hi` over each subrange for measure-pruned stabbing.
-struct RelIndex {
-    /// Interests of one relation, sorted ascending by `lo` (so every prefix is
-    /// exactly the interests whose low endpoint is ≤ a given point).
-    items: Vec<Interest>,
-    /// Segment tree (`4·n`) over `items`, `seg[node]` = the maximum `hi` in the
-    /// node's subrange — the upward measure that lets a stab skip subranges whose
-    /// intervals all end at or before the point.
-    seg: Vec<Tuple>,
-}
+/// What an interest binds: its half-open upper endpoint and its endorsement.
+pub type InterestVal = (Tuple, Endorsement);
 
-impl RelIndex {
-    fn build(mut items: Vec<Interest>) -> RelIndex {
-        items.sort_by(|a, b| a.lo.cmp(&b.lo));
-        let n = items.len();
-        // `hi` values are non-empty tuples; the first item's hi is a valid
-        // placeholder for never-queried cells (n==0 is handled by callers).
-        let placeholder = items.first().map(|i| i.hi.clone()).unwrap_or_else(|| Tuple::from([]));
-        let mut idx = RelIndex { items, seg: vec![placeholder; 4 * n.max(1)] };
-        if n > 0 {
-            idx.build_seg(0, 0, n);
-        }
-        idx
+impl Measure<InterestKey, InterestVal> for Reach {
+    fn empty() -> Self {
+        Reach { max_hi: None, endorse: Endorsement::NONE }
     }
-
-    fn build_seg(&mut self, node: usize, sl: usize, sr: usize) -> Tuple {
-        if sr - sl == 1 {
-            self.seg[node] = self.items[sl].hi.clone();
-            return self.seg[node].clone();
-        }
-        let mid = (sl + sr) / 2;
-        let l = self.build_seg(2 * node + 1, sl, mid);
-        let r = self.build_seg(2 * node + 2, mid, sr);
-        let m = l.max(r);
-        self.seg[node] = m.clone();
-        m
+    fn entry(_k: &InterestKey, v: &InterestVal) -> Self {
+        Reach { max_hi: Some(v.0.clone()), endorse: v.1 }
     }
-
-    /// Collect the interests whose `[lo, hi)` contains `q.point`, pushing ids into
-    /// `out`. `q.qr` bounds the candidates to those with `lo ≤ point` (a prefix);
-    /// the `max-hi` measure prunes subranges that cannot match.
-    fn stab(&self, node: usize, sl: usize, sr: usize, q: &Stab, out: &mut Vec<InterestId>) {
-        if sl >= q.qr || self.items.is_empty() {
-            return;
-        }
-        // Measure prune: if the whole subrange's greatest `hi` is ≤ point, no
-        // interval here reaches past `point`, so none can contain it.
-        if self.seg[node] <= *q.point {
-            return;
-        }
-        if sr - sl == 1 {
-            // Leaf in-bounds (sl < qr ⇒ lo ≤ point); match iff point < hi.
-            let it = &self.items[sl];
-            if *q.point < it.hi && it.endorse.dominates(q.min_endorse) {
-                out.push(it.id);
-            }
-            return;
-        }
-        let mid = (sl + sr) / 2;
-        self.stab(2 * node + 1, sl, mid, q, out);
-        self.stab(2 * node + 2, mid, sr, q, out);
-    }
-
-    /// The ids whose interval contains `point` and whose endorsement dominates
-    /// `min_endorse`.
-    fn hits(&self, point: &Tuple, min_endorse: Endorsement, out: &mut Vec<InterestId>) {
-        // Candidates: the prefix of items with `lo ≤ point`.
-        let qr = self.items.partition_point(|i| i.lo <= *point);
-        self.stab(0, 0, self.items.len(), &Stab { point, min_endorse, qr }, out);
+    fn combine(&self, right: &Self) -> Self {
+        let max_hi = match (&self.max_hi, &right.max_hi) {
+            (None, r) => r.clone(),
+            (l, None) => l.clone(),
+            (Some(l), Some(r)) => Some(l.max(r).clone()),
+        };
+        Reach { max_hi, endorse: Endorsement(self.endorse.0 | right.endorse.0) }
     }
 }
 
-/// The canopy: a set of standing interests over the world, indexed per relation
-/// by a measured interval tree.
-#[derive(Default)]
+/// The canopy enfilade: standing interests as a persistent measured tree.
+pub type CanopyEnf = Tree<InterestKey, InterestVal, Reach>;
+
+/// An endorsement persists as its flag word, so a canopy can be written to the
+/// granfilade like any other enfilade.
+impl crate::granfilade::Persist for Endorsement {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_be_bytes());
+    }
+    fn decode(bytes: &[u8], pos: usize) -> grmpl_core::Result<(Self, usize)> {
+        let end = pos + 8;
+        let b = bytes
+            .get(pos..end)
+            .ok_or_else(|| grmpl_core::Error::Codec("canopy: truncated endorsement".into()))?;
+        Ok((Endorsement(u64::from_be_bytes(b.try_into().unwrap())), end))
+    }
+}
+
+/// The canopy: standing interests over the world, held in one measured enfilade.
+#[derive(Default, Clone)]
 pub struct Canopy {
     next: u64,
-    interests: Vec<Interest>,
-    /// Per-relation interval index, rebuilt on mutation (register/unregister).
-    index: BTreeMap<RelId, RelIndex>,
+    enf: CanopyEnf,
 }
 
 impl Canopy {
@@ -165,48 +135,52 @@ impl Canopy {
 
     /// Register interest carrying an explicit [`Endorsement`] — routing via
     /// [`route_endorsed`](Self::route_endorsed) delivers to it only when its
-    /// endorsement dominates the required flags.
-    pub fn register_endorsed(&mut self, rel: RelId, lo: Tuple, hi: Tuple, endorse: Endorsement) -> InterestId {
+    /// endorsement dominates the required flags. `O(log n)`, persistent: the
+    /// prior canopy version is unchanged and shares every untouched node.
+    pub fn register_endorsed(
+        &mut self,
+        rel: RelId,
+        lo: Tuple,
+        hi: Tuple,
+        endorse: Endorsement,
+    ) -> InterestId {
         let id = InterestId(self.next);
         self.next += 1;
-        self.interests.push(Interest { id, rel, lo, hi, endorse });
-        self.reindex(rel);
+        self.enf = self.enf.insert((rel.0, lo, id.0), (hi, endorse));
         id
     }
 
-    /// Drop a registered interest.
+    /// Drop a registered interest. `O(n)` only in the number of interests on the
+    /// same relation span, since the id is the key's last column.
     pub fn unregister(&mut self, id: InterestId) {
-        if let Some(pos) = self.interests.iter().position(|i| i.id == id) {
-            let rel = self.interests[pos].rel;
-            self.interests.remove(pos);
-            self.reindex(rel);
-        }
-    }
-
-    /// Rebuild the interval index for one relation from the interest list.
-    fn reindex(&mut self, rel: RelId) {
-        let items: Vec<Interest> =
-            self.interests.iter().filter(|i| i.rel == rel).cloned().collect();
-        if items.is_empty() {
-            self.index.remove(&rel);
-        } else {
-            self.index.insert(rel, RelIndex::build(items));
+        let key = self
+            .enf
+            .iter()
+            .find(|(k, _)| k.2 == id.0)
+            .map(|(k, _)| k.clone());
+        if let Some(k) = key {
+            self.enf = self.enf.remove(&k);
         }
     }
 
     /// Number of live interests.
     pub fn len(&self) -> usize {
-        self.interests.len()
+        self.enf.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.interests.is_empty()
+        self.enf.is_empty()
+    }
+
+    /// The enfilade backing this canopy — a persistent measured tree, so it can
+    /// be versioned and persisted with the rest of the plex.
+    pub fn enfilade(&self) -> &CanopyEnf {
+        &self.enf
     }
 
     /// The interests touched by `updates` — every interest whose `(rel, [lo, hi))`
     /// contains at least one updated tuple, deduplicated and sorted. A watcher
-    /// not in the result is provably unaffected by this commit. Answered by the
-    /// measured interval tree in `O(log n + k)` per updated tuple.
+    /// not in the result is provably unaffected by this commit.
     pub fn route(&self, updates: &[(RelId, Tuple, Diff)]) -> Vec<InterestId> {
         self.route_endorsed(updates, Endorsement::NONE)
     }
@@ -215,16 +189,73 @@ impl Canopy {
     /// interests whose endorsement **dominates** `required` (holds every required
     /// flag). `Endorsement::NONE` gates nothing, so `route` is this at the lattice
     /// bottom.
-    pub fn route_endorsed(&self, updates: &[(RelId, Tuple, Diff)], required: Endorsement) -> Vec<InterestId> {
+    pub fn route_endorsed(
+        &self,
+        updates: &[(RelId, Tuple, Diff)],
+        required: Endorsement,
+    ) -> Vec<InterestId> {
         let mut hit: Vec<InterestId> = Vec::new();
         for (rel, tuple, _diff) in updates {
-            if let Some(idx) = self.index.get(rel) {
-                idx.hits(tuple, required, &mut hit);
-            }
+            self.stab(&self.enf, rel.0, tuple, required, &mut hit);
         }
         hit.sort();
         hit.dedup();
         hit
+    }
+
+    /// Collect the interests of `rel` whose interval contains `point`, pruning on
+    /// the upward measure: a subtree whose greatest `hi` does not clear the point
+    /// holds nothing that can contain it, and a subtree whose joined endorsement
+    /// lacks a required flag holds nothing that can receive it.
+    fn stab(
+        &self,
+        t: &CanopyEnf,
+        rel: u32,
+        point: &Tuple,
+        required: Endorsement,
+        out: &mut Vec<InterestId>,
+    ) {
+        let node = match t.node() {
+            None => return,
+            Some(n) => n,
+        };
+        // WID prune: nothing under here reaches past the point…
+        let m = t.measure();
+        if m.max_hi.as_ref().is_none_or(|h| h <= point) {
+            return;
+        }
+        // …and nothing under here carries the flags the requirement demands.
+        if !m.endorse.dominates(required) {
+            return;
+        }
+        match node {
+            NodeRef::Leaf(entries) => {
+                for ((r, lo, id), (hi, endorse)) in entries {
+                    if *r == rel && lo <= point && point < hi && endorse.dominates(required) {
+                        out.push(InterestId(*id));
+                    }
+                }
+            }
+            NodeRef::Internal(keys, children) => {
+                for (i, child) in children.iter().enumerate() {
+                    // Skip children whose whole span lies past this relation's
+                    // interests, or whose low endpoints all exceed the point.
+                    if i > 0 {
+                        let (kr, klo, _) = &keys[i - 1];
+                        if *kr > rel || (*kr == rel && klo > point) {
+                            break;
+                        }
+                    }
+                    if i < keys.len() {
+                        let (kr, _, _) = &keys[i];
+                        if *kr < rel {
+                            continue;
+                        }
+                    }
+                    self.stab(child, rel, point, required, out);
+                }
+            }
+        }
     }
 }
 
@@ -280,6 +311,33 @@ mod tests {
         assert_eq!(c.route_endorsed(&[(RelId(1), t(5), 1)], Endorsement(0b11)), vec![admin]);
         // A point outside the range: nobody, regardless of endorsement.
         assert!(c.route_endorsed(&[(RelId(1), t(200), 1)], Endorsement::NONE).is_empty());
+    }
+
+    /// The canopy is a real enfilade: it versions like one (an older canopy is
+    /// unaffected by a later registration) and it **persists** like one, through
+    /// the same granfilade as the Fact and Edition enfilades.
+    #[test]
+    fn the_canopy_versions_and_persists_like_any_enfilade() {
+        let mut c = Canopy::new();
+        let a = c.register(RelId(1), t(0), t(10));
+        let v0 = c.enfilade().clone();
+
+        let b = c.register(RelId(1), t(5), t(20));
+        // The retained older version is untouched by the later registration —
+        // this is a persistent structure, not a mutable index.
+        assert_eq!(v0.len(), 1, "an older canopy version mutated");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.route(&[(RelId(1), t(7), 1)]), vec![a, b]);
+
+        // …and it round-trips through the granfilade.
+        let dir = tempfile::tempdir().unwrap();
+        let gran = crate::granfilade::Granfilade::open(dir.path()).unwrap();
+        let ck = gran.persist(c.enfilade()).unwrap();
+        let back: CanopyEnf = gran.load(ck).unwrap();
+        let want: Vec<_> = c.enfilade().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let got: Vec<_> = back.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(got, want, "the canopy did not survive the granfilade");
+        assert_eq!(back.measure(), c.enfilade().measure(), "its upward measure did not");
     }
 
     /// The interval tree must agree with the naive linear stab on every point,

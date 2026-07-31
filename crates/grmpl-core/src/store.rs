@@ -75,6 +75,30 @@ pub trait TraceStore: EditionStore {
             .collect())
     }
 
+    /// **Interest routing.** Could any commit in `(from, to]` have touched one of
+    /// `rels`?
+    ///
+    /// This is the substrate's answer to the canopy's question — "does this
+    /// change concern anyone watching here?" — and it exists so a reactive
+    /// watcher can be *routed* rather than re-evaluated: a maintained view whose
+    /// base relations were not touched over an interval is provably unchanged
+    /// across it, so the pump can skip the whole differential evaluation.
+    ///
+    /// **Conservative, never a subset.** The contract is that a `false` is a
+    /// proof of no change, while a `true` merely means "possibly" — so the
+    /// default implementation returns `true` unconditionally and every store is
+    /// correct without doing anything. That keeps the Snapshot–stream law safe by
+    /// construction: an over-eager answer costs an evaluation, an under-eager one
+    /// would lose a delta. A store whose commit log is a *measured* structure
+    /// (the Ent's Edition enfilade) overrides this to answer in `O(log n)` from
+    /// cached subtree measures, without materializing a single update.
+    ///
+    /// Naming relations and editions is a pure value-level contract; the trait
+    /// still names no storage technology.
+    fn touched_since(&self, _from: Edition, _to: Edition, _rels: &[RelId]) -> Result<bool> {
+        Ok(true)
+    }
+
     /// The consolidation **watermark** (P6 history/GC). Every edition ≤ this has
     /// been folded into per-relation checkpoints and its raw updates discarded,
     /// so no intermediate as-of state below it survives. This is the floor of
