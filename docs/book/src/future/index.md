@@ -13,6 +13,12 @@ the Ent and *awkward-to-impossible* on an append log.
 These are deferred deliberately — the capability exists and is correct; only its
 asymptotics are on the table.
 
+> Three items once listed here have since landed and moved to the
+> implementation chapter: **path-only persistence** (a commit's work is now flat
+> in relation size, not just its on-disk growth) and **durable forks sharing one
+> granfilade** (a 5000-row fork encodes zero node frames). What follows is what
+> is genuinely still ahead.
+
 ### Multi-order arrangements
 
 The lead-column WID pushdown is done: an entity-keyed view prunes to its key at
@@ -22,22 +28,15 @@ relation (several measured trees over the same facts), so `RangeRel` can prune o
 as well. Non-lead filters run correctly today; they just run unpruned. This is
 purely "more measured trees," the same primitive replicated per order.
 
-### Durable fork sharing one granfilade
+### Subtree-pruned version-compare
 
-In-memory structural-sharing forks and the DagWood ancestry are done. True
-`O(edit)` **durable** node-sharing wants all branches living in *one* granfilade,
-with roots namespaced by branch, so a fork on disk shares nodes with its ancestor
-rather than copying them. This is a persistence-layer design — a durable *copy*
-fork would be weaker than the faithful sharing form, so it is left for the real
-design rather than hacked in.
-
-### Path-only persistence
-
-On-disk structural sharing already holds — a commit grows the store by only the
-edited path. The remaining win is making the per-commit *traversal* `O(log n)`
-instead of `O(n)` by memoizing each node's content key. Deferred because a safe
-implementation must dodge pointer-ABA and a tree↔granfilade layering break: an
-invasive core change, performance-only, not to be done hastily.
+Backfollow short-circuits when two editions share a Fact root, but otherwise
+walks both sides. Making it `O(measure)` — pruning at *every* node on shared
+subtrees, disjoint key bounds, and trace membership carried as a WID upward
+measure (Gold's `HistoryCrum inTrace:`) — needs the enfilade to split at an
+arbitrary key so two versions can be compared span by span. That is a
+`split`/`join` addition to the tree, which is why it is here and not filed as a
+tidy-up.
 
 ## Persistent Derived enfilades
 
@@ -49,11 +48,15 @@ view maintenance into a first-class, durable member of the plex. This is the one
 enfilade with no Xanadu ancestor, and its persistent form is where grmpl's
 differential extension of the `Ent` fully lands.
 
-## Full canopy interest compilation
+## The canopy on the reactive path, then interest compilation
 
 The canopy is a real interval tree with an endorsement lattice, routing
-conservatively. The frontier is compiling `watch` interest into **wid-summarized
-scope covers** so that interest routing is not just per-watcher stabbing but a
+conservatively — but it is a `Vec` plus a segment tree rather than an enfilade,
+and **nothing routes through it**: the pump re-evaluates its view on every pump
+instead of asking whether a commit could have touched it. Making it an enfilade
+(so it versions and persists with the plex) and putting it on the pump's path is
+the near-term step. The frontier beyond that is compiling `watch` interest into
+**wid-summarized scope covers** so that interest routing is not just per-watcher stabbing but a
 measure the cluster can read off a subtree: "everything under this scope is
 watched for these kinds of change." That is the bridge from local reactivity to
 distributed interest management.

@@ -21,10 +21,14 @@ crates/grmpl-ent/src/
 
 ## The enfilade primitive — `tree.rs`, `measure.rs`
 
-At the bottom is `Tree<K, V, M>`: a **persistent, weight-balanced, measured
-tree**. It is immutable in the functional sense — `insert`/`remove` return a new
-tree and share the old one's untouched subtrees (path copy) — and every node
-carries the monoidal measure `M` of its subtree. `measure.rs` defines the
+At the bottom is `Tree<K, V, M>`: a **persistent, measured B+ tree**. It is
+immutable in the functional sense — `insert`/`remove` return a new tree and share
+the old one's untouched subtrees (path copy) — and every node carries the
+monoidal measure `M` of its subtree. A node holds a *run* of up to 64 entries (or
+children), not one: a node is one content-addressed granfilade record, so arity
+is the difference between one record per **run** of tuples and one per tuple.
+That constant factor, not any asymptotic gap, is what decides whether the Ent can
+sit under the language at all. `measure.rs` defines the
 `Measure` trait (an associative fold with identity) and the canonical `Count`
 measure.
 
@@ -46,24 +50,36 @@ snapshots never mutate.
 
 The granfilade is the persistent node substrate: a **content-addressed** node
 table (fjall used purely as a node blob store). Its job is **structural sharing
-on disk**: a node's identity is its `ContentKey`, computed as
-`hash(kind, measure-relevant fields, child content-keys)` — closed over child
-*content keys only*, with physical id and allocation order excluded by
-construction. So two logically-identical subtrees, however they were built,
-intern to **one** stored node. A new edition writes only the nodes along its
-edited path; everything else is already present under its content key and is
-shared.
+on disk**: a node's identity is its `ContentKey` — the SHA-256 of its frame,
+closed over its entries and its children's content keys, with physical id and
+allocation order excluded by construction. A new edition writes only the nodes
+along its edited path; everything else is already present under its key.
+
+Sharing is **within a version lineage**. A content key identifies a *shape*, and
+because the tree's balance depends on insertion order, two different histories
+reaching the same logical map get different keys. That is deliberate: identity in
+grmpl is logical, not structural — `DESIGN.md` and the store contract define it
+by `iter`/`scan_updates`, and Gold likewise guarantees content/version identity
+and never byte-identical node layout.
+
+Commits are path-sized in **work** as well as in bytes: each node memoizes its
+content key, and a node that is both memoized and known-durable here is returned
+without being re-serialized — along with everything beneath it, since a node's
+key closes over its children's. The memo alone would not be safe, because it says
+"this is its key", not "it is on *this* disk": a fork clones nodes memoized
+against its parent's granfilade, so each granfilade also tracks which keys it
+knows are durable.
 
 This is the mechanism behind cheap history *on disk*, not just in memory: a
 commit grows the store by only the edited path, and reachability GC from retained
 roots reclaims what no live edition points at.
 
-> Node identity carries three roles by three mechanisms, because a single naïve
-> id fails: a **content key** interns nodes for dedup and sharing (order- and
-> pointer-independent, so structural sharing is canonical); a monotonic
-> **`phys_id`** places nodes for locality; and equality that the language relies
-> on is at the **leaf/query level**, not the tree shape — because balance
-> heuristics legitimately vary internal shape, exactly as Gold's do.
+> The hash is part of the on-disk format, so it is pinned: SHA-256, vendored and
+> checked against the FIPS vectors. The previous `DefaultHasher` had neither
+> property it needed — `std` does not specify its algorithm across releases (a
+> granfilade could hash differently under a new toolchain), and its fixed known
+> keys are not collision-resistant against player-supplied content, where a
+> collision means one node silently aliasing another.
 
 ## The Edition and Fact enfilades — `store.rs`
 
@@ -77,7 +93,16 @@ store traits by running two enfilades side by side, committed atomically togethe
   is three entries, not a net.
 - **The Fact enfilade** serves `read_at`/`holds`/joins — the net-per-tuple
   state, tuple-keyed and measured, delivered tuple-sorted with zero-weight tuples
-  absent.
+  absent. Every live as-of root is persisted with its commit, so recovery is a
+  root lookup. (It used to be written only at the watermark, with `open`
+  replaying the whole log tail back through the fold — checkpoint-and-replay
+  recovery, which is the LSM shape the mandate rules out from underneath the
+  Ent.)
+
+The **context enfilade** is committed beside them, and the durable catalog and
+the edition-versioned schema registry are bindings in it at the root scope —
+so `schema_at` is a WID range walk over the relation's `(rel, edition)` span
+rather than a scan, and both survive GC as live roots.
 
 A single commit opens one transaction over the granfilade, writes the touched
 nodes of both enfilades plus the edition bump, and issues one durable sync — the
@@ -120,44 +145,70 @@ until it diverges.
 ## The branch/edition DAG — `dag.rs`
 
 `Dag` (a `DagWood`, after Gold) is the `fulltrace`: the version/branch graph.
-`fork_edition(at)` returns an opaque `Edition` on a new branch that **shares
-structure** with its ancestor (an `O(edit)` virtual copy of the *world*, not an
-`O(state)` deep copy). The DAG answers cross-branch provenance — `descends_from`,
-`common_ancestor_with` — and reachability GC uses it to know which roots are
-still live. Branch membership is carried as a WID upward measure (Gold's
-`HistoryCrum inTrace:`), so **backfollow / version-compare** — "this content is
-edition E, relocated" — is `O(measure)`, subtree-pruned, not a scan.
+`fork_at(at)` returns a store on a new branch that **shares structure** with its
+ancestor — an `O(edit)` virtual copy of the *world*, not an `O(state)` deep copy.
+Every branch lives in one granfilade with its roots namespaced by branch, so the
+fork writes roots naming nodes already present and encodes no node frames at all;
+the branch graph is serialized alongside, so forks survive a reopen. The DAG
+answers cross-branch provenance — `descends_from`, `common_ancestor_with` — and
+reachability GC roots from every branch.
+
+**Backfollow / version-compare** is implemented and correct, but not yet
+subtree-pruned: `compare` short-circuits when two editions share a Fact root and
+otherwise walks both sides. Carrying trace membership as a WID upward measure
+(Gold's `HistoryCrum inTrace:`) is future work — see Part IV.
 
 ## The canopy — `canopy.rs`
 
-The canopy is the interest index. Standing interests are held as a **measured
+The canopy is the interest index. Standing interests are held in a **measured
 interval tree** (a max-hi segment tree, so a change *stabs* the tree for
-overlapping interests in `O(log n + k)` rather than testing every watcher),
-gated by an **endorsement flag-lattice** (`Endorsement`, `InterestId`) that
-routes conservatively — a superset of what the pump will actually deliver, never
-a subset. This is `CanopyCrum` with interest as the upward measure: a fact change
-is routed only to the observers whose interest covers it.
+overlapping interests in `O(log n + k)` rather than testing every watcher), gated
+by an **endorsement flag-lattice** (`Endorsement`, `InterestId`) that routes
+conservatively — a superset of what the pump will actually deliver, never a
+subset.
+
+Two honest caveats. It is a `Vec` plus a segment tree rebuilt on each
+register/unregister, not yet an enfilade — so it does not version, persist, or
+GC with the rest of the plex. And nothing routes through it yet: the reactive
+pump re-evaluates its view on every pump rather than asking the canopy whether a
+commit could have touched it. Making it an enfilade and putting it on the pump's
+path is plan v5's G-4.
 
 ## The context enfilade — `context.rs`
 
-`Context` carries inherited scope down: namespace, schema, placement. It is the
-DSPative-context generalization of dsps from "displacement" to "everything a
-subtree should receive from where it sits." Authority itself lives in the
-canopy's endorsement lattice (Gold-faithful — authority was never a dsp), while
-namespace/schema/placement inherit down the context enfilade.
+The context enfilade carries inherited scope down: namespace, schema, placement.
+It is the DSPative-context generalization of dsps from "displacement" to
+"everything a subtree should receive from where it sits." Authority itself lives
+in the canopy's endorsement lattice (Gold-faithful — authority was never a dsp).
+
+It is a real enfilade — a persistent measured tree over the granfilade, versioned
+and GC-rooted like the others — and it is load-bearing: the **durable catalog**
+and the **edition-versioned schema registry** are bindings in it at the root
+scope. Both are invariants `CLAUDE.md` names, and both used to exist only on the
+LSM, so a world running on the Ent had no durable names and committed with
+`NoSchemas`.
 
 ## Where the LSM stands now
 
 `grmpl-store` (the fjall LSM) has not vanished. It survives as the
-**construction-time conformance oracle** — an independent third leg the ent is
-checked against — plus the `grmpl-bench` baseline and the showcase's substrate
-demos. The end-state plan deletes it after a soak window, leaving a single
-ent-native on-disk format; today it is deliberately kept as the differential
-truth against which the Ent is proven.
+**differential conformance oracle** — an independent second leg the ent is
+checked against — and as the showcase's substrate demo. The end-state plan
+deletes it after a soak window, leaving a single ent-native on-disk format.
 
-Every distinctive Xanadu-`Ent` structural component is present and correct:
-measured enfilade, granfilade, WID pruning (load-bearing in the language), DSP
-transforms, structural-sharing fork, Edition enfilade + branch DAG, interval-tree
-canopy with flag-lattice, and backfollow/version-compare. What remains are
-**performance optimizations of already-correct capabilities** — the subject of
-Part IV.
+The oracle is no longer a handful of store-contract tests. `grmpl-conformance`
+states a law once, against the substrate *traits*, and runs it on every
+implementation: the whole of `grmpl-proc`, `grmpl-lang` and `grmpl-session` —
+the optimistic commit protocol, the reactive pump, the scheduler, replay, GC
+policy, schema enforcement, behaviours-as-relations, the concatenative surface,
+the session runtime, and every seeded oracle among them — runs twice, once on
+each substrate. "The language runs on the Ent" is a property the suite checks
+rather than a sentence in this chapter. `grmpl run`, `grmpld` and `grmpl-bench`
+open an `EntStore`.
+
+Every distinctive Xanadu-`Ent` structural component is present: measured
+enfilade, granfilade, WID pruning (load-bearing in the language), DSP transforms,
+durable structural-sharing forks, Edition + Fact + context enfilades, branch DAG,
+interval-tree canopy, and backfollow/version-compare. What remains is a mix of
+optimizations and of *wiring* — the canopy and the DSP overlay are correct but
+not yet on the running system's path, and the Derived enfilade is unbuilt. Plan
+v5 (`docs/ENT-GAPS-PLAN.md`) tracks them; Part IV describes where they lead.

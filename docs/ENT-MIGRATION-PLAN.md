@@ -1,6 +1,6 @@
 # Making the Ent the heart of grmpl — plan (v4, no-compromise)
 
-> **Superseded in part by [`ENT-GAPS-PLAN.md`](ENT-GAPS-PLAN.md) (v5).** An audit
+> **Superseded by [`ENT-GAPS-PLAN.md`](ENT-GAPS-PLAN.md) (v5).** An audit
 > of `crates/grmpl-ent` against the status section below found that several
 > components are present as *modules* but are not the substrate the world runs on
 > — three (`canopy`, `context`, `dsp::DspEnf`) have no caller outside their own

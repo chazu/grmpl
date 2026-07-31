@@ -5,6 +5,33 @@ authoritative substrate of the language: a coordinated family of persistent,
 measured, versioned **enfilades** over a shared **granfilade**, with no LSM log
 underneath it in the end state.
 
+> ## Status
+>
+> **Landed.** G-1b (B+ arity — 1000 rows now cost 32 granfilade records, not
+> 1000) · G-5 (context enfilade carrying the durable catalog + schema registry)
+> · G-0a (the `frames_encoded` ops counter) · G-0b (SHA-256 content keys, framed
+> under a node-format version) · G-1 (path-only persistence — commit work flat in
+> relation size) · G-2 (Fact roots persisted; `open` no longer replays the log)
+> · G-6 (durable forks sharing one granfilade — a 5000-row fork encodes **zero**
+> node frames — plus a persistent DagWood).
+>
+> **The suite moved with it.** `grmpl-conformance` states a law once and runs it
+> against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
+> — ~90 laws including every seeded oracle — now run on the ent *and* the LSM.
+> `grmpl run`, `grmpld` and `grmpl-bench` open an `EntStore`.
+>
+> **Remaining.** G-0c (doc truth) · G-0d (measured version-compare) · G-2a (Rel +
+> Version enfilades) · G-3 (the WID measure family) · G-4 (canopy as enfilade,
+> wired to the pump) · G-7 (DSP overlay instancing) · G-8 (Derived enfilades) ·
+> G-9 (multi-order arrangements) · G-10 (showcase cutover, soak, delete the LSM).
+>
+> **One estimate was wrong.** G-0d is filed below as small; it is not. Pruning a
+> diff at every node needs the B+ tree to split at an arbitrary key so the two
+> sides can be compared span-by-span, which is a `split`/`join` addition to
+> `tree.rs`, not a rewrite of `diff`. It is also the least load-bearing item here
+> — `compare` has no caller in the running language — so it is now sequenced
+> after G-3, whose `KeyBounds` measure it wants anyway.
+
 **What this document adds.** v4 declared every distinctive Xanadu-`Ent`
 structural component "present and correct", with three deferred *performance*
 items. An audit of `crates/grmpl-ent` against that claim finds the components are
