@@ -1,5 +1,14 @@
 # Making the Ent the heart of grmpl — plan (v4, no-compromise)
 
+> **Superseded in part by [`ENT-GAPS-PLAN.md`](ENT-GAPS-PLAN.md) (v5).** An audit
+> of `crates/grmpl-ent` against the status section below found that several
+> components are present as *modules* but are not the substrate the world runs on
+> — three (`canopy`, `context`, `dsp::DspEnf`) have no caller outside their own
+> unit tests, the Fact enfilade is replayed from the log on open rather than
+> persisted, and the catalog/schema registry exist only on the LSM. v5 is the plan
+> to close those gaps: **use the Ent, don't simulate it.** Read the status section
+> below with v5 §1 (claimed vs. actual) beside it.
+
 **Mandate.** The end state is a **faithful Xanadu-`Ent` as the authoritative
 substrate of the language — no compromises.** The store *is* a coordinated family
 of persistent, measured, versioned **enfilades** over a shared **granfilade**
