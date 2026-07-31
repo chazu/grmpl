@@ -67,9 +67,8 @@ decision rather than a task:
 * **"Content keys are order-independent"** (v4 §1, node identity). The tree is
   weight-balanced with a shape that depends on insertion order, and the content
   key is `hash(lck, rck, key, val)`. Two histories reaching the same logical map
-  therefore get **different** root keys. Order-independence requires a
-  canonically-shaped tree. See **G-2b** — this is a real fork in the design, and
-  it gates cross-branch dedup and any structural `canonical_dump`.
+  therefore get **different** root keys. **Settled in G-2b: the claim is
+  withdrawn** — identity is logical, as v4 §2 and `tree.rs` already say.
 * **"`DefaultHasher` has fixed keys, so the key is deterministic across
   processes"** (`granfilade.rs:30`). True within one build; `std` explicitly does
   not specify the algorithm or guarantee it across Rust releases. See **G-0b**.
@@ -129,7 +128,8 @@ namespace/schema, and order-independent content keys.
 
 *Change.* Correct those passages to describe what the code does, and point at
 this plan for what it will do. (Doing this *first* keeps the docs honest while
-the waves land, rather than retroactively.)
+the waves land, rather than retroactively.) **Absorbs G-2b**: withdraw the
+order-independence claim and state that identity is logical.
 
 *Acceptance.* Every "landed" claim in the book has a named test behind it.
 
@@ -231,32 +231,93 @@ key (see the caveat in G-2b).
 
 *Depends on.* G-2.
 
-#### G-2b. **Decision:** canonical tree shape, or drop the order-independence claim
+#### G-2b. **SETTLED: identity is logical — the order-independence claim is withdrawn**
 
-*The fork.* v4 §1 asserts content keys are order-independent ("a property test
-asserts one content key for the same logical subtree under two insertion
+*The fork was.* v4 §1 asserts content keys are order-independent ("a property
+test asserts one content key for the same logical subtree under two insertion
 orders"). With a weight-balanced tree this is false: shape depends on insertion
-order, and the key is closed over children's keys. Two options:
+order, and the key is closed over children's keys. Either **(a)** drop the claim,
+or **(b)** adopt a canonically-shaped tree — a hash-treap keyed on `hash(key)`,
+or a B-tree with content-determined split boundaries (a "prolly tree") — so
+*equal content ⇒ equal shape ⇒ equal root key* regardless of history.
 
-* **(a) Drop the claim.** Content keys identify a *shape*. Structural sharing
-  still works within a version lineage (a path-copy shares every untouched
-  subtree). Cross-history dedup and a structural `canonical_dump` do not.
-* **(b) Adopt a canonically-shaped tree** — a hash-treap keyed on `hash(key)`, or
-  a deterministic B-tree with content-determined splits — so *equal content ⇒
-  equal shape ⇒ equal root key*, regardless of history.
+*Measured, on a 1000-entry Fact tree over a real granfilade:*
 
-*Recommendation: (b).* It is contained (only the balance rule in `tree.rs`
-changes; measures, persistence, and the store are untouched), it makes dedup real
-across branches — which is exactly what G-8's durable fork wants — and it is what
-Gold's interning implies. The cost is losing the current shape's cache behaviour,
-which G-0a can measure before and after.
+| | records |
+|---|---|
+| build 1000 entries | 1000 (one KV record per tuple), depth 15 |
+| **+1 insert on top** | **+16** — within-lineage path-copy sharing |
+| same map, **reverse** insertion order | **+998 of 1000** (0.2% dedup) |
+| same map, **interleaved** order | +500 of 1000 (50% dedup) |
 
-*Acceptance.* The property test v4 already specifies: build the same logical map
-by two different insertion orders, assert one content key. Plus a
-`canonical_dump` defined over the root key rather than over a re-serialized
-projection.
+*Decision: **(a)**.* Shape-dependence costs almost everything in the worst case
+(0.2% dedup) and half in a mixed case — but only in the scenario "two *different*
+histories reach the *same* logical state", and that is a scenario grmpl
+structurally avoids:
 
-*Depends on.* G-1. Should be decided **before** G-8 and G-10.
+* a fork **starts** from its parent's root, so it shares by path copy — the
+  +16-records row, which is shape-independent and is what G-1, G-2 and G-6
+  actually depend on;
+* **replay** re-runs the same operation sequence, so it reproduces the same shape
+  and dedups already (the tree is deterministic — `tree.rs` §Weight-balanced);
+* **instances** are disjoint by construction — that is what the DSP shift is for;
+* speculative forks are simulated ahead and **discarded**, not reconverged.
+
+And the codebase has already made this decision twice: v4 §2 defines
+`canonical_dump` over "the logical projection in `(edition, submit_index)` order
+per rel … **not** raw node bytes", calling that *faithful* ("Gold guarantees
+content/version identity, never byte-identical node layout"); and `tree.rs:16‑18`
+says "identity is defined at the entry level, never the node level." Only v4 §1's
+node-identity paragraph disagrees. Settling (a) makes three statements consistent
+instead of leaving one contradicting two.
+
+The Replay law — the one that is actually load-bearing — is unaffected: it
+demands *same history ⇒ same result*, which the deterministic balance rule
+already gives.
+
+*What this costs, honestly.* Cross-history dedup is forgone. If a future
+workload turns out to reconverge often, the fix is the prolly-tree form, and
+**it rides on top of G-1b below** rather than replacing it — so choosing (a) now
+sequences that option correctly instead of foreclosing it.
+
+*Change.* Withdraw the claim in v4 §1 and in `granfilade.rs`'s module docstring;
+state plainly that a content key identifies a *shape*, that sharing is
+within-lineage, and that logical identity is `iter`/`scan_updates` equality.
+
+*Acceptance.* No new machinery — a doc change plus a test asserting the property
+that *does* hold: replaying the same operation sequence into a fresh granfilade
+adds **zero** new records.
+
+*Depends on.* Nothing. Folds into G-0c.
+
+#### G-1b. Multi-entry nodes — stop storing one KV record per tuple
+
+*Gap.* The measurement above turned up something this plan under-weighted at
+first draft: **a 1000-row relation is 1000 granfilade records**. Every tree node
+holds exactly one entry (`tree.rs`), and every node is one content-addressed blob
+(`granfilade.rs:271‑289`), so the store pays a 16-byte key, two child pointers,
+and a full fjall record *per tuple* — and `load` is one recursive KV `get` per
+tuple (4.6 ms for 1000 entries in a debug build).
+
+*Why it matters.* Unlike shape-canonicality, this is paid on **every** commit and
+**every** load, always — not in a rare reconvergence scenario. It is the
+constant-factor reason the ent looks bad next to the LSM on `grmpl-bench`, and
+therefore a real blocker on the E7 cutover (G-10) that no amount of asymptotic
+work fixes.
+
+*Change.* Give the enfilade B-tree arity — ~64–128 entries per node — so one
+granfilade record covers a whole run of tuples. `Measure` is already a monoid, so
+it composes over a multi-entry node with no interface change; path copy, WID
+pruning, and the `Persist` framing all carry over. Node count drops by roughly
+the arity factor, and so do KV round-trips on load.
+
+*Acceptance.* Records-per-1000-rows falls from ~1000 to ~an arity-fraction of it;
+load time per row drops correspondingly (G-0a counters + a `grmpl-bench` axis).
+Conformance, reopen, and GC suites stay green — this is a representation change,
+not a semantic one.
+
+*Depends on.* G-0a, G-0b. Should land **before** G-1, since G-1 memoizes a
+content key *into the node* and the node type changes here.
 
 ### Wave 2 — the shelfware modules become load-bearing
 
@@ -357,7 +418,7 @@ by `O(edit)`, not `O(state)` (assert the `node_count` delta). Ancestry survives
 reopen. GC after a fork collects nothing reachable from either branch. The P10
 fork/replay identity holds over the logical projection.
 
-*Depends on.* G-2, G-2a, and the G-2b decision.
+*Depends on.* G-2, G-2a.
 
 #### G-7. DSP overlays that are actually `O(1)` — and instancing that uses them
 
@@ -396,7 +457,7 @@ unbuilt member.
 *Acceptance.* A materialized view survives close/reopen with **no**
 recomputation. Incremental maintenance touches `O(delta · log n)` nodes.
 
-*Depends on.* G-1, G-2a, G-2b.
+*Depends on.* G-1b, G-1, G-2a.
 
 #### G-9. Multi-order Arrangements
 
@@ -443,13 +504,13 @@ precondition). Then the deletion commit, and a single ent-native on-disk format.
 
 ```
 Wave 0  G-0a counters ─┬─ G-0b stable content hash
-                       ├─ G-0c doc-truth pass
+                       ├─ G-0c doc-truth pass  (absorbs G-2b: identity is logical)
                        └─ G-0d measured version-compare
                               │
-Wave 1  G-1 path-only persistence  ← the unlock for everything below
-          └─ G-2 Fact roots persisted (open stops replaying the log)
-               └─ G-2a Rel + Version enfilades
-                    └─ G-2b DECISION: canonical shape?   (gates G-6, G-8)
+Wave 1  G-1b multi-entry nodes         ← the constant factor
+          └─ G-1 path-only persistence ← the asymptotic unlock
+               └─ G-2 Fact roots persisted (open stops replaying the log)
+                    └─ G-2a Rel + Version enfilades
                               │
 Wave 2  G-3 the WID measure family
           ├─ G-4 canopy as enfilade + pump routes through it
@@ -462,15 +523,24 @@ Wave 3  G-6 durable fork + persistent DagWood
 Wave 4  G-10 full cutover, soak, delete grmpl-store
 ```
 
-**Order rationale.** G-1 comes first among the substantive items because it is
-the reason the cutover stalled: while a commit is `O(n)`, the ent cannot replace
-the LSM anywhere that cares about throughput, and every later item that persists
-*more* per commit makes that worse. G-2 immediately after, because a store whose
-recovery is log replay is not the Ent regardless of what the modules are called.
+**Order rationale.** Wave 1 fixes the two costs that stalled the cutover, in the
+order they bite. **G-1b** first: a commit and a load currently pay one
+content-addressed KV record *per tuple*, a constant factor no asymptotic work
+removes, and it must precede G-1 because G-1 memoizes a content key into the node
+whose type G-1b changes. **G-1** next, because while a commit re-walks the whole
+tree at `O(n)` the ent cannot replace the LSM anywhere that cares about
+throughput — and every later item that persists *more* per commit makes that
+worse. **G-2** immediately after, because a store whose recovery is log replay is
+not the Ent regardless of what the modules are called.
+
 Wave 2 is where the three shelfware modules become load-bearing — the direct
 answer to "use it, don't simulate it". Wave 3 spends the structure on the
 capabilities that only an Ent can offer cheaply. Wave 4 is the deletion the
 mandate has been pointing at since v4.
+
+Note that **G-2b no longer gates anything**: settling identity as logical removes
+the decision that Wave 3 was waiting on, so G-6 and G-8 depend only on the Wave 1
+substrate work.
 
 Each item lands as its own commit, with the invariant checks from `CLAUDE.md`
 (`cargo build`, `cargo test`, `cargo clippy --all-targets`, iroh off) green, plus
@@ -485,6 +555,7 @@ The Ent is *used*, not simulated, when:
 * every module in `crates/grmpl-ent/src` has a caller outside its own unit tests;
 * no `Vec`/`HashMap`/`BTreeMap` stands in for an enfilade in the store's state;
 * recovery is a root lookup, not a log replay — there is no LSM shape underneath;
+* the granfilade stores a *run* of tuples per record, not one record per tuple;
 * every sublinear claim in the crate is asserted by a counter, not a docstring;
 * the catalog and the schema registry are ent-native, and `grmpl run` uses them;
 * the full P0–P15 suite runs green on `EntStore`;
