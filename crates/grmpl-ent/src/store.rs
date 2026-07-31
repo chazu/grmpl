@@ -21,10 +21,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
-    Diff, Edition, EditionStore, Entity, Error, RelId, Result, Time, TraceStore, Tuple, Update,
-    Value,
+    wire, Catalog, Diff, Edition, EditionStore, Entity, Error, RelId, Result, Schema,
+    SchemaCatalog, Time, TraceStore, Tuple, Update, Value,
 };
 
+use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Dsp;
 use crate::granfilade::{ContentKey, Granfilade};
@@ -55,6 +56,9 @@ struct Inner {
     fact: HashMap<RelId, BTreeMap<u64, FactTree>>,
     /// Edition enfilade per rel: the raw commit-order log.
     log: HashMap<RelId, LogTree>,
+    /// Context enfilade: inherited scope bindings, plus the durable catalog and
+    /// the edition-versioned schema registry ([`crate::context`]).
+    ctx: ContextEnf,
 }
 
 impl Default for EntStore {
@@ -198,7 +202,13 @@ impl EntStore {
             }
         }
         Ok(EntStore {
-            inner: Mutex::new(Inner { current: at.0, watermark: inner.watermark, fact, log }),
+            inner: Mutex::new(Inner {
+                current: at.0,
+                watermark: inner.watermark,
+                fact,
+                log,
+                ctx: inner.ctx.clone(),
+            }),
             gran: None,
             branch: child_branch,
             dag: Arc::clone(&self.dag),
@@ -282,6 +292,22 @@ impl EntStore {
         self.commit(&updates)
     }
 
+    /// Persist the context enfilade (catalog, schemas, scoped bindings) as one
+    /// atomic granfilade write. A no-op for an in-memory store.
+    ///
+    /// Kept separate from [`persist`](Self::persist) because context is written
+    /// on its own occasions — `register`, `put_schema` — not on the commit path,
+    /// and it is exempt from consolidation: the catalog is append-only for the
+    /// life of the world.
+    fn persist_ctx(&self, inner: &Inner) -> Result<()> {
+        let gran = match &self.gran {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        let (ck, nodes) = gran.collect_tree(&inner.ctx);
+        gran.write(nodes, vec![(CTX_KEY.to_vec(), opt_ck_bytes(ck))])
+    }
+
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
     /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
     fn persist(&self, inner: &Inner, touched: &[RelId], all_ckpts: bool) -> Result<()> {
@@ -318,7 +344,13 @@ impl EntStore {
 
 impl Inner {
     fn empty() -> Inner {
-        Inner { current: 0, watermark: 0, fact: HashMap::new(), log: HashMap::new() }
+        Inner {
+            current: 0,
+            watermark: 0,
+            fact: HashMap::new(),
+            log: HashMap::new(),
+            ctx: ContextEnf::new(),
+        }
     }
 
     /// Rebuild in-memory state from a granfilade: the clock, each rel's Fact
@@ -327,7 +359,9 @@ impl Inner {
     fn rebuild(gran: &Granfilade) -> Result<Inner> {
         let current = gran.meta_get(b"cur")?.map(|b| u64_be(&b)).unwrap_or(0);
         let watermark = gran.meta_get(b"wm")?.map(|b| u64_be(&b)).unwrap_or(0);
-        let mut inner = Inner { current, watermark, fact: HashMap::new(), log: HashMap::new() };
+        let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(CTX_KEY)?.unwrap_or_default()))?;
+        let mut inner =
+            Inner { current, watermark, fact: HashMap::new(), log: HashMap::new(), ctx };
 
         // Fact checkpoints (state as-of the watermark).
         for (key, val) in gran.meta_prefix(b"ckpt:")? {
@@ -491,7 +525,135 @@ impl TraceStore for EntStore {
     }
 }
 
+/// **The durable catalog (G-5)** — bindings in the context enfilade at the root
+/// scope, so the name→id map versions, persists, and is GC-rooted exactly like
+/// the world's facts, rather than living in a private side table.
+impl Catalog for EntStore {
+    fn rel_id(&self, name: &str) -> Result<Option<RelId>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.ctx.get(&context::catalog_key(name)).and_then(as_rel))
+    }
+
+    fn register(&self, name: &str, id: RelId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = context::catalog_key(name);
+        // Append-only: rebinding a name to a different id is a hard error.
+        if let Some(existing) = inner.ctx.get(&key).and_then(as_rel) {
+            if existing != id {
+                return Err(Error::Store(format!(
+                    "catalog conflict: `{name}` already bound to {} (cannot rebind to {})",
+                    existing.0, id.0
+                )));
+            }
+            return Ok(());
+        }
+        inner.ctx = inner.ctx.insert(key, Value::Int(id.0 as i64));
+        self.persist_ctx(&inner)
+    }
+
+    fn entries(&self) -> Result<Vec<(String, RelId)>> {
+        let inner = self.inner.lock().unwrap();
+        let (lo, hi) = context::catalog_span();
+        // The catalog is one contiguous span of the enfilade, already in name
+        // order — a WID range walk, not a scan of every binding.
+        Ok(inner
+            .ctx
+            .range_collect(&lo, &hi)
+            .into_iter()
+            .filter_map(|(k, v)| Some((as_name(&k)?, as_rel(&v)?)))
+            .collect())
+    }
+}
+
+/// **The durable schema registry (G-5)**, versioned by the edition each version
+/// took effect. Because a version's key is `(rel, edition)`, `schema_at` is a
+/// **WID range walk** over `[(rel, 0), (rel, at + 1))` and takes the last row —
+/// the as-of query is answered by the enfilade's own ordering.
+impl SchemaCatalog for EntStore {
+    fn put_schema(&self, rel: RelId, schema: &Schema, at: Edition) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((cur_edition, current)) = latest_schema(&inner.ctx, rel)? {
+            if &current == schema {
+                return Ok(()); // idempotent re-put — no new version
+            }
+            // Evolution law: additive-only, and strictly after the current
+            // version's edition (a version's edition is when it took effect).
+            if !schema.is_additive_over(&current) {
+                return Err(Error::Schema(format!(
+                    "non-additive schema change for relation {}: a new version may only \
+                     append columns to the current one",
+                    rel.0
+                )));
+            }
+            if at.0 <= cur_edition {
+                return Err(Error::Schema(format!(
+                    "schema evolution for relation {} must take effect after edition {} \
+                     (got {})",
+                    rel.0, cur_edition, at.0
+                )));
+            }
+        }
+        let bytes = wire::encode_schema(schema);
+        inner.ctx = inner.ctx.insert(context::schema_key(rel, at.0), Value::Bytes(bytes.into()));
+        self.persist_ctx(&inner)
+    }
+
+    fn schema(&self, rel: RelId) -> Result<Option<Schema>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(latest_schema(&inner.ctx, rel)?.map(|(_, s)| s))
+    }
+
+    fn schema_at(&self, rel: RelId, at: Edition) -> Result<Option<Schema>> {
+        let inner = self.inner.lock().unwrap();
+        // The newest version whose introducing edition is ≤ `at` — the last row
+        // of the pruned span, no scan of other relations' versions.
+        let (lo, hi) = context::schema_span(rel, 0, at.0.saturating_add(1));
+        match inner.ctx.range_collect(&lo, &hi).last() {
+            None => Ok(None),
+            Some((_, v)) => decode_schema_value(v).map(Some),
+        }
+    }
+}
+
 // --- helpers --------------------------------------------------------------
+
+fn as_rel(v: &Value) -> Option<RelId> {
+    match v {
+        Value::Int(i) => Some(RelId(*i as u32)),
+        _ => None,
+    }
+}
+
+/// The relation name from a catalog binding key `(scope, NS_CATALOG, name)`.
+fn as_name(k: &Tuple) -> Option<String> {
+    match k.as_slice().get(2) {
+        Some(Value::Text(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+fn decode_schema_value(v: &Value) -> Result<Schema> {
+    match v {
+        Value::Bytes(b) => wire::decode_schema(b),
+        _ => Err(Error::Codec("context: schema binding is not bytes".into())),
+    }
+}
+
+/// The highest-edition schema version for `rel`, with the edition it took
+/// effect — the last row of the relation's contiguous version span.
+fn latest_schema(ctx: &ContextEnf, rel: RelId) -> Result<Option<(u64, Schema)>> {
+    let (lo, hi) = context::schema_all_span(rel);
+    match ctx.range_collect(&lo, &hi).last() {
+        None => Ok(None),
+        Some((k, v)) => {
+            let edition = match k.as_slice().get(3) {
+                Some(Value::Int(e)) => *e as u64,
+                _ => return Err(Error::Codec("context: schema key has no edition".into())),
+            };
+            Ok(Some((edition, decode_schema_value(v)?)))
+        }
+    }
+}
 
 fn touched(updates: &[(RelId, Tuple, Diff)]) -> Vec<RelId> {
     let mut rels: Vec<RelId> = updates.iter().map(|(r, _, _)| *r).collect();
@@ -499,6 +661,10 @@ fn touched(updates: &[(RelId, Tuple, Diff)]) -> Vec<RelId> {
     rels.dedup();
     rels
 }
+
+/// The meta key holding the context enfilade's root (catalog + schemas + scoped
+/// bindings). GC roots from it, so the catalog is never collected.
+const CTX_KEY: &[u8] = b"ctx:";
 
 fn log_key(rel: RelId) -> Vec<u8> {
     let mut k = b"log:".to_vec();

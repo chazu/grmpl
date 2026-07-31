@@ -21,7 +21,7 @@ pub mod store;
 pub mod tree;
 
 pub use canopy::{Canopy, Endorsement, InterestId};
-pub use context::Context;
+pub use context::{ContextEnf, Scope};
 pub use dag::{Branch, BranchId, Dag};
 pub use dsp::{Dsp, DspEnf};
 pub use granfilade::{ContentKey, Granfilade, Persist};

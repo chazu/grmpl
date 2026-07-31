@@ -241,7 +241,9 @@ impl Granfilade {
     pub fn gc(&self) -> Result<usize> {
         // Roots: every content key referenced by a meta entry.
         let mut stack: Vec<ContentKey> = Vec::new();
-        for prefix in [b"log:".as_ref(), b"ckpt:".as_ref()] {
+        // `ctx:` is a root too: the catalog and schema registry live in the
+        // context enfilade, and collecting them would lose the world's names.
+        for prefix in [b"log:".as_ref(), b"ckpt:".as_ref(), b"ctx:".as_ref()] {
             for (_k, v) in self.meta_prefix(prefix)? {
                 if v.first() == Some(&1) {
                     if let Some(b) = v.get(1..17) {
