@@ -25,7 +25,7 @@ use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
 
 use crate::measure::Measure;
-use crate::tree::Tree;
+use crate::tree::{NodeRef, Tree};
 
 /// A 128-bit content key (two salted `SipHash` passes; `DefaultHasher` has fixed
 /// keys, so the key is deterministic across processes — required to reload a
@@ -195,15 +195,37 @@ impl Granfilade {
             .map_err(store_err)?
             .ok_or_else(|| Error::Store("granfilade: node key not found".into()))?;
         let bytes = bytes.as_ref();
-        // Frame layout: child keys FIRST (so GC can read them type-agnostically),
-        // then the entry key and value.
-        let (lck, pos) = decode_ck(bytes, 0)?;
-        let (rck, pos) = decode_ck(bytes, pos)?;
-        let (key, pos) = K::decode(bytes, pos)?;
-        let (val, _pos) = V::decode(bytes, pos)?;
-        let left = self.load(lck)?;
-        let right = self.load(rck)?;
-        Ok(Tree::from_parts(key, val, left, right))
+        let (tag, child_keys, pos) = decode_header(bytes)?;
+        let (count, mut pos) = decode_u32(bytes, pos)?;
+        match tag {
+            TAG_LEAF => {
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (key, p) = K::decode(bytes, pos)?;
+                    let (val, p) = V::decode(bytes, p)?;
+                    entries.push((key, val));
+                    pos = p;
+                }
+                Ok(Tree::leaf_of(entries))
+            }
+            TAG_INTERNAL => {
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (key, p) = K::decode(bytes, pos)?;
+                    keys.push(key);
+                    pos = p;
+                }
+                let mut children = Vec::with_capacity(child_keys.len());
+                for c in child_keys {
+                    children.push(self.load(Some(c))?);
+                }
+                if keys.len() + 1 != children.len() {
+                    return Err(Error::Codec("granfilade: malformed internal node".into()));
+                }
+                Ok(Tree::internal_of(keys, children))
+            }
+            _ => Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
+        }
     }
 
     /// Number of distinct nodes stored — for structural-sharing verification.
@@ -235,9 +257,7 @@ impl Granfilade {
                 continue;
             }
             if let Some(frame) = self.nodes.get(ck).map_err(store_err)? {
-                let (l, r) = children_of(frame.as_ref())?;
-                stack.extend(l);
-                stack.extend(r);
+                stack.extend(children_of(frame.as_ref())?);
             }
         }
         // Sweep.
@@ -257,57 +277,83 @@ impl Granfilade {
     }
 }
 
-/// The two child content keys of a node frame (leading fields), read without
-/// decoding the entry — used by GC.
-fn children_of(frame: &[u8]) -> Result<(Option<ContentKey>, Option<ContentKey>)> {
-    let (l, pos) = decode_ck(frame, 0)?;
-    let (r, _pos) = decode_ck(frame, pos)?;
-    Ok((l, r))
+/// A leaf frame: a run of `(key, value)` entries, no children.
+const TAG_LEAF: u8 = 0;
+/// An internal frame: child content keys plus the separators dividing them.
+const TAG_INTERNAL: u8 = 1;
+
+/// The child content keys of a node frame, read **without decoding the payload**
+/// — the frame puts the tag and the child-key run first precisely so GC can walk
+/// references without knowing `K` or `V`. Used by [`Granfilade::gc`].
+fn children_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
+    let (_tag, children, _pos) = decode_header(frame)?;
+    Ok(children)
+}
+
+/// Frame header: `tag(1) || n_children(u32 BE) || [content_key; 16]*n`. Returns
+/// the tag, the child keys, and the offset where the payload count begins.
+fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
+    let tag = *frame.first().ok_or_else(|| trunc("node tag"))?;
+    let (n, mut pos) = decode_u32(frame, 1)?;
+    let mut children = Vec::with_capacity(n);
+    for _ in 0..n {
+        let end = pos + 16;
+        let b = frame.get(pos..end).ok_or_else(|| trunc("content key"))?;
+        children.push(b.try_into().unwrap());
+        pos = end;
+    }
+    Ok((tag, children, pos))
+}
+
+fn decode_u32(bytes: &[u8], pos: usize) -> Result<(usize, usize)> {
+    let end = pos + 4;
+    let b = bytes.get(pos..end).ok_or_else(|| trunc("count"))?;
+    Ok((u32::from_be_bytes(b.try_into().unwrap()) as usize, end))
+}
+
+fn encode_header(out: &mut Vec<u8>, tag: u8, children: &[ContentKey]) {
+    out.push(tag);
+    out.extend_from_slice(&(children.len() as u32).to_be_bytes());
+    for c in children {
+        out.extend_from_slice(c);
+    }
 }
 
 /// Recurse the tree, appending each node's `(content_key, frame_bytes)` and
 /// returning the root key. Children first, so a node's frame carries its
 /// children's content keys.
+///
+/// One frame is one **node**, and a node holds a whole run of entries
+/// ([`grmpl_ent::tree::B`](crate::tree::B) of them), so the store keeps one
+/// record per run rather than one per tuple.
 fn collect_nodes<K, V, M>(tree: &Tree<K, V, M>, out: &mut Vec<(ContentKey, Vec<u8>)>) -> Option<ContentKey>
 where
     K: Persist + Ord + Clone,
     V: Persist + Clone,
     M: Measure<K, V>,
 {
-    let (key, val, left, right) = tree.root_parts()?;
-    let lck = collect_nodes(left, out);
-    let rck = collect_nodes(right, out);
-    // Child keys first (GC reads them without decoding the entry), then entry.
     let mut bytes = Vec::new();
-    encode_ck(&mut bytes, lck);
-    encode_ck(&mut bytes, rck);
-    key.encode(&mut bytes);
-    val.encode(&mut bytes);
+    match tree.node()? {
+        NodeRef::Leaf(entries) => {
+            encode_header(&mut bytes, TAG_LEAF, &[]);
+            bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (k, v) in entries {
+                k.encode(&mut bytes);
+                v.encode(&mut bytes);
+            }
+        }
+        NodeRef::Internal(keys, children) => {
+            let cks: Vec<ContentKey> = children.iter().filter_map(|c| collect_nodes(c, out)).collect();
+            encode_header(&mut bytes, TAG_INTERNAL, &cks);
+            bytes.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for k in keys {
+                k.encode(&mut bytes);
+            }
+        }
+    }
     let ck = hash128(&bytes);
     out.push((ck, bytes));
     Some(ck)
-}
-
-fn encode_ck(out: &mut Vec<u8>, ck: Option<ContentKey>) {
-    match ck {
-        None => out.push(0),
-        Some(k) => {
-            out.push(1);
-            out.extend_from_slice(&k);
-        }
-    }
-}
-
-fn decode_ck(bytes: &[u8], pos: usize) -> Result<(Option<ContentKey>, usize)> {
-    match bytes.get(pos) {
-        Some(0) => Ok((None, pos + 1)),
-        Some(1) => {
-            let end = pos + 1 + 16;
-            let b = bytes.get(pos + 1..end).ok_or_else(|| trunc("content key"))?;
-            Ok((Some(b.try_into().unwrap()), end))
-        }
-        _ => Err(trunc("content-key flag")),
-    }
 }
 
 /// 128-bit content hash: two `SipHash` passes over the frame with distinct salts.
