@@ -215,6 +215,30 @@ where
         out
     }
 
+    /// The greatest entry whose key is `<= key`, or `None`. `O(log n)`.
+    ///
+    /// This is the as-of lookup: a Version enfilade keyed by edition answers
+    /// "the state in force at `at`" with it, so an as-of read is a descent
+    /// rather than a scan of the versions below `at`.
+    pub fn last_le(&self, key: &K) -> Option<(&K, &V)> {
+        match self.node()? {
+            NodeRef::Leaf(entries) => {
+                let i = entries.partition_point(|(k, _)| k <= key);
+                (i > 0).then(|| {
+                    let (k, v) = &entries[i - 1];
+                    (k, v)
+                })
+            }
+            NodeRef::Internal(keys, children) => {
+                // Descend the child whose span holds `key`; if that subtree has
+                // nothing at or below it, the answer is the greatest entry of a
+                // preceding sibling.
+                let i = child_index(keys, key);
+                (0..=i).rev().find_map(|j| children[j].last_le(key))
+            }
+        }
+    }
+
     /// Whether two trees are the **same shared version** — an `O(1)` pointer
     /// check (both empty, or the same root `Arc`). A `true` result means no entry
     /// differs; the backfollow / version-compare fast path (an unchanged relation

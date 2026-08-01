@@ -17,7 +17,6 @@
 //! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
@@ -43,6 +42,18 @@ type FactMeasure = (Count, SumDiff);
 type FactTree = Tree<Tuple, Diff, FactMeasure>;
 /// The Edition enfilade: `(edition, submit_index) → (tuple, diff)` raw log.
 type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
+/// The **Version enfilade**: `edition → Fact root`, one persistent root per
+/// live as-of edition (G-2a). `last_le` makes an as-of read a descent.
+type VersionTree = Tree<u64, FactTree, Count>;
+/// The **Rel enfilade**: the directory of live relations (G-2a).
+type RelTree = Tree<u32, RelRoots, Count>;
+
+/// One relation's roots: its versioned Fact enfilade and its Edition log.
+#[derive(Clone, Default)]
+struct RelRoots {
+    versions: VersionTree,
+    log: LogTree,
+}
 
 /// An ent store: a family of per-relation Fact + Edition enfilades behind one
 /// commit clock, optionally durable on a [`Granfilade`].
@@ -62,13 +73,45 @@ pub struct EntStore {
 struct Inner {
     current: u64,
     watermark: u64,
-    /// Fact enfilade per rel: `edition → net-state root` (versioned for as-of).
-    fact: HashMap<RelId, BTreeMap<u64, FactTree>>,
-    /// Edition enfilade per rel: the raw commit-order log.
-    log: HashMap<RelId, LogTree>,
+    /// **The Rel enfilade (G-2a).** The directory of live relations, each
+    /// holding its Version enfilade and its Edition log.
+    ///
+    /// This used to be `HashMap<RelId, BTreeMap<u64, FactTree>>` beside
+    /// `HashMap<RelId, LogTree>` — the "family of enfilades" held together by
+    /// std maps, with the relation directory in unordered iteration order (the
+    /// one thing the Determinism invariant warns about). Now the store's whole
+    /// state is one root, ordered all the way down, and "how many relations" or
+    /// "how many live editions" are measures.
+    rels: RelTree,
     /// Context enfilade: inherited scope bindings, plus the durable catalog and
     /// the edition-versioned schema registry ([`crate::context`]).
     ctx: ContextEnf,
+}
+
+impl Inner {
+    fn roots(&self, rel: RelId) -> Option<&RelRoots> {
+        self.rels.get(&rel.0)
+    }
+
+    /// The Fact root in force at `at` — an `O(log n)` descent of the Version
+    /// enfilade, not a scan of the versions below it.
+    fn fact_at(&self, rel: RelId, at: u64) -> Option<&FactTree> {
+        self.roots(rel).and_then(|r| r.versions.last_le(&at)).map(|(_, t)| t)
+    }
+
+    fn log_of(&self, rel: RelId) -> Option<&LogTree> {
+        self.roots(rel).map(|r| &r.log)
+    }
+
+    /// Replace `rel`'s roots, creating the entry if it is new.
+    fn put(&mut self, rel: RelId, roots: RelRoots) {
+        self.rels = self.rels.insert(rel.0, roots);
+    }
+
+    /// Every live relation, in id order — deterministic, unlike a `HashMap`.
+    fn rel_ids(&self) -> Vec<RelId> {
+        self.rels.iter().map(|(r, _)| RelId(*r)).collect()
+    }
 }
 
 impl Default for EntStore {
@@ -117,12 +160,7 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("range_at", at.0, inner.watermark));
         }
-        Ok(inner
-            .fact
-            .get(&rel)
-            .and_then(|f| f.range(..=at.0).next_back())
-            .map(|(_, t)| t.range_collect(lo, hi))
-            .unwrap_or_default())
+        Ok(inner.fact_at(rel, at.0).map(|t| t.range_collect(lo, hi)).unwrap_or_default())
     }
 
     /// **WID measure (E2).** How many live tuples of `rel` lie in `[lo, hi)`
@@ -133,12 +171,7 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("count_at", at.0, inner.watermark));
         }
-        Ok(inner
-            .fact
-            .get(&rel)
-            .and_then(|f| f.range(..=at.0).next_back())
-            .map(|(_, t)| t.measure_range(lo, hi).0 .0)
-            .unwrap_or(0))
+        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).0 .0).unwrap_or(0))
     }
 
     /// **WID weight measure (G-3).** The total net weight of `rel`'s tuples in
@@ -151,12 +184,7 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("weight_at", at.0, inner.watermark));
         }
-        Ok(inner
-            .fact
-            .get(&rel)
-            .and_then(|f| f.range(..=at.0).next_back())
-            .map(|(_, t)| t.measure_range(lo, hi).1 .0)
-            .unwrap_or(0))
+        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).1 .0).unwrap_or(0))
     }
 
     /// **Version-compare / backfollow (E6).** How `rel` differs between editions
@@ -171,14 +199,7 @@ impl EntStore {
                 return Err(door("compare", at.0, inner.watermark));
             }
         }
-        let root_at = |ed: u64| {
-            inner
-                .fact
-                .get(&rel)
-                .and_then(|f| f.range(..=ed).next_back())
-                .map(|(_, t)| t.clone())
-                .unwrap_or_default()
-        };
+        let root_at = |ed: u64| inner.fact_at(rel, ed).cloned().unwrap_or_default();
         Ok(root_at(a.0).diff(&root_at(b.0)))
     }
 
@@ -221,37 +242,33 @@ impl EntStore {
         // shared DagWood; the child carries that id and the same registry, so
         // ancestry is queryable across the whole fork family (the fulltrace).
         let child_branch = self.dag.lock().unwrap().fork(self.branch, at.0);
-        // Fact: keep the versioned roots up to `at` (their trees are shared Arcs).
-        let mut fact: HashMap<RelId, BTreeMap<u64, FactTree>> = HashMap::new();
-        for (rel, versions) in &inner.fact {
-            let kept: BTreeMap<u64, FactTree> =
-                versions.range(..=at.0).map(|(e, t)| (*e, t.clone())).collect();
-            if !kept.is_empty() {
-                fact.insert(*rel, kept);
+        // Keep each relation's versioned roots up to `at` (their trees are
+        // shared Arcs), and its log — whole when forking at current, else the
+        // prefix ≤ `at`.
+        let mut rels = RelTree::new();
+        for (rel, roots) in inner.rels.iter() {
+            let mut versions = VersionTree::new();
+            for (e, t) in roots.versions.range_collect(&0, &(at.0 + 1)) {
+                versions = versions.insert(e, t);
             }
-        }
-        // Edition log: the whole tree when forking at current (shared Arc), else
-        // the prefix ≤ `at`.
-        let mut log: HashMap<RelId, LogTree> = HashMap::new();
-        for (rel, l) in &inner.log {
-            if at.0 >= inner.current {
-                log.insert(*rel, l.clone());
+            let log = if at.0 >= inner.current {
+                roots.log.clone()
             } else {
                 let mut t = LogTree::new();
-                for (k, v) in l.range_collect(&(0, 0), &(at.0 + 1, 0)) {
+                for (k, v) in roots.log.range_collect(&(0, 0), &(at.0 + 1, 0)) {
                     t = t.insert(k, v);
                 }
-                if !t.is_empty() {
-                    log.insert(*rel, t);
-                }
+                t
+            };
+            if !versions.is_empty() || !log.is_empty() {
+                rels = rels.insert(*rel, RelRoots { versions, log });
             }
         }
         let child = EntStore {
             inner: Mutex::new(Inner {
                 current: at.0,
                 watermark: inner.watermark,
-                fact,
-                log,
+                rels,
                 ctx: inner.ctx.clone(),
             }),
             gran: self.gran.clone(),
@@ -263,7 +280,7 @@ impl EntStore {
         // without re-encoding anything: the fork writes roots, never nodes.
         if let Some(gran) = &self.gran {
             let child_inner = child.inner.lock().unwrap();
-            let rels: Vec<RelId> = child_inner.log.keys().copied().collect();
+            let rels: Vec<RelId> = child_inner.rel_ids();
             child.persist(&child_inner, &rels, None)?;
             child.persist_ctx(&child_inner)?;
             gran.write(
@@ -425,7 +442,7 @@ impl EntStore {
         let mut drop_meta = Vec::new();
         for rel in touched {
             // The Edition enfilade (the raw commit-order log).
-            let log = inner.log.get(rel).cloned().unwrap_or_default();
+            let log = inner.log_of(*rel).cloned().unwrap_or_default();
             let (ck, ns) = gran.collect_tree(&log);
             nodes.extend(ns);
             meta.push((log_key(self.branch, *rel), opt_ck_bytes(ck)));
@@ -434,8 +451,8 @@ impl EntStore {
             // as-of root is persisted, so `open` is a root lookup rather than a
             // replay of the log — the Fact enfilade is durable state in its own
             // right, not an index derived from a log underneath it.
-            if let Some(versions) = inner.fact.get(rel) {
-                for (edition, tree) in versions {
+            if let Some(roots) = inner.roots(*rel) {
+                for (edition, tree) in roots.versions.iter() {
                     let (ck, ns) = gran.collect_tree(tree);
                     nodes.extend(ns);
                     meta.push((fact_key(self.branch, *rel, *edition), opt_ck_bytes(ck)));
@@ -458,13 +475,7 @@ impl EntStore {
 
 impl Inner {
     fn empty() -> Inner {
-        Inner {
-            current: 0,
-            watermark: 0,
-            fact: HashMap::new(),
-            log: HashMap::new(),
-            ctx: ContextEnf::new(),
-        }
+        Inner { current: 0, watermark: 0, rels: RelTree::new(), ctx: ContextEnf::new() }
     }
 
     /// Rebuild in-memory state from a granfilade: the clock, then each
@@ -479,19 +490,22 @@ impl Inner {
         let current = gran.meta_get(&cur_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
         let watermark = gran.meta_get(&wm_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
         let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(&ctx_key(branch))?.unwrap_or_default()))?;
-        let mut inner =
-            Inner { current, watermark, fact: HashMap::new(), log: HashMap::new(), ctx };
+        let mut inner = Inner { current, watermark, rels: RelTree::new(), ctx };
 
         for (key, val) in gran.meta_prefix(&branch_key(b"fact:", branch))? {
             let rel = rel_from_key(&key, b"fact:");
             let edition = fact_edition(&key)
                 .ok_or_else(|| Error::Codec("granfilade: malformed fact root key".into()))?;
             let tree: FactTree = gran.load(bytes_opt_ck(&val))?;
-            inner.fact.entry(rel).or_default().insert(edition, tree);
+            let mut roots = inner.roots(rel).cloned().unwrap_or_default();
+            roots.versions = roots.versions.insert(edition, tree);
+            inner.put(rel, roots);
         }
         for (key, val) in gran.meta_prefix(&branch_key(b"log:", branch))? {
             let rel = rel_from_key(&key, b"log:");
-            inner.log.insert(rel, gran.load(bytes_opt_ck(&val))?);
+            let mut roots = inner.roots(rel).cloned().unwrap_or_default();
+            roots.log = gran.load(bytes_opt_ck(&val))?;
+            inner.put(rel, roots);
         }
         Ok(inner)
     }
@@ -499,33 +513,29 @@ impl Inner {
     /// Fold one update into the Fact enfilade at edition `e`: build a fresh root
     /// from the latest root ≤ `e`, netting the tuple's weight; drop it at 0.
     fn fold_fact(&mut self, e: u64, rel: RelId, tuple: &Tuple, diff: Diff) {
-        let facts = self.fact.entry(rel).or_default();
-        let base = facts.range(..=e).next_back().map(|(_, t)| t.clone()).unwrap_or_default();
+        let mut roots = self.roots(rel).cloned().unwrap_or_default();
+        let base = roots.versions.last_le(&e).map(|(_, t)| t.clone()).unwrap_or_default();
         let cur = base.get(tuple).copied().unwrap_or(0);
         let net = cur + diff;
         let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
-        facts.insert(e, root);
+        roots.versions = roots.versions.insert(e, root);
+        self.put(rel, roots);
     }
 
     /// Apply `updates` as edition `e`: append to each Edition enfilade in submit
     /// order and fold each into the Fact enfilade.
     fn apply(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
         for (i, (rel, tuple, diff)) in updates.iter().enumerate() {
-            {
-                let log = self.log.entry(*rel).or_default();
-                *log = log.insert((e, i as u64), (tuple.clone(), *diff));
-            }
+            let mut roots = self.roots(*rel).cloned().unwrap_or_default();
+            roots.log = roots.log.insert((e, i as u64), (tuple.clone(), *diff));
+            self.put(*rel, roots);
             self.fold_fact(e, *rel, tuple, *diff);
         }
         self.current = e;
     }
 
     fn holds_now(&self, rel: RelId, tuple: &Tuple) -> bool {
-        self.fact
-            .get(&rel)
-            .and_then(|f| f.range(..=self.current).next_back())
-            .and_then(|(_, t)| t.get(tuple))
-            .is_some_and(|n| *n > 0)
+        self.fact_at(rel, self.current).and_then(|t| t.get(tuple)).is_some_and(|n| *n > 0)
     }
 }
 
@@ -566,13 +576,10 @@ impl TraceStore for EntStore {
         if at.0 < inner.watermark {
             return Err(door("read_at", at.0, inner.watermark));
         }
-        let rows = inner
-            .fact
-            .get(&rel)
-            .and_then(|f| f.range(..=at.0).next_back())
-            .map(|(_, t)| t.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
-        Ok(rows)
+        Ok(inner
+            .fact_at(rel, at.0)
+            .map(|t| t.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default())
     }
 
     fn scan_updates(&self, rel: RelId, from: Edition, to: Edition) -> Result<Vec<Update>> {
@@ -581,7 +588,7 @@ impl TraceStore for EntStore {
             return Err(door("scan_updates", from.0, inner.watermark));
         }
         let mut out = Vec::new();
-        if let Some(log) = inner.log.get(&rel) {
+        if let Some(log) = inner.log_of(rel) {
             for ((edition, _submit), (tuple, diff)) in
                 log.range_collect(&(from.0 + 1, 0), &(to.0 + 1, 0))
             {
@@ -615,7 +622,7 @@ impl TraceStore for EntStore {
             return Ok(true);
         }
         for rel in rels {
-            if let Some(log) = inner.log.get(rel) {
+            if let Some(log) = inner.log_of(*rel) {
                 if log.measure_range(&(from.0 + 1, 0), &(to.0 + 1, 0)).0 > 0 {
                     return Ok(true);
                 }
@@ -634,29 +641,27 @@ impl TraceStore for EntStore {
         if new_wm <= inner.watermark {
             return Ok(Edition(inner.watermark));
         }
-        for facts in inner.fact.values_mut() {
-            let checkpoint = facts.range(..=new_wm).next_back().map(|(_, t)| t.clone());
-            let mut next: BTreeMap<u64, FactTree> = BTreeMap::new();
-            if let Some(t) = checkpoint {
-                next.insert(new_wm, t);
+        for rel in inner.rel_ids() {
+            let roots = inner.roots(rel).cloned().unwrap_or_default();
+            // Fold everything at or below the new watermark into one checkpoint,
+            // and keep the versions above it.
+            let mut versions = VersionTree::new();
+            if let Some((_, t)) = roots.versions.last_le(&new_wm) {
+                versions = versions.insert(new_wm, t.clone());
             }
-            for (e, t) in facts.range((new_wm + 1)..) {
-                next.insert(*e, t.clone());
+            for (e, t) in roots.versions.range_collect(&(new_wm + 1), &u64::MAX) {
+                versions = versions.insert(e, t);
             }
-            *facts = next;
-        }
-        for log in inner.log.values_mut() {
-            let tail = log.range_collect(&(new_wm + 1, 0), &(u64::MAX, u64::MAX));
-            let mut next = LogTree::new();
-            for (k, v) in tail {
-                next = next.insert(k, v);
+            let mut log = LogTree::new();
+            for (k, v) in roots.log.range_collect(&(new_wm + 1, 0), &(u64::MAX, u64::MAX)) {
+                log = log.insert(k, v);
             }
-            *log = next;
+            inner.put(rel, RelRoots { versions, log });
         }
         inner.watermark = new_wm;
         // Every rel's Fact versions and log tail changed — persist all, and
         // retire the roots below the new watermark in the same batch.
-        let all_rels: Vec<RelId> = inner.log.keys().copied().collect();
+        let all_rels: Vec<RelId> = inner.rel_ids();
         self.persist(&inner, &all_rels, Some(new_wm))?;
         Ok(Edition(new_wm))
     }
