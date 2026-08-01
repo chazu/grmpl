@@ -15,7 +15,9 @@ underneath it in the end state.
 > · G-6 (durable forks sharing one granfilade — a 5000-row fork encodes **zero**
 > node frames — plus a persistent DagWood) · G-4 (the canopy is an enfilade, and
 > the reactive pump routes through the substrate instead of re-evaluating) · G-3
-> (the WID measure family — `SumDiff` and `KeyBounds` beside `Count`).
+> (the WID measure family — `SumDiff` and `KeyBounds` beside `Count`) · G-2a (the
+> store's state is one enfilade root, ordered all the way down) · G-7 (`DspEnf` is
+> on the instancing path — **no module in `grmpl-ent` has zero callers now**).
 >
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
@@ -28,11 +30,18 @@ underneath it in the end state.
 > G-0c (doc truth) is done — the book now describes what the code does, in both
 > directions.
 >
-> **Remaining.** G-0d (measured version-compare) · G-2a (Rel + Version enfilades)
-> · G-7 (DSP overlay instancing) · G-8 (Derived
+> **Remaining.** G-0d (measured version-compare) · G-8 (Derived
 > enfilades) · G-9 (multi-order arrangements) · the tail of G-10 (soak, then
 > delete `grmpl-store`). The LSM is now *only* the differential oracle — no
-> binary and no runtime path uses it.
+> binary and no runtime path uses it, and it should stay until the remaining
+> items land, since it is the independent leg that has been catching the bugs.
+>
+> G-7 landed its *capability* but not its asymptotics: instancing now reads out
+> of a displaced view (`O(1)` to relocate, query transformed into the shared
+> tree's coordinates and pruned there) instead of materializing the template and
+> mapping over it — but it still commits `O(template)` rows. A copy-on-write
+> overlay that shares until an instance diverges needs a displaced node variant
+> threaded through every tree walk; that is the remaining half.
 >
 > **One estimate was wrong.** G-0d is filed below as small; it is not. Pruning a
 > diff at every node needs the B+ tree to split at an arbitrary key so the two

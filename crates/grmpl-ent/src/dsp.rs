@@ -15,7 +15,7 @@
 
 use grmpl_core::{Diff, Entity, Tuple, Value};
 
-use crate::measure::Count;
+use crate::measure::{Count, Measure};
 use crate::tree::Tree;
 
 /// A coordinate displacement: shift the entity id in a key's column 0 by `shift`.
@@ -82,14 +82,14 @@ impl Dsp {
 /// A displaced view of a Fact enfilade: the underlying `inner` tree is **shared**
 /// (an `Arc` clone), and the displacement is applied lazily on read — so a
 /// relocation costs `O(1)` and shares every node with the original.
-pub struct DspEnf {
-    inner: Tree<Tuple, Diff, Count>,
+pub struct DspEnf<M = Count> {
+    inner: Tree<Tuple, Diff, M>,
     dsp: Dsp,
 }
 
-impl DspEnf {
+impl<M: Measure<Tuple, Diff>> DspEnf<M> {
     /// Relocate `inner` by `dsp` — `O(1)`, sharing all of `inner`'s nodes.
-    pub fn relocate(inner: Tree<Tuple, Diff, Count>, dsp: Dsp) -> DspEnf {
+    pub fn relocate(inner: Tree<Tuple, Diff, M>, dsp: Dsp) -> DspEnf<M> {
         DspEnf { inner, dsp }
     }
 
@@ -106,7 +106,7 @@ impl DspEnf {
     }
 
     /// Compose a further displacement onto this view (still `O(1)`, still shared).
-    pub fn then(&self, more: Dsp) -> DspEnf {
+    pub fn then(&self, more: Dsp) -> DspEnf<M> {
         DspEnf { inner: self.inner.clone(), dsp: self.dsp.compose(&more) }
     }
 
@@ -133,7 +133,27 @@ impl DspEnf {
     /// measures in `O(log n)` without materializing any row — the WID count over
     /// the displaced span, via the same query-coordinate transform as
     /// [`range`](Self::range).
-    pub fn measure_range(&self, lo: &Tuple, hi: &Tuple) -> Count {
+    /// **Displaced *cluster* range read.** Like [`range`](Self::range) — the
+    /// query is transformed into the shared tree's coordinates and pruned there,
+    /// so nothing is materialized that the span does not cover — but each result
+    /// is relocated with [`Dsp::apply_all`], moving **every** entity column
+    /// together rather than only the key's lead column.
+    ///
+    /// That is what a self-contained sub-world needs: `located(thing, place)` and
+    /// `exits(from, way, to)` must move both endpoints by the same displacement
+    /// or the instance comes back internally disconnected, while its text and
+    /// weights are preserved. The key order is set by the lead column alone, so
+    /// transforming the *query* by the lead column stays exact.
+    pub fn range_all(&self, lo: &Tuple, hi: &Tuple) -> Vec<(Tuple, Diff)> {
+        let inv = self.dsp.inverse();
+        self.inner
+            .range_collect(&inv.apply(lo), &inv.apply(hi))
+            .into_iter()
+            .map(|(k, v)| (self.dsp.apply_all(&k), v))
+            .collect()
+    }
+
+    pub fn measure_range(&self, lo: &Tuple, hi: &Tuple) -> M {
         let inv = self.dsp.inverse();
         self.inner.measure_range(&inv.apply(lo), &inv.apply(hi))
     }

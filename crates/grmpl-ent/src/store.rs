@@ -26,7 +26,7 @@ use grmpl_core::{
 
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
-use crate::dsp::Dsp;
+use crate::dsp::{Dsp, DspEnf};
 use crate::granfilade::{ContentKey, Granfilade};
 use crate::measure::{Count, SumDiff};
 use crate::tree::Tree;
@@ -400,12 +400,27 @@ impl EntStore {
     pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
         let at = self.current();
         let dsp = Dsp::by(shift);
-        let lo = Tuple::from([Value::Ent(Entity(block_lo))]);
-        let hi = Tuple::from([Value::Ent(Entity(block_hi))]);
+        // The *target* block: the instance's own coordinates.
+        let lo = Tuple::from([Value::Ent(Entity(block_lo.wrapping_add(shift as u64)))]);
+        let hi = Tuple::from([Value::Ent(Entity(block_hi.wrapping_add(shift as u64)))]);
         let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
-        for &rel in rels {
-            for (tuple, diff) in self.range_at(rel, at, &lo, &hi)? {
-                updates.push((rel, dsp.apply_all(&tuple), diff));
+        {
+            let inner = self.inner.lock().unwrap();
+            if at.0 < inner.watermark {
+                return Err(door("instance_template", at.0, inner.watermark));
+            }
+            for &rel in rels {
+                let Some(facts) = inner.fact_at(rel, at.0) else { continue };
+                // **The DSP overlay (E6/G-7).** Relocating the relation is `O(1)`
+                // and shares every node — no copy is made here. The instance's
+                // rows are then read *out of the displaced view*, which
+                // transforms the query back into the shared tree's coordinates
+                // and prunes there (the `DspLoaf` discipline), rather than
+                // materializing the template and mapping over it.
+                let moved = DspEnf::relocate(facts.clone(), dsp);
+                for (tuple, diff) in moved.range_all(&lo, &hi) {
+                    updates.push((rel, tuple, diff));
+                }
             }
         }
         self.commit(&updates)
