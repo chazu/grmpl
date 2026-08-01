@@ -287,17 +287,46 @@ impl QueryIr {
 /// plain `Rel`+`Filter`. Any other shape lowers unchanged.
 fn lower_filter(input: QueryIr, pred: PredExpr) -> Query {
     if let QueryIr::Rel(r) = input {
-        if let Some((key, residual)) = pushdown_lead_eq(&pred) {
+        // Prefer the lead column: it is the trace's primary order, so the range
+        // is always prunable, on any store.
+        if let Some((key, residual)) = pushdown_col_eq(&pred, 0) {
             let hi = lead_successor(&key).expect("candidate key has a successor");
             let base = Query::range(r, Tuple::from([key]), Tuple::from([hi]));
-            return match residual {
-                None => base,
-                Some(p) => Query::Filter { input: Box::new(base), pred: p.lower() },
-            };
+            return residual_filter(base, residual);
+        }
+        // Otherwise a *trailing*-column equality (G-9). This prunes only on a
+        // store that keeps an Arrangement for that column; everywhere else
+        // `read_range_on` falls back to read-and-filter, which is exactly the
+        // `Filter` this replaces. So it is never worse and sometimes sublinear.
+        if let Some((col, key, residual)) = pushdown_any_eq(&pred) {
+            let hi = lead_successor(&key).expect("candidate key has a successor");
+            let base = Query::range_on(r, col, key, hi);
+            return residual_filter(base, residual);
         }
         return Query::Filter { input: Box::new(Query::rel(r)), pred: pred.lower() };
     }
     Query::Filter { input: Box::new(input.lower()), pred: pred.lower() }
+}
+
+/// Re-attach whatever conjuncts the pushdown did not consume.
+fn residual_filter(base: Query, residual: Option<PredExpr>) -> Query {
+    match residual {
+        None => base,
+        Some(p) => Query::Filter { input: Box::new(base), pred: p.lower() },
+    }
+}
+
+/// The first *non-lead* column constrained to a literal with a successor, with
+/// the remaining conjuncts. Column 0 is excluded — the caller tried it first and
+/// it has the better range.
+fn pushdown_any_eq(pred: &PredExpr) -> Option<(usize, Value, Option<PredExpr>)> {
+    let conjuncts = conjuncts_of(pred);
+    let (k, col) = conjuncts
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| col_lit(p).filter(|(c, _)| *c != 0).map(|(c, _)| (i, c)))?;
+    let (_, key) = col_lit(conjuncts[k]).expect("find_map matched a column literal");
+    Some((col, key, residual_of(&conjuncts, k)))
 }
 
 /// The least value strictly greater than every tuple whose first column is `v` —
@@ -317,32 +346,44 @@ fn lead_successor(v: &Value) -> Option<Value> {
 /// that key and the residual predicate (the other conjuncts, or `None` if the
 /// equality was the whole predicate). Only a *pushable* key (successor exists) is
 /// selected, so the caller can always build the range.
-fn pushdown_lead_eq(pred: &PredExpr) -> Option<(Value, Option<PredExpr>)> {
-    let conjuncts: Vec<&PredExpr> = match pred {
+fn pushdown_col_eq(pred: &PredExpr, want: usize) -> Option<(Value, Option<PredExpr>)> {
+    let conjuncts = conjuncts_of(pred);
+    let k = conjuncts.iter().position(|p| col_lit(p).is_some_and(|(c, _)| c == want))?;
+    let (_, key) = col_lit(conjuncts[k]).expect("position found a column literal");
+    Some((key, residual_of(&conjuncts, k)))
+}
+
+fn conjuncts_of(pred: &PredExpr) -> Vec<&PredExpr> {
+    match pred {
         PredExpr::And(ps) => ps.iter().collect(),
         other => vec![other],
+    }
+}
+
+/// `(column, literal)` when `p` pins a column to a literal that has a
+/// [`lead_successor`] — only a pushable key is selected, so the caller can always
+/// build the half-open range.
+fn col_lit(p: &PredExpr) -> Option<(usize, Value)> {
+    let (a, b) = match p {
+        PredExpr::Eq(a, b) => (a, b),
+        _ => return None,
     };
-    let lead_lit = |p: &PredExpr| -> Option<Value> {
-        let (a, b) = match p {
-            PredExpr::Eq(a, b) => (a, b),
-            _ => return None,
-        };
-        let v = match (a, b) {
-            (RowExpr::Col(0), RowExpr::Lit(v)) | (RowExpr::Lit(v), RowExpr::Col(0)) => v,
-            _ => return None,
-        };
-        lead_successor(v).map(|_| v.clone())
+    let (col, v) = match (a, b) {
+        (RowExpr::Col(c), RowExpr::Lit(v)) | (RowExpr::Lit(v), RowExpr::Col(c)) => (*c, v),
+        _ => return None,
     };
-    let k = conjuncts.iter().position(|p| lead_lit(p).is_some())?;
-    let key = lead_lit(conjuncts[k]).expect("position found a lead literal");
+    lead_successor(v).map(|_| (col, v.clone()))
+}
+
+/// Every conjunct but the `k`th, recombined.
+fn residual_of(conjuncts: &[&PredExpr], k: usize) -> Option<PredExpr> {
     let rest: Vec<PredExpr> =
         conjuncts.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, p)| (*p).clone()).collect();
-    let residual = match rest.len() {
+    match rest.len() {
         0 => None,
         1 => Some(rest.into_iter().next().unwrap()),
         _ => Some(PredExpr::And(rest)),
-    };
-    Some((key, residual))
+    }
 }
 
 /// One grammar rule as inspectable data — the reified `grmpl_pattern::Rule`: a
@@ -431,10 +472,10 @@ mod pushdown_tests {
     fn pushdown_picks_the_lead_equality_and_keeps_the_rest() {
         // Bare lead equality → pushed, no residual.
         let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5)));
-        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), None)));
+        assert_eq!(pushdown_col_eq(&p, 0), Some((ent(5), None)));
         // Operand order does not matter.
         let p = PredExpr::Eq(RowExpr::Lit(ent(5)), RowExpr::Col(0));
-        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), None)));
+        assert_eq!(pushdown_col_eq(&p, 0), Some((ent(5), None)));
 
         // Lead equality alongside a column-column join key → the join key stays.
         let join = PredExpr::Eq(RowExpr::Col(1), RowExpr::Col(0));
@@ -442,19 +483,76 @@ mod pushdown_tests {
             PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5))),
             join.clone(),
         ]);
-        assert_eq!(pushdown_lead_eq(&p), Some((ent(5), Some(join))));
+        assert_eq!(pushdown_col_eq(&p, 0), Some((ent(5), Some(join))));
     }
 
     #[test]
-    fn pushdown_declines_non_lead_and_unpushable_keys() {
-        // Equality on a non-lead column → no pushdown.
+    fn pushdown_declines_unpushable_keys() {
+        // Equality on a non-lead column → no *lead* pushdown…
         let p = PredExpr::Eq(RowExpr::Col(1), RowExpr::Lit(ent(5)));
-        assert_eq!(pushdown_lead_eq(&p), None);
+        assert_eq!(pushdown_col_eq(&p, 0), None);
         // Lead column bound to a text literal (no successor) → no pushdown.
         let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(Value::text("x")));
-        assert_eq!(pushdown_lead_eq(&p), None);
+        assert_eq!(pushdown_col_eq(&p, 0), None);
+        assert_eq!(pushdown_any_eq(&p), None);
         // A column-column lead constraint is not a literal key.
         let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Col(2));
-        assert_eq!(pushdown_lead_eq(&p), None);
+        assert_eq!(pushdown_col_eq(&p, 0), None);
+        assert_eq!(pushdown_any_eq(&p), None);
+    }
+
+    /// **G-9's lowerer half.** A *trailing*-column equality is auto-emitted as a
+    /// `RangeRelOn`, so a secondary-key view prunes at the source on a store
+    /// carrying an Arrangement for that column — and reads exactly as the
+    /// `Filter` it replaces on one that does not.
+    #[test]
+    fn pushdown_picks_a_trailing_equality_when_the_lead_has_none() {
+        // …but it *is* a trailing pushdown, on column 1.
+        let p = PredExpr::Eq(RowExpr::Col(1), RowExpr::Lit(ent(5)));
+        assert_eq!(pushdown_any_eq(&p), Some((1, ent(5), None)));
+        // Operand order does not matter.
+        let p = PredExpr::Eq(RowExpr::Lit(Value::Int(7)), RowExpr::Col(2));
+        assert_eq!(pushdown_any_eq(&p), Some((2, Value::Int(7), None)));
+        // Other conjuncts survive as the residual.
+        let join = PredExpr::Eq(RowExpr::Col(3), RowExpr::Col(0));
+        let p = PredExpr::And(vec![
+            PredExpr::Eq(RowExpr::Col(1), RowExpr::Lit(ent(5))),
+            join.clone(),
+        ]);
+        assert_eq!(pushdown_any_eq(&p), Some((1, ent(5), Some(join))));
+        // Column 0 is excluded — the caller already tried it and its range is
+        // better, so a lead equality must not be claimed here.
+        let p = PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5)));
+        assert_eq!(pushdown_any_eq(&p), None);
+    }
+
+    /// The lead column is preferred when both are available: its range prunes on
+    /// every store, the trailing one only where an Arrangement exists.
+    #[test]
+    fn lowering_prefers_the_lead_column() {
+        let p = PredExpr::And(vec![
+            PredExpr::Eq(RowExpr::Col(1), RowExpr::Lit(ent(9))),
+            PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(ent(5))),
+        ]);
+        match lower_filter(QueryIr::Rel(RelId(1)), p) {
+            Query::Filter { input, .. } => assert!(
+                matches!(*input, Query::RangeRel { .. }),
+                "a lead equality must lower to the lead range, not the trailing one"
+            ),
+            _ => panic!("expected a residual filter over a lead range"),
+        }
+    }
+
+    /// With no lead equality, the trailing one is emitted.
+    #[test]
+    fn lowering_emits_a_trailing_range_when_that_is_all_there_is() {
+        let p = PredExpr::Eq(RowExpr::Col(2), RowExpr::Lit(Value::Int(3)));
+        match lower_filter(QueryIr::Rel(RelId(1)), p) {
+            Query::RangeRelOn { rel, col, lo, hi } => {
+                assert_eq!((rel, col), (RelId(1), 2));
+                assert_eq!((lo, hi), (Value::Int(3), Value::Int(4)));
+            }
+            _ => panic!("expected a trailing-column range"),
+        }
     }
 }

@@ -35,13 +35,11 @@ underneath it in the end state.
 >
 > · **G-10 (complete — `grmpl-store` is deleted).**
 >
-> **Every item has landed; two carry a named residual.** G-7's *capability* is on
+> **Every item has landed; one carries a named residual.** G-7's *capability* is on
 > the running path but its asymptotics are not (instancing still commits
-> `O(template)` rows — see below), and G-9's pruning is reachable but not
-> auto-emitted by the lowerer for trailing columns. Both are described precisely
-> a few paragraphs down; neither is a substrate gap, and neither should be read
-> as "done" by someone scanning this line. Everything else is closed, and a
-> second audit
+> `O(template)` rows — see below), with one residual left. It is described
+> precisely a few paragraphs down and should not be read as "done" by someone
+> scanning this line. Everything else is closed, and a second audit
 > against §4's definition of done caught four things the first completion claim
 > had papered over — the `Canopy` type still had no caller (routing went through
 > the Edition enfilade's measure, not the canopy), `grmpl run` still committed
@@ -54,10 +52,13 @@ underneath it in the end state.
 > each against an independent model rather than as agreement with another store.
 > Deleting it without that would have deleted the laws along with it.
 >
-> One thing is reachable rather than automatic: G-9 gives the substrate the
-> Arrangements and `read_range_on`, but the `grmpl-lang` lowerer auto-emits
-> `RangeRel` only from a *lead*-column equality, so trailing-column pruning must
-> be asked for. That is a lowerer feature, not a substrate gap.
+> G-9 is complete on both sides: the substrate has the Arrangements and
+> `read_range_on`, `grmpl-diff` has the `RangeRelOn` operator, and the lowerer
+> auto-emits it from a *trailing*-column equality — preferring the lead column
+> when both exist, since the lead range prunes on any store while the trailing one
+> prunes only where an Arrangement is kept. On a store without one,
+> `read_range_on` falls back to read-and-filter, which is exactly the `Filter` it
+> replaced, so the rewrite is never worse.
 >
 > G-7 landed its *capability* but not its asymptotics: instancing now reads out
 > of a displaced view (`O(1)` to relocate, query transformed into the shared

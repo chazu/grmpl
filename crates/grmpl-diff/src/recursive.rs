@@ -58,7 +58,9 @@ pub enum Maintenance {
 /// Collect every base relation referenced by a query (for monotonicity checks).
 fn collect_rels(q: &Query, out: &mut Vec<RelId>) {
     match q {
-        Query::Rel(r) | Query::RangeRel { rel: r, .. } => out.push(*r),
+        Query::Rel(r) | Query::RangeRel { rel: r, .. } | Query::RangeRelOn { rel: r, .. } => {
+            out.push(*r)
+        }
         Query::Map { input, .. }
         | Query::Filter { input, .. }
         | Query::Project { input, .. } => collect_rels(input, out),

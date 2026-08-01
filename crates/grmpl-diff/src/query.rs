@@ -48,6 +48,17 @@ pub enum Query {
     /// store without such a trace the default `read_range` makes it exactly the
     /// filter, so the operator is always correct.
     RangeRel { rel: RelId, lo: Tuple, hi: Tuple },
+    /// A base relation restricted by a **non-lead** column's value range — the
+    /// trailing-column counterpart of [`RangeRel`](Query::RangeRel), riding
+    /// [`TraceStore::read_range_on`].
+    ///
+    /// `RangeRel` prunes on the lead column because that is what the trace's
+    /// primary order is keyed by. A store that maintains several orderings of the
+    /// same facts (the Ent's Arrangements) can prune on `col` too; a store that
+    /// does not answers by the default read-and-filter. Either way the operator
+    /// means exactly `Rel(rel)` filtered to rows whose `col`th value lies in
+    /// `[lo, hi)`, so it is always correct and only sometimes fast.
+    RangeRelOn { rel: RelId, col: usize, lo: Value, hi: Value },
     Map { input: Box<Query>, f: MapFn },
     Filter { input: Box<Query>, pred: Pred },
     Project { input: Box<Query>, cols: Arc<[usize]> },
@@ -120,7 +131,9 @@ impl Query {
 
     fn collect_base_relations(&self, out: &mut std::collections::BTreeSet<RelId>) {
         match self {
-            Query::Rel(r) | Query::RangeRel { rel: r, .. } => {
+            Query::Rel(r)
+            | Query::RangeRel { rel: r, .. }
+            | Query::RangeRelOn { rel: r, .. } => {
                 out.insert(*r);
             }
             Query::Recur => {}
@@ -149,6 +162,13 @@ impl Query {
     /// store's arranged-trace fast path (see [`Query::RangeRel`]).
     pub fn range(r: RelId, lo: Tuple, hi: Tuple) -> Query {
         Query::RangeRel { rel: r, lo, hi }
+    }
+
+    /// A base relation restricted to rows whose `col`th value lies in
+    /// `[lo, hi)`, pushed to the store's Arrangements when it has one for `col`
+    /// (see [`Query::RangeRelOn`]).
+    pub fn range_on(r: RelId, col: usize, lo: Value, hi: Value) -> Query {
+        Query::RangeRelOn { rel: r, col, lo, hi }
     }
     pub fn map(self, f: impl Fn(&Tuple) -> Tuple + Send + Sync + 'static) -> Query {
         Query::Map { input: Box::new(self), f: Arc::new(f) }
@@ -299,7 +319,7 @@ fn fold_agg(members: &[Tuple], agg: &Agg) -> Value {
 fn contains_reduce(q: &Query) -> bool {
     match q {
         Query::Reduce { .. } => true,
-        Query::Rel(_) | Query::RangeRel { .. } | Query::Recur => false,
+        Query::Rel(_) | Query::RangeRel { .. } | Query::RangeRelOn { .. } | Query::Recur => false,
         Query::Map { input, .. }
         | Query::Filter { input, .. }
         | Query::Project { input, .. } => contains_reduce(input),
@@ -387,6 +407,13 @@ fn eval_inner(
             Some(m) => m.iter().filter(|(t, _)| lo <= *t && *t < hi).map(|(t, d)| (t.clone(), *d)).collect(),
             None => multiset::from_pairs(store.read_range(*rel, at, lo, hi)?),
         },
+        Query::RangeRelOn { rel, col, lo, hi } => {
+            let keep = |t: &Tuple| t.as_slice().get(*col).is_some_and(|v| lo <= v && v < hi);
+            match overrides.and_then(|o| o.get(rel)) {
+                Some(m) => m.iter().filter(|(t, _)| keep(t)).map(|(t, d)| (t.clone(), *d)).collect(),
+                None => multiset::from_pairs(store.read_range_on(*rel, at, *col, lo, hi)?),
+            }
+        }
         Query::Map { input, f } => {
             let child = eval_inner(input, store, at, recur, overrides, arr)?;
             let mut out = Multiset::new();
@@ -487,6 +514,16 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
             let ups = store.scan_updates(*rel, from, to)?;
             multiset::from_pairs(
                 ups.into_iter().filter(|u| *lo <= u.tuple && u.tuple < *hi).map(|u| (u.tuple, u.diff)),
+            )
+        }
+        Query::RangeRelOn { rel, col, lo, hi } => {
+            // Same shape as `RangeRel`'s delta: the interval's updates, kept when
+            // the row's `col`th value falls in the range.
+            let ups = store.scan_updates(*rel, from, to)?;
+            multiset::from_pairs(
+                ups.into_iter()
+                    .filter(|u| u.tuple.as_slice().get(*col).is_some_and(|v| lo <= v && v < hi))
+                    .map(|u| (u.tuple, u.diff)),
             )
         }
         Query::Map { input, f } => {
