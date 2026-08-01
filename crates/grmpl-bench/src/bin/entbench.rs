@@ -117,6 +117,39 @@ fn main() {
         row("count_at (measure, no rows)", n, m_ns, "");
     }
 
+    // ------------------------------------------------- scan vs flat array ---
+    header(
+        "Full scan — what the tree costs when you want every row",
+        "read_at against cloning a flat Vec holding the same tuples.",
+    );
+    for &n in &sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seeded(dir.path(), n);
+        let at = store.current();
+        let flat: Vec<(Tuple, Diff)> = (0..n).map(|k| (t(k), 1i64)).collect();
+
+        const S: u32 = 20;
+        let start = Instant::now();
+        for _ in 0..S {
+            std::hint::black_box(store.read_at(REL, at).unwrap());
+        }
+        let tree_ns = start.elapsed().as_nanos() as f64 / S as f64;
+
+        let start = Instant::now();
+        for _ in 0..S {
+            std::hint::black_box(flat.clone());
+        }
+        let flat_ns = start.elapsed().as_nanos() as f64 / S as f64;
+
+        row("read_at (enfilade)", n, tree_ns, &format!("{:.0} ns/row", tree_ns / n as f64));
+        row(
+            "clone a flat Vec",
+            n,
+            flat_ns,
+            &format!("{:.0} ns/row — tree is {:.1}x", flat_ns / n as f64, tree_ns / flat_ns),
+        );
+    }
+
     // --------------------------------------------------------------- as-of ---
     header(
         "As-of — reading the past",
