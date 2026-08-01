@@ -14,7 +14,8 @@ underneath it in the end state.
 > relation size) · G-2 (Fact roots persisted; `open` no longer replays the log)
 > · G-6 (durable forks sharing one granfilade — a 5000-row fork encodes **zero**
 > node frames — plus a persistent DagWood) · G-4 (the canopy is an enfilade, and
-> the reactive pump routes through the substrate instead of re-evaluating).
+> the reactive pump routes through the substrate instead of re-evaluating) · G-3
+> (the WID measure family — `SumDiff` and `KeyBounds` beside `Count`).
 >
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
@@ -28,7 +29,7 @@ underneath it in the end state.
 > directions.
 >
 > **Remaining.** G-0d (measured version-compare) · G-2a (Rel + Version enfilades)
-> · G-3 (the WID measure family) · G-7 (DSP overlay instancing) · G-8 (Derived
+> · G-7 (DSP overlay instancing) · G-8 (Derived
 > enfilades) · G-9 (multi-order arrangements) · the tail of G-10 (soak, then
 > delete `grmpl-store`). The LSM is now *only* the differential oracle — no
 > binary and no runtime path uses it.

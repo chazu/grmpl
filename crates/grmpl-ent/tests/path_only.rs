@@ -137,3 +137,31 @@ fn consolidation_retires_superseded_fact_roots() {
     assert_eq!(store.read_at(REL, cur).unwrap().len(), 20);
     assert!(store.read_at(REL, Edition(1)).is_err());
 }
+
+/// **G-3: the measure family.** "How many" and "how much" over a key span are
+/// both folds of cached subtree summaries — the tree's shape, not its rows.
+#[test]
+fn count_and_weight_are_answered_from_the_measure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
+
+    // Weights that are not all 1, and some that cancel, so Σ is not the count.
+    let updates: Vec<(RelId, Tuple, Diff)> =
+        (0..500i64).map(|k| (REL, t(k), if k % 7 == 0 { 3 } else { 1 })).collect();
+    store.commit(&updates).unwrap();
+    let at = store.current();
+
+    for (lo, hi) in [(0i64, 500i64), (0, 1), (100, 200), (499, 500), (600, 700), (5, 5)] {
+        let rows = store.read_range(REL, at, &t(lo), &t(hi)).unwrap();
+        assert_eq!(
+            store.count_at(REL, at, &t(lo), &t(hi)).unwrap(),
+            rows.len() as u64,
+            "count over [{lo},{hi}) disagreed with the rows"
+        );
+        assert_eq!(
+            store.weight_at(REL, at, &t(lo), &t(hi)).unwrap(),
+            rows.iter().map(|(_, d)| *d).sum::<i64>(),
+            "weight over [{lo},{hi}) disagreed with the rows"
+        );
+    }
+}

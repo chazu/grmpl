@@ -29,11 +29,18 @@ use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Dsp;
 use crate::granfilade::{ContentKey, Granfilade};
-use crate::measure::Count;
+use crate::measure::{Count, SumDiff};
 use crate::tree::Tree;
 
 /// The Fact enfilade: `tuple → net Σdiff` (nonzero only).
-type FactTree = Tree<Tuple, Diff, Count>;
+///
+/// It carries **two** upward measures (plan v5 §G-3): the entry [`Count`], and
+/// the [`SumDiff`] of the weights beneath each node. A product of monoids is a
+/// monoid, so this needs no tree machinery — and it means "how many rows" and
+/// "what is their total weight" over any key span are both `O(log n)` folds of
+/// cached summaries, materializing nothing.
+type FactMeasure = (Count, SumDiff);
+type FactTree = Tree<Tuple, Diff, FactMeasure>;
 /// The Edition enfilade: `(edition, submit_index) → (tuple, diff)` raw log.
 type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
 
@@ -130,7 +137,25 @@ impl EntStore {
             .fact
             .get(&rel)
             .and_then(|f| f.range(..=at.0).next_back())
-            .map(|(_, t)| t.measure_range(lo, hi).0)
+            .map(|(_, t)| t.measure_range(lo, hi).0 .0)
+            .unwrap_or(0))
+    }
+
+    /// **WID weight measure (G-3).** The total net weight of `rel`'s tuples in
+    /// `[lo, hi)` as-of `at` — folded from cached subtree summaries in
+    /// `O(log n)`, without materializing a single row. Where `count_at` answers
+    /// "how many", this answers "how much": the aggregate reads the tree's shape
+    /// rather than its contents.
+    pub fn weight_at(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<i64> {
+        let inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("weight_at", at.0, inner.watermark));
+        }
+        Ok(inner
+            .fact
+            .get(&rel)
+            .and_then(|f| f.range(..=at.0).next_back())
+            .map(|(_, t)| t.measure_range(lo, hi).1 .0)
             .unwrap_or(0))
     }
 

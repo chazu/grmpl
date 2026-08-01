@@ -35,6 +35,69 @@ impl<K, V, A: Measure<K, V>, B: Measure<K, V>> Measure<K, V> for (A, B) {
     }
 }
 
+/// **Σ of the entries' weights** under a subtree.
+///
+/// The Fact enfilade's values *are* net weights, so this makes "what is the
+/// total weight over this key span" an `O(log n)` fold of cached summaries
+/// rather than a materialize-then-sum — the difference between an aggregate
+/// reading the tree's shape and reading its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SumDiff(pub i64);
+
+impl<K> Measure<K, i64> for SumDiff {
+    fn empty() -> Self {
+        SumDiff(0)
+    }
+    fn entry(_k: &K, v: &i64) -> Self {
+        SumDiff(*v)
+    }
+    fn combine(&self, right: &Self) -> Self {
+        SumDiff(self.0.wrapping_add(right.0))
+    }
+}
+
+/// The least and greatest **key** under a subtree.
+///
+/// The bounds a range walk needs are already carried by a B+ node's separators,
+/// so this is not what prunes an ordinary range read. It earns its place in
+/// comparisons *between two versions*: a subtree whose key span is disjoint from
+/// the other side's cannot contribute a difference, so it can be dismissed
+/// without descent (plan v5 §G-0d).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBounds<K> {
+    /// `None` for the empty subtree.
+    pub span: Option<(K, K)>,
+}
+
+impl<K: Ord + Clone, V> Measure<K, V> for KeyBounds<K> {
+    fn empty() -> Self {
+        KeyBounds { span: None }
+    }
+    fn entry(key: &K, _v: &V) -> Self {
+        KeyBounds { span: Some((key.clone(), key.clone())) }
+    }
+    fn combine(&self, right: &Self) -> Self {
+        let span = match (&self.span, &right.span) {
+            (None, r) => r.clone(),
+            (l, None) => l.clone(),
+            (Some((llo, lhi)), Some((rlo, rhi))) => {
+                Some((llo.min(rlo).clone(), lhi.max(rhi).clone()))
+            }
+        };
+        KeyBounds { span }
+    }
+}
+
+impl<K: Ord> KeyBounds<K> {
+    /// Whether this subtree's keys can overlap `[lo, hi)`.
+    pub fn overlaps(&self, lo: &K, hi: &K) -> bool {
+        match &self.span {
+            None => false,
+            Some((slo, shi)) => slo < hi && shi >= lo,
+        }
+    }
+}
+
 /// The trivial measure — just the entry count. Useful on its own (size), and as
 /// the identity building block; every enfilade tracks at least this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
