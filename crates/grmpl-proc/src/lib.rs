@@ -6,6 +6,7 @@
 
 pub mod alloc;
 pub mod commit;
+pub mod derived;
 pub mod domain;
 pub mod gc;
 pub mod process;
@@ -15,6 +16,7 @@ pub mod watch;
 
 pub use alloc::Alloc;
 pub use commit::{check_schema, commit_patch, commit_patch_checked, CommitOutcome};
+pub use derived::Materialized;
 pub use domain::{outbox_len, Domain};
 pub use gc::{consolidate_to, min_watch_cursor};
 pub use process::{enqueue, enqueue_seq, inbox_fact, seed_seq, Behavior, Prepared, Process};
