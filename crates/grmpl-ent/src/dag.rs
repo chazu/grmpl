@@ -20,7 +20,8 @@
 //! The DAG is deterministic — branch ids are allocated by a monotone counter, no
 //! clock or randomness — so it is Replay-safe like every other enfilade.
 
-use std::collections::BTreeMap;
+use crate::measure::Count;
+use crate::tree::Tree;
 
 /// A branch identity. The root world is [`Dag::ROOT`] (`0`); each fork allocates
 /// the next id.
@@ -35,13 +36,30 @@ pub struct Branch {
     pub parent: Option<(BranchId, u64)>,
 }
 
+/// The branch enfilade: `branch id → its fork point`.
+///
+/// An enfilade like every other directory in the store's state, rather than a
+/// std map beside them — so "how many branches" is a measure, iteration is
+/// ordered, and a retained `Dag` is a persistent version of the graph that a
+/// later fork cannot mutate underneath it.
+pub type BranchTree = Tree<BranchId, Branch, Count>;
+
 /// The branch DAG. A monotone registry of branches, each pointing at its parent
 /// fork point — a tree of branches (each has ≤1 parent), the linear per-branch
 /// enfilades hanging off it forming the whole fulltrace.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Dag {
-    branches: BTreeMap<BranchId, Branch>,
+    branches: BranchTree,
     next: BranchId,
+}
+
+impl std::fmt::Debug for Dag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dag")
+            .field("branches", &self.branches.iter().map(|(_, b)| *b).collect::<Vec<_>>())
+            .field("next", &self.next)
+            .finish()
+    }
 }
 
 impl Dag {
@@ -50,8 +68,8 @@ impl Dag {
 
     /// A fresh DAG with just the root branch.
     pub fn new() -> Dag {
-        let mut branches = BTreeMap::new();
-        branches.insert(Self::ROOT, Branch { id: Self::ROOT, parent: None });
+        let branches =
+            BranchTree::new().insert(Self::ROOT, Branch { id: Self::ROOT, parent: None });
         Dag { branches, next: 1 }
     }
 
@@ -59,10 +77,10 @@ impl Dag {
     /// fresh id. Panics if `parent` is unknown (a fork off a branch this DAG never
     /// minted is a programming error, not a runtime condition).
     pub fn fork(&mut self, parent: BranchId, at: u64) -> BranchId {
-        assert!(self.branches.contains_key(&parent), "fork off unknown branch {parent}");
+        assert!(self.branches.get(&parent).is_some(), "fork off unknown branch {parent}");
         let id = self.next;
         self.next += 1;
-        self.branches.insert(id, Branch { id, parent: Some((parent, at)) });
+        self.branches = self.branches.insert(id, Branch { id, parent: Some((parent, at)) });
         id
     }
 
@@ -113,7 +131,7 @@ impl Dag {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.branches.len() as u32).to_be_bytes());
-        for b in self.branches.values() {
+        for (_, b) in self.branches.iter() {
             out.extend_from_slice(&b.id.to_be_bytes());
             match b.parent {
                 None => out.push(0),
@@ -134,7 +152,7 @@ impl Dag {
             return Some(Dag::new());
         }
         let n = u32::from_be_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
-        let mut branches = BTreeMap::new();
+        let mut branches = BranchTree::new();
         let mut next = 0u64;
         let mut pos = 4;
         for _ in 0..n {
@@ -152,7 +170,7 @@ impl Dag {
                     Some((p, at))
                 }
             };
-            branches.insert(id, Branch { id, parent });
+            branches = branches.insert(id, Branch { id, parent });
             next = next.max(id + 1);
         }
         Some(Dag { branches, next })
@@ -165,7 +183,8 @@ impl Dag {
     /// from [`ROOT`](Dag::ROOT)).
     pub fn common_ancestor(&self, ba: BranchId, ea: u64, bb: BranchId, eb: u64) -> Option<(BranchId, u64)> {
         // Map each branch in a's lineage to the edition a's history holds there.
-        let a_line: BTreeMap<BranchId, u64> = self.lineage(ba, ea).into_iter().collect();
+        let a_line: std::collections::BTreeMap<BranchId, u64> =
+            self.lineage(ba, ea).into_iter().collect();
         // Walk b's lineage newest-first; the first branch also in a's lineage is
         // the nearest shared branch — the join is at the min edition of the two.
         for (br, eb_here) in self.lineage(bb, eb) {

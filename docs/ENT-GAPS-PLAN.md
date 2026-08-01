@@ -35,7 +35,13 @@ underneath it in the end state.
 >
 > · **G-10 (complete — `grmpl-store` is deleted).**
 >
-> **Nothing remains.** Every item in this plan has landed. Deleting the LSM was
+> **Nothing remains.** Every item in this plan has landed, and a second audit
+> against §4's definition of done caught four things the first completion claim
+> had papered over — the `Canopy` type still had no caller (routing went through
+> the Edition enfilade's measure, not the canopy), `grmpl run` still committed
+> with `NoSchemas` and compiled without the catalog, and the Arrangement
+> directory and the DagWood were still std maps in the store's state. All four
+> are fixed and tested. Deleting the LSM was
 > done last and only after its law suites were ported: the store contract —
 > determinism, the patch–edition law, history/consolidation, fork identity — is
 > now stated **absolutely** against the Ent in `grmpl-ent/tests/store_laws.rs`,
