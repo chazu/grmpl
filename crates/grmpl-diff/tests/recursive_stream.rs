@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use grmpl_core::{Diff, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 use grmpl_diff::{multiset, DeltaStream, Multiset, Query, Snapshot};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const DIRECT: RelId = RelId(3); //    (entity, behavior)
 const PROTOTYPE: RelId = RelId(4); // (child, parent)
@@ -43,7 +43,7 @@ fn implements_query() -> Query {
 }
 
 fn commit_and_check(
-    store: &FjallStore,
+    store: &EntStore,
     q: &Query,
     stream: &mut DeltaStream<'_>,
     acc: &mut Multiset,
@@ -61,7 +61,7 @@ fn commit_and_check(
 #[test]
 fn implements_transitive_closure_with_edge_deletion() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let q = implements_query();
 
     let mut stream = q.watch(&store, store.current());
@@ -95,7 +95,7 @@ fn implements_transitive_closure_with_edge_deletion() {
 #[test]
 fn recursive_watch_tracks_find_under_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let q = implements_query();
 
     let mut stream = q.watch(&store, store.current());

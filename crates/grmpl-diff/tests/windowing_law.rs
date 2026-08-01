@@ -73,7 +73,7 @@ use grmpl_diff::{
     Snapshot, Window,
 };
 use grmpl_pattern::{DeltaInput, MatchInput, Pattern, VarId};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const SEEDS: std::ops::Range<u64> = 1..25; // 24 seeds
@@ -126,7 +126,7 @@ fn weight(world: &World, t: &Tuple) -> Diff {
 /// Commit one edition of 1–3 random churn updates over a small overlapping tuple
 /// domain. Magnitudes run to 3 (so `|diff| > 1` folds are exercised) and
 /// retractions never drive a weight below zero.
-fn churn_edition(store: &FjallStore, world: &mut World, rng: &mut Rng, log: &mut Log) {
+fn churn_edition(store: &EntStore, world: &mut World, rng: &mut Rng, log: &mut Log) {
     let n = 1 + rng.below(3);
     let mut batch: Vec<(RelId, Tuple, Diff)> = Vec::new();
     let mut pending = World::new();
@@ -173,7 +173,7 @@ fn covering_count(from: Edition, e: Edition, size: u64, step: u64) -> u64 {
 
 /// Law 1: the tumbling family partitions `(from, to]`.
 fn assert_tumbling_partitions(
-    store: &FjallStore,
+    store: &EntStore,
     w: &Window,
     full: &[Update],
     size: u64,
@@ -218,7 +218,7 @@ fn assert_tumbling_partitions(
 /// the range arithmetic says. Returns the number of updates that landed in more
 /// than one window (the anti-vacuity signal for overlap).
 fn assert_sliding_covers(
-    store: &FjallStore,
+    store: &EntStore,
     w: &Window,
     log: &Log,
     size: u64,
@@ -287,7 +287,7 @@ fn assert_sliding_covers(
 
 /// Law 3: a window's event slice is exactly the trace restricted to its edition
 /// range, in commit order, deterministically.
-fn assert_edition_bounded_and_ordered(store: &FjallStore, w: &Window, log: &Log, what: &str) {
+fn assert_edition_bounded_and_ordered(store: &EntStore, w: &Window, log: &Log, what: &str) {
     let full = w.events(store, REL).unwrap();
     assert!(
         full.iter().all(|u| w.contains(Edition(u.time.edition))),
@@ -311,7 +311,7 @@ fn assert_edition_bounded_and_ordered(store: &FjallStore, w: &Window, log: &Log,
 /// Law 4: the event slice and the consolidated tuple-set agree, modulo the
 /// anchor. Returns true if the anchored and unanchored readings differed here
 /// (the anti-vacuity signal for anchoring).
-fn assert_materializations_agree(store: &FjallStore, w: &Window, full: &[Update], what: &str) -> bool {
+fn assert_materializations_agree(store: &EntStore, w: &Window, full: &[Update], what: &str) -> bool {
     let q = Query::rel(REL);
     let folded = consolidate_events(full);
 
@@ -347,7 +347,7 @@ fn assert_materializations_agree(store: &FjallStore, w: &Window, full: &[Update]
 fn windowing_layer_law() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed);
         let mut world = World::new();
         let mut log = Log::new();
@@ -458,7 +458,7 @@ fn windowing_layer_law() {
 #[test]
 fn witness_tumbling_partitions_the_range() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     for i in 1..=5 {
         store.commit(&[(REL, tup(i, 1), 1)]).unwrap();
     }
@@ -496,7 +496,7 @@ fn witness_tumbling_partitions_the_range() {
 #[test]
 fn witness_sliding_shares_overlaps_and_rejects_gaps() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     for i in 1..=5 {
         store.commit(&[(REL, tup(i, 1), 1)]).unwrap();
     }

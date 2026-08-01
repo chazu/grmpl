@@ -20,7 +20,7 @@
 //!       through the reduce.
 //!
 //! A tiny xorshift64* PRNG keeps the churn reproducible with no external `rand`
-//! dependency (mirrors grmpl-store's determinism.rs and grmpl-lang's
+//! dependency (mirrors grmpl-ent's store_laws.rs and grmpl-lang's
 //! catalog.rs); every assertion prints its `seed` so a failure replays.
 
 use grmpl_core::{Diff, Entity, RelId, Tuple, Value};

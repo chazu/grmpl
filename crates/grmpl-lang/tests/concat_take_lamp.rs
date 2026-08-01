@@ -300,7 +300,7 @@ fn concatenative_absent_thing_makes_no_change() {
 // external dependency; every assertion prints its `seed` so a failure replays.
 
 /// Deterministic, seedable PRNG (xorshift64*), mirroring
-/// `grmpl-store/tests/determinism.rs` — reproducible churn without a `rand` dep.
+/// `grmpl-ent/tests/store_laws.rs` — reproducible churn without a `rand` dep.
 struct Rng(u64);
 
 impl Rng {

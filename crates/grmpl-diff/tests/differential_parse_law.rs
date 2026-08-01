@@ -64,7 +64,7 @@ use grmpl_diff::{
 use grmpl_pattern::{
     reify_delta, Bindings, DeltaInput, Form, MatchInput, Pattern, Rule, VarId,
 };
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const SEEDS: std::ops::Range<u64> = 1..25; // 24 seeds
@@ -147,7 +147,7 @@ fn weight(world: &World, t: &Tuple) -> Diff {
 /// the world actually holds. Magnitudes reach 2 sometimes, so a second derivation
 /// from the *same* row is exercised. Retractions never drive a weight below zero.
 fn churn_edition(
-    store: &FjallStore,
+    store: &EntStore,
     world: &mut World,
     rng: &mut Rng,
     log: &mut Log,
@@ -171,7 +171,7 @@ fn churn_edition(
     log.push((at, batch.into_iter().map(|(_, t, d)| (t, d)).collect()));
 }
 
-fn commit_batch(store: &FjallStore, world: &mut World, log: &mut Log, batch: Vec<(Tuple, Diff)>) {
+fn commit_batch(store: &EntStore, world: &mut World, log: &mut Log, batch: Vec<(Tuple, Diff)>) {
     if batch.is_empty() {
         return;
     }
@@ -186,7 +186,7 @@ fn commit_batch(store: &FjallStore, world: &mut World, log: &mut Log, batch: Vec
 /// Retract **every** present occurrence of one key in one edition — the targeted
 /// way to drive the trap's delete half: the key's last derivation is destroyed,
 /// so its parse must genuinely disappear.
-fn retract_whole_key(store: &FjallStore, world: &mut World, log: &mut Log, k: u64) {
+fn retract_whole_key(store: &EntStore, world: &mut World, log: &mut Log, k: u64) {
     let batch: Vec<(Tuple, Diff)> = world
         .iter()
         .filter(|(t, d)| **d > 0 && key_of(t) == k as i64)
@@ -198,7 +198,7 @@ fn retract_whole_key(store: &FjallStore, world: &mut World, log: &mut Log, k: u6
 /// Retract **one** occurrence of a key that has at least two — the targeted way
 /// to drive the trap's re-derive half: a derivation is destroyed but the parse
 /// keeps alternative support, so it must be re-derived rather than deleted.
-fn retract_one_of_many(store: &FjallStore, world: &mut World, log: &mut Log, rng: &mut Rng) {
+fn retract_one_of_many(store: &EntStore, world: &mut World, log: &mut Log, rng: &mut Rng) {
     let mut support: HashMap<i64, Diff> = HashMap::new();
     for (t, d) in world.iter().filter(|(_, d)| **d > 0) {
         *support.entry(key_of(t)).or_insert(0) += *d;
@@ -519,7 +519,7 @@ struct Sharing {
 fn differential_matching_equals_window_recompute_at_every_step() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed);
         let mut world = World::new();
         let mut log = Log::new();
@@ -694,7 +694,7 @@ fn reparses_per_advance_do_not_grow_with_the_window() {
 
     for seed in 1..17u64 {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x5A7E_1117);
 
         // A wide, mostly-monotone history so the window is genuinely large.
@@ -764,7 +764,7 @@ fn reparses_per_advance_do_not_grow_with_the_window() {
 fn retraction_drops_unsupported_parses_and_rederives_supported_ones() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0xA5A5_A5A5);
         let mut world = World::new();
         let mut log = Log::new();
@@ -996,7 +996,7 @@ fn parses_at_never_depends_on_anything_past_reach() {
 fn differential_deltas_are_deterministic_and_path_independent() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x5EED_5EED);
         let mut world = World::new();
         let mut log = Log::new();
@@ -1078,7 +1078,7 @@ fn differential_deltas_are_deterministic_and_path_independent() {
 #[test]
 fn witness_alternative_support_keeps_a_parse_alive_across_a_retraction() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let a = tup(7, 1);
     let b = tup(7, 2);
 
@@ -1111,7 +1111,7 @@ fn witness_alternative_support_keeps_a_parse_alive_across_a_retraction() {
 #[test]
 fn witness_appending_an_event_reparses_only_the_tail() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     for k in 0..12 {
         store.commit(&[(REL, tup(k, 1), 1)]).unwrap();
     }
@@ -1139,7 +1139,7 @@ fn witness_appending_an_event_reparses_only_the_tail() {
 #[test]
 fn witness_the_window_may_not_retreat() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     store.commit(&[(REL, tup(1, 1), 1)]).unwrap();
     let early = store.current();
     store.commit(&[(REL, tup(2, 1), 1)]).unwrap();
@@ -1164,7 +1164,7 @@ fn witness_the_window_may_not_retreat() {
 #[test]
 fn witness_a_cancelled_row_is_not_window_content() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let t = tup(4, 1);
     store.commit(&[(REL, t.clone(), 1)]).unwrap();
     let from = store.current(); // the row is in the world at the anchor

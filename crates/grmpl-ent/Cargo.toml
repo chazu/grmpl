@@ -3,7 +3,6 @@ name = "grmpl-ent"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "The Ent: a family of persistent, measured, versioned enfilades over a shared granfilade — the authoritative substrate of grmpl (Xanadu-Ent parity). Below the bright line: it names fjall (the granfilade node store) exactly as grmpl-store names it, and implements the grmpl-core store traits so the semantic core sees only an opaque store."
 
 [dependencies]
 grmpl-core = { workspace = true }
@@ -11,8 +10,6 @@ fjall = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-# The LSM store, used ONLY as the construction-time conformance oracle (plan §4).
-grmpl-store = { path = "../grmpl-store" }
 # Semantic-core crates, used ONLY to prove the language runs over the ent store.
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-proc = { path = "../grmpl-proc" }

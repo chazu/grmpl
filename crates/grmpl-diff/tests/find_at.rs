@@ -9,7 +9,7 @@ use grmpl_core::{
     Column, Edition, Entity, RelId, Schema, SchemaCatalog, TraceStore, Tuple, Ty, Value,
 };
 use grmpl_diff::{Query, Snapshot};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const R: RelId = RelId(1);
 
@@ -20,7 +20,7 @@ fn row(a: u64) -> Tuple {
 #[test]
 fn find_and_schema_are_both_as_of_the_pinned_edition() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // A one-column schema at edition 1, additively evolved to two columns later.
     let v1 = Schema::new(vec![Column::new("a", Ty::Ent)]);
@@ -55,7 +55,7 @@ fn find_and_schema_are_both_as_of_the_pinned_edition() {
 #[test]
 fn as_of_find_survives_consolidation_and_errors_below_the_watermark() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     store.commit(&[(R, row(1), 1)]).unwrap(); // e1
     store.commit(&[(R, row(2), 1)]).unwrap(); // e2

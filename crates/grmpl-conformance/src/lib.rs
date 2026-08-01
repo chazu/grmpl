@@ -9,23 +9,26 @@
 //! so it should be stated once and run against every implementation of them.
 //!
 //! Before this harness, `grmpl-proc`, `grmpl-lang` and `grmpl-session` tests
-//! opened a `FjallStore` by name, so the process layer, the reactive pump, the
+//! opened a `EntStore` by name, so the process layer, the reactive pump, the
 //! scheduler, replay and the session runtime were only ever *proven* on the LSM.
-//! `grmpl-ent` had a handful of its own end-to-end tests, which is not the same
-//! claim. Now a test writes its body once against `&dyn WorldStore` and
-//! [`each_store`] runs it on both — the ent and the LSM — so "the language runs
-//! on the Ent" is a property the suite checks rather than a sentence in a doc.
+//! A test now writes its body once against `&dyn WorldStore`, and [`each_store`]
+//! runs it on every substrate — so "the language runs on the Ent" is a property
+//! the suite checks rather than a sentence in a doc.
 //!
-//! **This crate is above the bright line and dev-only.** It names both `fjall`
-//! (via `grmpl-store`) and `grmpl-ent`, exactly as a harness must in order to
-//! compare them — which is precisely why the semantic core's crates can go on
-//! naming neither. It is a `dev-dependency` everywhere and is never published.
+//! The LSM is gone, so today "every substrate" is one. The indirection stays on
+//! purpose: it is what made the cutover checkable, and it is what would make a
+//! second substrate a matter of adding one variant rather than rewriting ~90
+//! laws. The store contract itself is now stated absolutely against the Ent in
+//! `grmpl-ent/tests/store_laws.rs`, rather than as agreement with another store.
+//!
+//! **This crate is above the bright line and dev-only.** It names `grmpl-ent`
+//! directly, which is precisely why the semantic core's crates need not. It is a
+//! `dev-dependency` everywhere and is never published.
 
 use std::sync::Arc;
 
 use grmpl_core::{Catalog, SchemaCatalog, TraceStore};
 use grmpl_ent::EntStore;
-use grmpl_store::FjallStore;
 use tempfile::TempDir;
 
 /// Everything a world needs from its substrate: the edition/tuple trace, the
@@ -89,18 +92,18 @@ impl Case {
     /// the same kind of store, or the law would be comparing an ent against an
     /// LSM instead of testing either.
     pub fn sibling(&self) -> Case {
-        match self.name {
-            "ent" => ent(),
-            _ => fjall(),
-        }
+        ent()
     }
 }
 
 /// Which substrate a location holds.
+///
+/// There is one, now that the LSM is deleted. The enum stays because the whole
+/// point of this crate is that a law is written against the *traits*, so adding
+/// a second implementation should mean adding a variant here and nothing else.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Kind {
     Ent,
-    Fjall,
 }
 
 /// A substrate **location** with no store currently open on it.
@@ -125,29 +128,24 @@ impl World {
     pub fn open(&self) -> Box<dyn WorldStore> {
         match self.kind {
             Kind::Ent => Box::new(EntStore::open(self.dir.path()).expect("reopen ent store")),
-            Kind::Fjall => Box::new(FjallStore::open(self.dir.path()).expect("reopen fjall store")),
         }
     }
 }
 
 /// Run one crash-recovery law against every substrate.
 pub fn for_each_world(mut body: impl FnMut(&World)) {
-    for kind in [Kind::Ent, Kind::Fjall] {
-        let name = match kind {
-            Kind::Ent => "ent",
-            Kind::Fjall => "fjall",
-        };
+    // One substrate today; the loop is the seam a second one would slot into,
+    // which is the whole reason this crate exists.
+    #[allow(clippy::single_element_loop)]
+    for (kind, name) in [(Kind::Ent, "ent")] {
         let dir = tempfile::tempdir().expect("tempdir");
         body(&World { name, kind, dir });
     }
 }
 
 /// Every substrate implementation, each freshly created.
-///
-/// The **Ent first**: it is the authoritative substrate, so when a law breaks on
-/// both, the ent's failure is the one reported first.
 pub fn each_store() -> Vec<Case> {
-    vec![ent(), fjall()]
+    vec![ent()]
 }
 
 /// Just the ent-native store — for laws that are specifically about it.
@@ -155,13 +153,6 @@ pub fn ent() -> Case {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = EntStore::open(dir.path()).expect("open ent store");
     Case { name: "ent", store: Arc::new(store), _dir: dir }
-}
-
-/// Just the LSM store — the differential oracle.
-pub fn fjall() -> Case {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let store = FjallStore::open(dir.path()).expect("open fjall store");
-    Case { name: "fjall", store: Arc::new(store), _dir: dir }
 }
 
 /// The **logical projection** of a store: for each relation, its raw updates in
@@ -172,7 +163,7 @@ pub fn fjall() -> Case {
 /// explicitly: identity is defined here and **not** over raw node bytes, because
 /// two substrates (and two tree shapes) legitimately lay the same world out
 /// differently — Gold guarantees content/version identity, never byte-identical
-/// node layout. `FjallStore::canonical_dump` compares physical keyspace bytes,
+/// node layout. `EntStore::canonical_dump` compares physical keyspace bytes,
 /// which no other substrate can answer and which would fail across a rebalance
 /// even on one.
 ///

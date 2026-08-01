@@ -11,7 +11,6 @@ grmpl-diff = { path = "../grmpl-diff" }
 
 [dev-dependencies]
 grmpl-conformance = { path = "../grmpl-conformance" }
-grmpl-store = { path = "../grmpl-store" }
 grmpl-pattern = { path = "../grmpl-pattern" }
 grmpl-transport = { path = "../grmpl-transport" }
 tempfile = "3"

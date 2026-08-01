@@ -26,7 +26,7 @@ use std::collections::HashSet;
 
 use grmpl_core::{Edition, EditionStore, RelId, TraceStore, Tuple, Value};
 use grmpl_diff::{sessions, window, Window};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const OTHER: RelId = RelId(2);
@@ -323,7 +323,7 @@ fn sessions_are_the_coarsest_split_and_monotone_in_the_timeout() {
 fn window_sessions_agree_with_the_grammar_over_observed_activity() {
     for seed in SEEDS.take(16) {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x7ACE_0FF5);
 
         // Build a trace whose *active* editions for REL are separated by random

@@ -1,6 +1,6 @@
 # grmpl-bench — the P13 benchmark harness
 
-Measures five engine costs against a **real `FjallStore`**, so the P13
+Measures five engine costs against a **real `EntStore`**, so the P13
 engine-statefulness work is gated on numbers rather than intuition. This is an
 edge/tooling crate above the bright line (it names fjall via `grmpl-store`,
 exactly as an application would); it measures the semantic core, it is not part

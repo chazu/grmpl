@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use grmpl_core::{Diff, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 use grmpl_diff::{multiset, Agg, Query, Snapshot};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const MEASURED: RelId = RelId(1); // (group: Ent, value: Int)
 
@@ -67,7 +67,7 @@ fn model(present: &HashSet<Tuple>, agg: Agg) -> Vec<(Tuple, Diff)> {
 #[test]
 fn reduce_tracks_find_under_random_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // One maintained stream per aggregate, all over the same base relation,
     // grouping by column 0 and folding column 1.
@@ -128,7 +128,7 @@ fn reduce_tracks_find_under_random_churn() {
 #[test]
 fn reduce_inside_iterate_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // An `Iterate` whose step contains a `Reduce` is an ill-formed plan.
     let step = Query::recur().reduce([0], Agg::Count);

@@ -7,7 +7,7 @@
 //!
 //! This module is *above the bright line*: it defines the pure schema value
 //! types and the invariant logic (type admission, arity/type checking, and the
-//! additive-evolution predicate). The durable map lives in `grmpl-store`; it
+//! additive-evolution predicate). The durable map lives in `grmpl-ent`; it
 //! calls into these predicates rather than re-deriving them.
 
 use crate::value::{Tuple, Value};

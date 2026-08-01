@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/grmpl-core",
-    "crates/grmpl-store",
     "crates/grmpl-diff",
     "crates/grmpl-proc",
     "crates/grmpl-pattern",

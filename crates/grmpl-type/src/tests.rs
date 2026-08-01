@@ -11,7 +11,7 @@ use super::*;
 
 /// A minimal in-memory [`SchemaCatalog`] for tests: a flat `RelId → Schema` map,
 /// edition-agnostic (every version is in effect at every edition). Enough to
-/// drive the type synthesizer without pulling in `grmpl-store`.
+/// drive the type synthesizer without pulling in a store.
 #[derive(Default)]
 struct MemSchemas(Mutex<HashMap<RelId, Schema>>);
 
@@ -466,7 +466,7 @@ fn iterate_widens_to_the_full_fixpoint_not_one_kleene_step() {
 
 use grmpl_core::{EditionStore, Tuple, TraceStore};
 use grmpl_diff::eval_snapshot;
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 /// A tiny deterministic xorshift64 PRNG — reproducible, no external `rand` dep.
 struct Rng(u64);
@@ -710,7 +710,7 @@ fn randomized_synthesized_type_admits_every_runtime_row() {
 
     for _ in 0..64 {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let cat = MemSchemas::default();
 
         // Random base relations with concrete schemas, registered for typing.

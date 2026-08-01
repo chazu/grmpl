@@ -30,7 +30,7 @@ use grmpl_core::{
 use grmpl_diff::Snapshot;
 use grmpl_lang::{PredExpr, Program, StoredBehavior, Word};
 use grmpl_proc::{commit_patch, commit_patch_checked, CommitOutcome};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 use grmpl_type::{check_stored_behavior_authority, EffectChecker};
 
 /// xorshift64\* — the crate-wide seeded PRNG idiom, no external dependency.
@@ -94,9 +94,9 @@ fn commit_boundary_rechecks_stored_behavior_under_random_churn() {
     for seed in 1..=24u64 {
         let mut rng = Rng::new(seed);
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let sound_dir = tempfile::tempdir().unwrap();
-        let sound_store = FjallStore::open(sound_dir.path()).unwrap();
+        let sound_store = EntStore::open(sound_dir.path()).unwrap();
 
         for _ in 0..30 {
             // Random write-set and random whole-relation authority.
@@ -166,7 +166,7 @@ fn unauthorized_behavior_is_rejected_at_commit() {
     let prog = program();
     let slot = prog.rel_id("slot").unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // A behavior that writes w0 and w1, but the authority owns only slot + w0.
     let behavior = behavior_writing(&[0usize, 1].into_iter().collect());

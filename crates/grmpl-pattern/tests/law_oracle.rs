@@ -4,7 +4,7 @@
 //! progress `measure()` is a well-founded natural number that must strictly
 //! decrease on every `next()` and hit zero exactly at the end. The in-crate
 //! unit tests pin single examples; the steward bar (repo convention in
-//! `grmpl-store`/`-diff`/`-proc`) is a seedable-xorshift randomized-churn law
+//! `grmpl-ent`/`-diff`/`-proc`) is a seedable-xorshift randomized-churn law
 //! oracle that re-checks the invariant every round over random inputs. This
 //! file is that oracle for all four `MatchInput` instances — `&[Value]`,
 //! `AstInput`, `BytesInput`, and `DeltaInput` (P9c event-mode delta windows) —

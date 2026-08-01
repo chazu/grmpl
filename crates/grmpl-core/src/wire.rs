@@ -4,7 +4,7 @@
 //! not storage layout — but it is the *one* value/tuple encoding for the whole
 //! system. Every framing that must put values on a byte channel builds on the
 //! shared `encode_tuple`/`decode_tuple` here: the transport and cross-domain
-//! router frame a `Message`, and `grmpl-store` frames an on-disk record around
+//! router frame a `Message`, and `grmpl-ent` frames an on-disk node around
 //! this same tuple codec (it no longer keeps a private copy). Pure and
 //! dependency-free.
 //!

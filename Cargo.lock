@@ -1095,7 +1095,6 @@ version = "0.0.1"
 dependencies = [
  "grmpl-core",
  "grmpl-ent",
- "grmpl-store",
  "tempfile",
 ]
 
@@ -1108,8 +1107,8 @@ name = "grmpl-diff"
 version = "0.0.1"
 dependencies = [
  "grmpl-core",
+ "grmpl-ent",
  "grmpl-pattern",
- "grmpl-store",
  "tempfile",
 ]
 
@@ -1122,7 +1121,6 @@ dependencies = [
  "grmpl-diff",
  "grmpl-proc",
  "grmpl-session",
- "grmpl-store",
  "tempfile",
 ]
 
@@ -1135,7 +1133,6 @@ dependencies = [
  "grmpl-diff",
  "grmpl-pattern",
  "grmpl-proc",
- "grmpl-store",
  "tempfile",
 ]
 
@@ -1154,7 +1151,6 @@ dependencies = [
  "grmpl-core",
  "grmpl-diff",
  "grmpl-pattern",
- "grmpl-store",
  "grmpl-transport",
  "tempfile",
 ]
@@ -1169,16 +1165,6 @@ dependencies = [
  "grmpl-ent",
  "grmpl-pattern",
  "grmpl-proc",
- "grmpl-store",
- "tempfile",
-]
-
-[[package]]
-name = "grmpl-store"
-version = "0.0.1"
-dependencies = [
- "fjall",
- "grmpl-core",
  "tempfile",
 ]
 
@@ -1187,7 +1173,7 @@ name = "grmpl-transport"
 version = "0.0.1"
 dependencies = [
  "grmpl-core",
- "grmpl-store",
+ "grmpl-ent",
  "iroh",
  "n0-future 0.3.2",
  "tempfile",
@@ -1200,9 +1186,9 @@ version = "0.0.1"
 dependencies = [
  "grmpl-core",
  "grmpl-diff",
+ "grmpl-ent",
  "grmpl-lang",
  "grmpl-proc",
- "grmpl-store",
  "tempfile",
 ]
 

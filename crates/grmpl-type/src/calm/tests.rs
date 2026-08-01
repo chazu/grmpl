@@ -25,7 +25,7 @@ use grmpl_core::{
 };
 use grmpl_diff::{eval_snapshot, Agg};
 use grmpl_lang::{MapExpr, PredExpr, QueryIr, RowExpr};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 use super::{classify, Blocker, Monotonicity};
 use crate::{check_query, RowTy};
@@ -378,7 +378,7 @@ fn gen(rng: &mut Rng, cat: &MemSchemas, rels: &[RelId], depth: usize, in_iterate
 
 /// The positive support of a plan at `at`: the set of tuples whose consolidated
 /// weight is strictly positive — the rows an observer sees as "present".
-fn present(q: &QueryIr, store: &FjallStore, at: Edition) -> Option<std::collections::HashSet<Tuple>> {
+fn present(q: &QueryIr, store: &EntStore, at: Edition) -> Option<std::collections::HashSet<Tuple>> {
     let out = eval_snapshot(&q.clone().lower(), store, at).ok()?;
     Some(
         out.into_iter()
@@ -398,7 +398,7 @@ fn monotone_plans_never_retract_under_insertion() {
 
     for _ in 0..48 {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let cat = MemSchemas::default();
 
         // Random base relations with concrete schemas.

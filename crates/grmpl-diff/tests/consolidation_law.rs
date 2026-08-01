@@ -70,7 +70,7 @@ use grmpl_diff::{
     consolidate_window, eval_delta, eval_snapshot, multiset, ConsolidatedWindow, Query, Snapshot,
 };
 use grmpl_pattern::{MatchInput, Pattern, VarId};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const SEEDS: std::ops::Range<u64> = 1..25; // 24 seeds
@@ -118,7 +118,7 @@ fn weight(world: &World, t: &Tuple) -> Diff {
 }
 
 /// Commit one update and mirror it into the model world.
-fn commit1(store: &FjallStore, world: &mut World, t: &Tuple, d: Diff) {
+fn commit1(store: &EntStore, world: &mut World, t: &Tuple, d: Diff) {
     store.commit(&[(REL, t.clone(), d)]).unwrap();
     apply(world, t, d);
 }
@@ -126,7 +126,7 @@ fn commit1(store: &FjallStore, world: &mut World, t: &Tuple, d: Diff) {
 /// A batch of 1–3 random churn updates over a small overlapping tuple domain,
 /// committed as one edition. Magnitudes run to 3 (so `|diff| > 1` folds are
 /// exercised) and retractions never drive a weight below zero.
-fn churn(store: &FjallStore, world: &mut World, rng: &mut Rng) {
+fn churn(store: &EntStore, world: &mut World, rng: &mut Rng) {
     let n = 1 + rng.below(3);
     let mut batch: Vec<(RelId, Tuple, Diff)> = Vec::new();
     let mut pending = World::new();
@@ -146,7 +146,7 @@ fn churn(store: &FjallStore, world: &mut World, rng: &mut Rng) {
 
 /// The unanchored consolidation the design warns about: fold the window's own
 /// deltas in isolation. Used only as the oracle's **negative control**.
-fn naive_window(q: &Query, store: &FjallStore, from: Edition, to: Edition) -> Vec<(Tuple, Diff)> {
+fn naive_window(q: &Query, store: &EntStore, from: Edition, to: Edition) -> Vec<(Tuple, Diff)> {
     let mut d = eval_delta(q, store, from, to).unwrap();
     multiset::strip_zeros(&mut d);
     multiset::to_sorted_vec(&d)
@@ -157,7 +157,7 @@ fn naive_window(q: &Query, store: &FjallStore, from: Edition, to: Edition) -> Ve
 /// implementation takes.
 fn assert_equals_snapshot_restricted(
     q: &Query,
-    store: &FjallStore,
+    store: &EntStore,
     cw: &ConsolidatedWindow,
     what: &str,
 ) {
@@ -180,7 +180,7 @@ fn assert_equals_snapshot_restricted(
 /// Laws 4 and 5: determinism, and that the result really feeds the v1 engine.
 fn assert_deterministic_and_matchable(
     q: &Query,
-    store: &FjallStore,
+    store: &EntStore,
     cw: &ConsolidatedWindow,
     what: &str,
 ) {
@@ -239,7 +239,7 @@ fn state_mode_consolidation_law() {
 
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed);
         let mut world = World::new();
         let mut anchors: Vec<Edition> = vec![Edition::ZERO];
@@ -411,7 +411,7 @@ fn state_mode_consolidation_law() {
 #[test]
 fn witness_pre_window_retraction_never_goes_negative() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let q = Query::rel(REL);
     let t = tup(7, 1);
 
@@ -434,7 +434,7 @@ fn witness_pre_window_retraction_never_goes_negative() {
 #[test]
 fn witness_snapshot_window_is_find_and_feeds_the_slice_engine() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let q = Query::rel(REL);
     let (a, b, gone) = (tup(1, 1), tup(2, 2), tup(3, 3));
 

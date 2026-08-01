@@ -33,7 +33,7 @@ use grmpl_diff::Snapshot;
 use grmpl_proc::commit_patch;
 
 /// Deterministic, seedable xorshift64\* — the crate-wide test idiom (no external
-/// `rand`/`proptest`). Identical math to `grmpl-store/tests/determinism.rs`.
+/// `rand`/`proptest`). Identical math to `grmpl-ent/tests/store_laws.rs`.
 struct Rng(u64);
 
 impl Rng {

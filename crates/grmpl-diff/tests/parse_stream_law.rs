@@ -66,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, Result, TraceStore, Tuple, Value};
 use grmpl_diff::{window, ParseStream, Query, Window, WindowParser};
 use grmpl_pattern::{Bindings, DeltaInput, Form, Pattern, Rule, VarId};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const SEEDS: std::ops::Range<u64> = 1..25; // 24 seeds
@@ -145,7 +145,7 @@ fn weight(world: &World, t: &Tuple) -> Diff {
 /// reach 2 sometimes, so a second derivation from the *same* row (multiplicity
 /// two) is exercised too. Retractions never drive a weight below zero.
 fn churn_edition(
-    store: &FjallStore,
+    store: &EntStore,
     world: &mut World,
     rng: &mut Rng,
     log: &mut Log,
@@ -170,7 +170,7 @@ fn churn_edition(
 }
 
 /// Commit one edition, keeping the world model and log in step.
-fn commit_batch(store: &FjallStore, world: &mut World, log: &mut Log, batch: Vec<(Tuple, Diff)>) {
+fn commit_batch(store: &EntStore, world: &mut World, log: &mut Log, batch: Vec<(Tuple, Diff)>) {
     if batch.is_empty() {
         return;
     }
@@ -189,7 +189,7 @@ fn commit_batch(store: &FjallStore, world: &mut World, log: &mut Log, batch: Vec
 /// usually keeps some support), and a law that never exercises its hard case is
 /// worthless, so the generator aims at it deliberately. Returns whether the key
 /// had anything to retract.
-fn retract_whole_key(store: &FjallStore, world: &mut World, log: &mut Log, k: u64) -> bool {
+fn retract_whole_key(store: &EntStore, world: &mut World, log: &mut Log, k: u64) -> bool {
     let batch: Vec<(Tuple, Diff)> = world
         .iter()
         .filter(|(t, d)| **d > 0 && key_of(t) == k as i64)
@@ -204,7 +204,7 @@ fn retract_whole_key(store: &FjallStore, world: &mut World, log: &mut Log, k: u6
 /// to drive trap case (b): a derivation is destroyed but the parse keeps
 /// alternative support, so it must be re-derived rather than deleted. Returns
 /// whether such a key existed.
-fn retract_one_of_many(store: &FjallStore, world: &mut World, log: &mut Log, rng: &mut Rng) -> bool {
+fn retract_one_of_many(store: &EntStore, world: &mut World, log: &mut Log, rng: &mut Rng) -> bool {
     let mut support: HashMap<i64, Diff> = HashMap::new();
     for (t, d) in world.iter().filter(|(_, d)| **d > 0) {
         *support.entry(key_of(t)).or_insert(0) += *d;
@@ -515,7 +515,7 @@ fn check_advance<P: WindowParser>(
 fn parse_stream_law_maintained_parses_equal_a_from_scratch_recompute() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed);
         let mut world = World::new();
         let mut log = Log::new();
@@ -576,7 +576,7 @@ fn parse_stream_law_maintained_parses_equal_a_from_scratch_recompute() {
 fn retraction_drops_unsupported_parses_and_rederives_supported_ones() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0xA5A5_A5A5);
         let mut world = World::new();
         let mut log = Log::new();
@@ -763,7 +763,7 @@ fn retraction_drops_unsupported_parses_and_rederives_supported_ones() {
 fn parse_deltas_are_deterministic_and_path_independent() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x5EED_5EED);
         let mut world = World::new();
         let mut log = Log::new();
@@ -839,7 +839,7 @@ fn parse_deltas_are_deterministic_and_path_independent() {
 #[test]
 fn witness_alternative_support_keeps_a_parse_alive_across_a_retraction() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let a = tup(7, 1);
     let b = tup(7, 2);
 
@@ -874,7 +874,7 @@ fn witness_alternative_support_keeps_a_parse_alive_across_a_retraction() {
 #[test]
 fn witness_the_window_may_not_retreat() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     store.commit(&[(REL, tup(1, 1), 1)]).unwrap();
     let early = store.current();
     store.commit(&[(REL, tup(2, 1), 1)]).unwrap();

@@ -4,10 +4,8 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 publish = false
-description = "Dev-only harness that runs one law suite against every substrate implementation. An edge crate above the bright line: it names both grmpl-store (fjall) and grmpl-ent, exactly as a test harness must, so the semantic core's own crates never do."
 
 [dependencies]
 grmpl-core = { workspace = true }
 grmpl-ent = { path = "../grmpl-ent" }
-grmpl-store = { path = "../grmpl-store" }
 tempfile = "3"

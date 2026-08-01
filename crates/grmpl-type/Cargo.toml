@@ -11,9 +11,9 @@ grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }
 
 [dev-dependencies]
+grmpl-ent = { path = "../grmpl-ent" }
 # A concrete store to *run* lowered plans in the soundness oracle (below the
 # bright line, so test-only — mirrors grmpl-diff / grmpl-lang's own dev-deps).
-grmpl-store = { path = "../grmpl-store" }
 # The commit boundary, to prove the P8b relation-level Authority check predicts
 # the runtime `commit_patch` Authority law (test-only).
 grmpl-proc = { path = "../grmpl-proc" }

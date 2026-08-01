@@ -38,7 +38,7 @@ fn message_survives_a_wire_round_trip() {
 #[test]
 fn durable_cross_domain_delivery_into_the_receiver_store() {
     let dir = tempfile::tempdir().unwrap();
-    let store_b = grmpl_store::FjallStore::open(dir.path()).unwrap();
+    let store_b = grmpl_ent::EntStore::open(dir.path()).unwrap();
 
     let net = InProcessNet::new();
     let a = net.endpoint(A);

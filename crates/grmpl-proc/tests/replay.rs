@@ -187,7 +187,7 @@ fn replay_below_watermark_is_rejected() {
 // commit-order history (not a fixed trace), reading each step as-of its own
 // pre-commit edition. Runs alternate with fresh enqueues so a single
 // `record_run` consumes several messages at once. A seedable xorshift64* PRNG
-// (mirroring grmpl-store/tests/determinism.rs) keeps each round reproducible and
+// (mirroring grmpl-ent/tests/store_laws.rs) keeps each round reproducible and
 // every assertion prints its `seed` so a failure replays directly.
 
 /// Deterministic, seedable PRNG (xorshift64*). Reproducible churn without an

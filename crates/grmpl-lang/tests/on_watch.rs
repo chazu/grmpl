@@ -3,7 +3,7 @@
 //! install path from TKT-77.
 //!
 //! The load-bearing test is a **seeded randomized-churn law oracle** (the
-//! `grmpl-store/tests/determinism.rs` idiom): for a view over a random
+//! `grmpl-ent/tests/store_laws.rs` idiom): for a view over a random
 //! pre-existing world plus a random sequence of subsequent commits, the
 //! grammar-installed watcher must deliver the **identical activation stream**
 //! (same seqs, same signed rows, same order) as a hand-built `OnWatch` installed

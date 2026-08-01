@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use grmpl_core::{Diff, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 use grmpl_diff::{eval_snapshot, IncrementalFixpoint, Maintenance, Query};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const DIRECT: RelId = RelId(3); //    (entity, behavior)
 const PROTOTYPE: RelId = RelId(4); // (child, parent)
@@ -30,7 +30,7 @@ fn sorted(m: &grmpl_diff::Multiset) -> Vec<(Tuple, Diff)> {
 #[test]
 fn incremental_matches_recompute_under_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let (init, step) = implements();
 
     let mut fix = IncrementalFixpoint::new(init, step, &store, store.current()).unwrap();
@@ -88,7 +88,7 @@ fn incremental_matches_recompute_under_churn() {
 #[test]
 fn extending_a_chain_is_incremental_and_cheap() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let (init, step) = implements();
     let mut fix = IncrementalFixpoint::new(init, step, &store, store.current()).unwrap();
 
@@ -139,7 +139,7 @@ fn extending_a_chain_is_incremental_and_cheap() {
 #[test]
 fn deleting_a_cycles_grounding_collapses_it() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     let (init, step) = implements();
 
     // Outside grounding: entity 2 directly "swim".

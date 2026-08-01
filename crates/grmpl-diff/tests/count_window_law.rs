@@ -35,7 +35,7 @@
 
 use grmpl_core::{Edition, EditionStore, RelId, TraceStore, Tuple, Update, Value};
 use grmpl_diff::{last_n, CountWindow};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
 const OTHER: RelId = RelId(2);
@@ -86,7 +86,7 @@ type Arrivals = Vec<Update>;
 /// traffic on a peer relation, and record what `REL` received. Several updates
 /// per edition are deliberate: it is what makes "the last N" fall *inside* an
 /// edition, which is the whole reason a count window is not a `Window`.
-fn churn(store: &FjallStore, rng: &mut Rng, arrivals: &mut Arrivals) {
+fn churn(store: &EntStore, rng: &mut Rng, arrivals: &mut Arrivals) {
     let n = 1 + rng.below(4);
     let batch: Vec<(RelId, Tuple, i64)> = (0..n)
         .map(|_| (REL, tup(rng.below(20)), if rng.below(4) == 0 { -1 } else { 1 }))
@@ -117,7 +117,7 @@ fn expected(arrivals: &Arrivals, n: usize) -> &[Update] {
 fn count_window_holds_exactly_the_last_n_in_arrival_order() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed);
         let mut arrivals = Arrivals::new();
 
@@ -229,7 +229,7 @@ fn count_window_holds_exactly_the_last_n_in_arrival_order() {
 fn count_window_slides_by_one_per_arrival() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x511D_E111);
         let mut arrivals = Arrivals::new();
 
@@ -304,7 +304,7 @@ fn count_window_slides_by_one_per_arrival() {
 fn opening_at_any_edition_agrees_with_having_watched_all_along() {
     for seed in SEEDS {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
         let mut rng = Rng::new(seed ^ 0x09E0_5EED);
         let mut arrivals = Arrivals::new();
         let mut stops = vec![Edition::ZERO];
@@ -401,7 +401,7 @@ fn last_n_is_the_tail_of_at_most_n() {
 #[test]
 fn witness_the_boundary_falls_inside_an_edition() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // One edition carrying four updates, into a window of three.
     let at = store
@@ -441,7 +441,7 @@ fn witness_the_boundary_falls_inside_an_edition() {
 #[test]
 fn witness_a_retraction_occupies_a_slot_rather_than_cancelling_one() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     store.commit(&[(REL, tup(1), 1)]).unwrap();
     let at = store.commit(&[(REL, tup(1), -1)]).unwrap();
 
@@ -455,7 +455,7 @@ fn witness_a_retraction_occupies_a_slot_rather_than_cancelling_one() {
 #[test]
 fn witness_ill_formed_count_window_use_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     store.commit(&[(REL, tup(1), 1)]).unwrap();
     let early = store.current();
     store.commit(&[(REL, tup(2), 1)]).unwrap();

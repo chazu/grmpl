@@ -33,10 +33,14 @@ underneath it in the end state.
 > G-0c (doc truth) is done — the book now describes what the code does, in both
 > directions.
 >
-> **Remaining.** Only the tail of G-10 (soak, then
-> delete `grmpl-store`). The LSM is now *only* the differential oracle — no
-> binary and no runtime path uses it, and it should stay until the remaining
-> items land, since it is the independent leg that has been catching the bugs.
+> · **G-10 (complete — `grmpl-store` is deleted).**
+>
+> **Nothing remains.** Every item in this plan has landed. Deleting the LSM was
+> done last and only after its law suites were ported: the store contract —
+> determinism, the patch–edition law, history/consolidation, fork identity — is
+> now stated **absolutely** against the Ent in `grmpl-ent/tests/store_laws.rs`,
+> each against an independent model rather than as agreement with another store.
+> Deleting it without that would have deleted the laws along with it.
 >
 > G-9 gives the substrate the Arrangements and the `read_range_on` primitive to
 > prune on them; the `grmpl-lang` lowerer does not yet *auto-emit* it from a

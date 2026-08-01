@@ -22,7 +22,7 @@ use grmpl_core::{
 use grmpl_diff::Snapshot;
 use grmpl_lang::Program;
 use grmpl_proc::{commit_patch, CommitOutcome};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 use grmpl_type::{
     check_authority, check_handler_authority, infer_handler_effects, EffectError, EffectRow,
 };
@@ -69,15 +69,15 @@ fn rid(prog: &Program, name: &str) -> RelId {
     prog.rel_id(name).unwrap()
 }
 
-fn store() -> (FjallStore, tempfile::TempDir) {
+fn store() -> (EntStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
     (store, dir)
 }
 
 /// Run one command through the compiled behavior, returning the patch it builds.
 /// The arms use only `self`, so the snapshot content is irrelevant.
-fn run_cmd(prog: &Arc<Program>, store: &FjallStore, word: &str) -> Patch {
+fn run_cmd(prog: &Arc<Program>, store: &EntStore, word: &str) -> Patch {
     let behavior = Program::behavior(prog, "inbox", SELF).unwrap();
     let snap = Snapshot::at_current(store);
     behavior(&snap, &Tuple::from([Value::text(word)])).unwrap()
@@ -271,7 +271,7 @@ impl Rng {
 /// * `Unauthorized` ⇔ some reachable command's patch does fail it.
 ///
 /// The left side is pure static analysis of the handler AST; the right side is
-/// real `commit_patch` calls against a fresh `FjallStore`. Their equivalence,
+/// real `commit_patch` calls against a fresh `EntStore`. Their equivalence,
 /// asserted every round over random authorities, is the P8b soundness law.
 #[test]
 fn static_authority_matches_commit_boundary_under_random_domains() {

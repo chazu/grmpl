@@ -25,20 +25,27 @@ build/test path (see `DESIGN.md` §13, the iroh version note).
 The semantic core (`grmpl-core`, `-diff`, `-proc`, `-lang`, `-pattern`) is
 *above the line*: pure value types and the substrate **traits**
 (`TraceStore`, `EditionStore`, `Catalog`, `Transport`). It names no storage or
-network technology. Only `grmpl-store` names `fjall`; only `grmpl-transport`
-names `iroh`. Substrate crates depend on the traits, never the reverse. The
-language observes **opaque `Edition`s**, never physical sequence numbers.
+network technology. Only `grmpl-ent` names `fjall` (as the granfilade's node
+store); only `grmpl-transport` names `iroh`. Substrate crates depend on the
+traits, never the reverse. The language observes **opaque `Edition`s**, never
+physical sequence numbers.
 
 ### One serialization, versioned (`grmpl-core::wire`)
 
 There is exactly **one** value/tuple encoding: `grmpl_core::wire`. Every framing
 builds on its `encode_tuple`/`decode_tuple` — the message wire *and* the
-`grmpl-store` on-disk record. `grmpl-store` does **not** keep a private copy.
+granfilade's on-disk node frame. `grmpl-ent` does **not** keep a private copy.
 
 Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
 
-* `message = version(1) || inbox(u32, BE) || encoded_tuple`
-* `record  = version(1) || diff(8, LE)   || encoded_tuple`
+* `message   = version(1) || inbox(u32, BE) || encoded_tuple`
+* `node frame = version(1) || tag(1) || n_children(u32, BE) || [content_key]*n
+                || count(u32, BE) || payload`
+
+Node content keys are **SHA-256** (`grmpl_ent::hash`), vendored and pinned
+against the FIPS vectors: the hash is part of the on-disk format, so it may not
+drift with the toolchain, and world content is player-supplied, so it must be
+collision-resistant against chosen input.
 
 Decoders reject any other version loudly (`Error::Codec`) rather than misreading
 an evolved layout. **Bump `FORMAT_VERSION` on any change to the tag set or
@@ -59,8 +66,8 @@ order:
 
 ### Catalog (`grmpl-core::Catalog`)
 
-The name→`RelId` catalog is **append-only** and **durable**: `grmpl-store`
-persists it in the `__meta` keyspace under `cat:{name}` keys. A name's id, once
+The name→`RelId` catalog is **append-only** and **durable**: `grmpl-ent`
+persists it as bindings in the **context enfilade** at the root scope. A name's id, once
 bound, never silently changes (rebinding to a different id is an error). The
 *contract* lives in `grmpl-core` (names and `RelId`s are core types); the
 durable map is a store concern — the language resolves stable ids across reopens
@@ -71,9 +78,10 @@ through the trait without ever naming the storage engine.
 Every relation may carry a **schema**: an ordered list of named, typed columns
 (`Ty` = `Ent`/`Int`/`Text`/`Bool`/`Tuple`/`Bytes`/`Any`). Like the catalog, the schema
 types and the invariant logic (`Schema::check`, `Schema::is_additive_over`) are
-**core**; the durable registry is a **store** concern — `grmpl-store` persists
-each version in `__meta` under `sch:{rel}{edition}` keys, **versioned by the
-edition** it took effect (so `schema_at` answers as-of queries).
+**core**; the durable registry is a **store** concern — `grmpl-ent` persists each
+version in the context enfilade under a `(rel, edition)` key, **versioned by the
+edition** it took effect, so `schema_at` is a WID range walk over the relation's
+version span rather than a scan.
 
 * **Additive-only evolution.** A relation's schema may only *grow*: a new
   version must be a prefix-superset of the current one (existing columns
@@ -101,13 +109,20 @@ step, so racing commits resolve to exactly one winner.
 ```
 grmpl-core ── grmpl-diff ── grmpl-proc ── grmpl-lang
      │            │              │
-     ├── grmpl-store (fjall)     │
+     ├── grmpl-ent (the Ent; fjall as the granfilade node store)
      ├── grmpl-pattern ──────────┴── grmpl-lang
      └── grmpl-transport (iroh, feature-gated)
 
 grmpl-session (P3 edge crate: TCP sessions, provisioning, world verbs)
-     └── depends on core + diff + proc + pattern + store
+grmpl-conformance (dev-only: one law suite, every substrate)
 ```
+
+The **Ent is the only substrate**: `grmpl-store` (the fjall LSM) was the
+construction-time differential oracle and is deleted. The store contract is now
+stated absolutely in `grmpl-ent/tests/store_laws.rs` — determinism, the
+patch–edition law, history/consolidation, and fork identity, each against an
+independent model — and every law of the language runs through
+`grmpl-conformance`, which is what made the cutover checkable.
 
 `grmpl-session` is an **edge** crate, *not* part of the semantic core: it sits
 above the bright line and wires the core to clients, so it may name a concrete

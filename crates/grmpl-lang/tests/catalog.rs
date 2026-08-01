@@ -145,7 +145,7 @@ fn register_schemas_is_idempotent_after_compile_with_catalog() {
 //   (c) each brand-new name's id is strictly above the prior high-water mark.
 //
 // A tiny xorshift64* PRNG keeps the churn reproducible with no external `rand`
-// dependency (mirrors grmpl-store's determinism.rs); every assertion prints its
+// dependency (mirrors grmpl-ent's store_laws.rs); every assertion prints its
 // `seed` so a failure replays directly.
 
 /// Deterministic, seedable PRNG (xorshift64*). Reproducible churn without a

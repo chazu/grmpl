@@ -9,7 +9,7 @@ description = "The differential engine: Query (a dataflow plan as a value), Snap
 grmpl-core = { workspace = true }
 
 [dev-dependencies]
-grmpl-store = { path = "../grmpl-store" }
+grmpl-ent = { path = "../grmpl-ent" }
 # Test-only: the state-mode consolidation law (P9c §4a) asserts that a
 # consolidated window really does feed the *existing* `&[Value]` pattern engine.
 # Dev-only by design — `grmpl-diff` must not depend on the algebra in prod.

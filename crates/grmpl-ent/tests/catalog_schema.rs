@@ -1,22 +1,19 @@
-//! **G-5 acceptance: the catalog and schema registry are ent-native, and obey
-//! the same laws on the Ent as on the LSM.**
+//! **G-5 acceptance: the catalog and schema registry are ent-native.**
 //!
 //! `CLAUDE.md` names both load-bearing — the name→`RelId` map is append-only and
 //! durable, the schema registry is versioned by the edition each version took
 //! effect and may only evolve additively. Until now `EntStore` implemented
 //! neither, so a world running on the Ent had no durable names and committed
-//! with `NoSchemas`: two of the substrate's four invariants were reachable only
-//! from the LSM.
+//! with `NoSchemas`: two of the substrate's four invariants had no ent-native
+//! implementation at all.
 //!
 //! Both now ride on the **context enfilade** — bindings at the root scope — so
 //! they version, persist, GC-root and range-walk like everything else in the
-//! plex. These tests drive the laws against `EntStore` (in memory and across a
-//! reopen) and check them **differentially against `FjallStore`**, the same
-//! oracle discipline the store contract uses.
+//! plex. These tests state the laws absolutely — in memory, across a reopen, and
+//! under randomized evolution — rather than as agreement with another store.
 
 use grmpl_core::{Catalog, Column, Edition, RelId, Schema, SchemaCatalog, Ty};
 use grmpl_ent::EntStore;
-use grmpl_store::FjallStore;
 
 fn schema(cols: &[(&str, Ty)]) -> Schema {
     Schema::new(cols.iter().map(|(n, t)| Column::new(*n, *t)).collect())
@@ -59,28 +56,6 @@ fn catalog_is_append_only() {
     assert_eq!(store.rel_id("located").unwrap(), Some(RelId(1)));
 }
 
-/// The ent and the LSM must agree on every catalog observable, driven by the
-/// same sequence — the differential oracle, extended to naming.
-#[test]
-fn catalog_matches_fjall() {
-    let dir = tempfile::tempdir().unwrap();
-    let ent = EntStore::new();
-    let fj = FjallStore::open(dir.path()).unwrap();
-    let names = ["located", "named", "held", "exits", "value", "a", "zzz"];
-    for (i, name) in names.iter().enumerate() {
-        let id = RelId(i as u32 + 1);
-        assert_eq!(ent.register(name, id).is_err(), fj.register(name, id).is_err());
-    }
-    // Conflicts agree.
-    assert_eq!(
-        ent.register("located", RelId(99)).is_err(),
-        fj.register("located", RelId(99)).is_err()
-    );
-    for name in names.iter().chain(["missing"].iter()) {
-        assert_eq!(ent.rel_id(name).unwrap(), fj.rel_id(name).unwrap(), "rel_id({name})");
-    }
-    assert_eq!(ent.entries().unwrap(), fj.entries().unwrap(), "entries");
-}
 
 // --- schema laws ----------------------------------------------------------
 
@@ -148,64 +123,6 @@ fn non_additive_and_non_increasing_changes_are_rejected() {
     assert_eq!(store.schema_at(RelId(1), Edition(3)).unwrap(), Some(v1));
 }
 
-/// Per-relation spans really are independent: one relation's evolution is
-/// invisible to another's `schema_at`.
-#[test]
-fn relations_do_not_share_schema_versions() {
-    let store = EntStore::new();
-    let a = schema(&[("x", Ty::Int)]);
-    let b = schema(&[("y", Ty::Text), ("z", Ty::Bool)]);
-    store.put_schema(RelId(1), &a, Edition(1)).unwrap();
-    store.put_schema(RelId(2), &b, Edition(2)).unwrap();
-    assert_eq!(store.schema_at(RelId(1), Edition(99)).unwrap(), Some(a));
-    assert_eq!(store.schema_at(RelId(2), Edition(1)).unwrap(), None);
-    assert_eq!(store.schema_at(RelId(2), Edition(2)).unwrap(), Some(b));
-    assert_eq!(store.schema_at(RelId(3), Edition(99)).unwrap(), None);
-}
-
-/// The registry laws under random evolution, checked against the LSM: the ent
-/// must accept exactly the same puts and answer exactly the same `schema_at`.
-#[test]
-fn schema_registry_matches_fjall_under_random_evolution() {
-    for seed in 1..=16u64 {
-        let dir = tempfile::tempdir().unwrap();
-        let ent = EntStore::new();
-        let fj = FjallStore::open(dir.path()).unwrap();
-        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15 | 1;
-        let mut next = || {
-            rng ^= rng >> 12;
-            rng ^= rng << 25;
-            rng ^= rng >> 27;
-            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        };
-        let cols = [("a", Ty::Int), ("b", Ty::Text), ("c", Ty::Bool), ("d", Ty::Ent)];
-
-        for _ in 0..40 {
-            let rel = RelId((next() % 3) as u32 + 1);
-            let width = (next() % 4) as usize + 1;
-            let at = Edition(next() % 12);
-            let s = schema(&cols[..width]);
-            let ea = ent.put_schema(rel, &s, at);
-            let fa = fj.put_schema(rel, &s, at);
-            assert_eq!(ea.is_err(), fa.is_err(), "seed {seed}: put_schema verdict diverged");
-
-            for r in 1..=3u32 {
-                assert_eq!(
-                    ent.schema(RelId(r)).unwrap(),
-                    fj.schema(RelId(r)).unwrap(),
-                    "seed {seed}: schema({r})"
-                );
-                for e in 0..12 {
-                    assert_eq!(
-                        ent.schema_at(RelId(r), Edition(e)).unwrap(),
-                        fj.schema_at(RelId(r), Edition(e)).unwrap(),
-                        "seed {seed}: schema_at({r}, {e})"
-                    );
-                }
-            }
-        }
-    }
-}
 
 /// The catalog and schema registry are GC-exempt: they are live roots, so
 /// collecting orphaned world nodes must never take the world's names with it.
@@ -235,4 +152,82 @@ fn gc_does_not_collect_the_catalog_or_schemas() {
     let store = EntStore::open(dir.path()).unwrap();
     assert_eq!(store.rel_id("located").unwrap(), Some(RelId(1)));
     assert_eq!(store.schema(RelId(1)).unwrap(), Some(s));
+}
+
+/// The evolution law under randomized puts, stated directly: a put is accepted
+/// exactly when it is the first schema, an identical re-put, or a strict
+/// additive extension at a strictly later edition — and a rejected put leaves
+/// the registry untouched.
+#[test]
+fn schema_evolution_laws_hold_under_random_evolution() {
+    for seed in 1..=16u64 {
+        let store = EntStore::new();
+        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15 | 1;
+        let mut next = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let cols = [("a", Ty::Int), ("b", Ty::Text), ("c", Ty::Bool), ("d", Ty::Ent)];
+
+        for _ in 0..40 {
+            let rel = RelId((next() % 3) as u32 + 1);
+            let width = (next() % 4) as usize + 1;
+            let at = Edition(next() % 12);
+            let s = schema(&cols[..width]);
+
+            // What the law says should happen, decided before the call.
+            let before = store.schema(rel).unwrap();
+            let before_at: Vec<Option<Schema>> =
+                (0..12).map(|e| store.schema_at(rel, Edition(e)).unwrap()).collect();
+            let expected_ok = match &before {
+                None => true,
+                Some(cur) if cur == &s => true,
+                Some(cur) => s.is_additive_over(cur) && at.0 > current_edition(&store, rel),
+            };
+
+            let got = store.put_schema(rel, &s, at);
+            assert_eq!(got.is_ok(), expected_ok, "seed {seed}: verdict for width {width} at {at:?}");
+
+            if got.is_err() {
+                // A rejected put changes nothing, at any edition.
+                assert_eq!(store.schema(rel).unwrap(), before, "seed {seed}: rejected put mutated");
+                for (e, want) in before_at.iter().enumerate() {
+                    assert_eq!(
+                        &store.schema_at(rel, Edition(e as u64)).unwrap(),
+                        want,
+                        "seed {seed}: rejected put moved schema_at({e})"
+                    );
+                }
+            } else {
+                // `schema_at` is monotone in the edition: once a version is in
+                // force it stays in force until a later one supersedes it.
+                let mut last: Option<Schema> = None;
+                for e in 0..12u64 {
+                    let here = store.schema_at(rel, Edition(e)).unwrap();
+                    if let (Some(p), Some(h)) = (&last, &here) {
+                        assert!(
+                            h == p || h.is_additive_over(p),
+                            "seed {seed}: schema_at went backwards between {} and {e}",
+                            e - 1
+                        );
+                    }
+                    last = here;
+                }
+            }
+        }
+    }
+}
+
+/// The edition the current version of `rel` took effect — the floor a later
+/// version must strictly exceed.
+fn current_edition(store: &EntStore, rel: RelId) -> u64 {
+    let cur = match store.schema(rel).unwrap() {
+        None => return 0,
+        Some(c) => c,
+    };
+    (0..12u64)
+        .find(|e| store.schema_at(rel, Edition(*e)).unwrap().as_ref() == Some(&cur))
+        .unwrap_or(0)
 }

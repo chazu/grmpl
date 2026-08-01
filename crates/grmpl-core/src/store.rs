@@ -1,7 +1,7 @@
 //! The substrate boundary (DESIGN.md §4).
 //!
 //! These traits are the *only* contract between the semantic core and the
-//! physical world. `grmpl-store` implements them with fjall; `grmpl-diff` and
+//! physical world. `grmpl-ent` implements them with the Ent (fjall serves only as its granfilade node store); `grmpl-diff` and
 //! the process layer depend on the traits, never on the implementation. The
 //! language observes opaque `Edition`s here, never a `SeqNo`.
 //!
@@ -173,8 +173,8 @@ pub trait TraceStore: EditionStore {
 ///
 /// **Store-API boundary decision.** The *catalog contract* is declared here in
 /// the core — names are `&str` and ids are `RelId`, both storage-agnostic core
-/// types — while the durable map itself is a store concern (`grmpl-store`
-/// persists it in its `__meta` keyspace, next to the edition clock). It is kept
+/// types — while the durable map itself is a store concern (`grmpl-ent`
+/// persists it as a binding in the context enfilade, beside the edition clock). It is kept
 /// deliberately separate from [`TraceStore`]: naming is orthogonal to the
 /// edition/tuple trace, so a store may implement one without the other, and the
 /// language layer resolves/allocates *stable* ids across reopens through this
@@ -197,9 +197,9 @@ pub trait Catalog: Send + Sync {
 ///
 /// **Store-API boundary decision** (mirrors [`Catalog`]). The *schema types*
 /// and the *evolution invariant* (additive-only, [`Schema::is_additive_over`])
-/// are core; the durable map is a store concern — `grmpl-store` persists each
+/// are core; the durable map is a store concern — `grmpl-ent` persists each
 /// version in its `__meta` keyspace beside the catalog, under a
-/// `sch:{rel}:{edition}` key. Kept separate from [`TraceStore`] and [`Catalog`]
+/// `(rel, edition)` binding. Kept separate from [`TraceStore`] and [`Catalog`]
 /// because schema history is orthogonal to both the tuple trace and the
 /// name→id binding.
 ///

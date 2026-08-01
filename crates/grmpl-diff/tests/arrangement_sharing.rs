@@ -9,16 +9,16 @@ use grmpl_core::{
     Diff, Edition, EditionStore, Entity, RelId, Result, TraceStore, Tuple, Update, Value,
 };
 use grmpl_diff::{eval_snapshot, eval_snapshot_with, Arrangements, Query};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 /// Delegates to a real store but tallies `read_at` calls per relation.
 struct CountingStore {
-    inner: FjallStore,
+    inner: EntStore,
     reads: Mutex<HashMap<RelId, usize>>,
 }
 
 impl CountingStore {
-    fn new(inner: FjallStore) -> Self {
+    fn new(inner: EntStore) -> Self {
         CountingStore { inner, reads: Mutex::new(HashMap::new()) }
     }
     fn reads(&self, rel: RelId) -> usize {
@@ -70,7 +70,7 @@ fn seed(store: &CountingStore) {
 #[test]
 fn shared_subdag_is_read_once_within_a_query() {
     let dir = tempfile::tempdir().unwrap();
-    let store = CountingStore::new(FjallStore::open(dir.path()).unwrap());
+    let store = CountingStore::new(EntStore::open(dir.path()).unwrap());
     seed(&store);
     let at = store.current();
 
@@ -90,7 +90,7 @@ fn shared_subdag_is_read_once_within_a_query() {
 #[test]
 fn shared_arrangement_spans_multiple_queries() {
     let dir = tempfile::tempdir().unwrap();
-    let store = CountingStore::new(FjallStore::open(dir.path()).unwrap());
+    let store = CountingStore::new(EntStore::open(dir.path()).unwrap());
     seed(&store);
     let at = store.current();
 

@@ -13,5 +13,4 @@ grmpl-proc = { path = "../grmpl-proc" }
 
 [dev-dependencies]
 grmpl-conformance = { path = "../grmpl-conformance" }
-grmpl-store = { path = "../grmpl-store" }
 tempfile = "3"

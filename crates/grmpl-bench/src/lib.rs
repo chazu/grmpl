@@ -1,7 +1,7 @@
 //! # grmpl-bench — the P13 benchmark harness
 //!
 //! Five axes, each a submodule of [`scenarios`], measured against a real
-//! [`grmpl_store::FjallStore`]:
+//! [`grmpl_ent::EntStore`]:
 //!
 //! * [`scenarios::churn`] — commit/patch throughput (the write floor).
 //! * [`scenarios::watch`] — watch fan-out over independent v1 delta streams,
@@ -15,7 +15,7 @@
 //!   engine-statefulness work must design around.
 //!
 //! This is an **edge / tooling crate**, above the bright line: it names fjall
-//! (via `grmpl-store`) exactly as an application would. It measures the semantic
+//! (via `grmpl-ent`) exactly as an application would. It measures the semantic
 //! core; it is not part of it. The [`harness`] module holds the dependency-free
 //! timing scaffolding shared by every scenario.
 

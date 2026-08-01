@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use grmpl_core::{Diff, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 use grmpl_diff::{multiset, Query, Snapshot};
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const LOCATED: RelId = RelId(1); // (thing, place)
 const NAMED: RelId = RelId(2); //  (thing, name)
@@ -35,7 +35,7 @@ impl Lcg {
 #[test]
 fn watch_tracks_find_under_random_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = FjallStore::open(dir.path()).unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
 
     // q = distinct( located ⋈_thing named  →  project (place, name) )
     // concat layout after join: [0]=thing_l [1]=place [2]=thing_r [3]=name
