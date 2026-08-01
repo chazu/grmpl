@@ -271,6 +271,10 @@ paging** (fixes the 40 ms eager reopen and the resident-memory floor).
 
 ### 6. Per-domain commit clocks
 
+> Expanded in [`CONCURRENCY-DISTRIBUTED.md`](CONCURRENCY-DISTRIBUTED.md): causal
+> frontiers, a staged implementation of this item, and the costs it incurs.
+
+
 Today one store = one `EditionStore` = one total order, so every writer
 serializes on one clock no matter how disjoint their authority. Sharding the
 store *by domain* — `DESIGN.md` §5.2 already says one authority domain has one
