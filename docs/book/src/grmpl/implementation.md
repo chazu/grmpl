@@ -167,12 +167,27 @@ by an **endorsement flag-lattice** (`Endorsement`, `InterestId`) that routes
 conservatively — a superset of what the pump will actually deliver, never a
 subset.
 
-Two honest caveats. It is a `Vec` plus a segment tree rebuilt on each
-register/unregister, not yet an enfilade — so it does not version, persist, or
-GC with the rest of the plex. And nothing routes through it yet: the reactive
-pump re-evaluates its view on every pump rather than asking the canopy whether a
-commit could have touched it. Making it an enfilade and putting it on the pump's
-path is plan v5's G-4.
+It is a real enfilade: interests live in the same persistent measured tree as
+everything else, keyed `(rel, lo, id)` so one relation's interests are a
+contiguous low-endpoint-ordered span, and it round-trips through the granfilade.
+Registering is an `O(log n)` persistent insert.
+
+**Routing is load-bearing, but by a coarser mechanism than the canopy.** The
+reactive pump no longer re-evaluates its view on every pump: it asks the
+substrate, through `TraceStore::touched_since`, whether an interval could have
+touched the view's base relations, and the Ent answers from the *Edition*
+enfilade's cached measures in `O(log n)`. The contract is conservative — `false`
+is a proof of no change, `true` merely means "possibly" — so the default `true`
+leaves every store correct and only a store that can prove a negative saves the
+work. Measured: 50 installed watches, one commit to a relation none of them
+reads, zero differential evaluations.
+
+That routes per *relation*. Routing per *key range* — which is what the canopy
+indexes, and what would let two watchers on disjoint parts of one relation miss
+each other's commits — needs the pump to register an interest with a range,
+which it can only do for a view whose key span is known (the E2b `RangeRel`
+pushdown). That step is what puts the `Canopy` type itself on the path, and it
+has not been taken.
 
 ## The context enfilade — `context.rs`
 

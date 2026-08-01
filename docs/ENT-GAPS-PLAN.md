@@ -36,6 +36,13 @@ underneath it in the end state.
 > binary and no runtime path uses it, and it should stay until the remaining
 > items land, since it is the independent leg that has been catching the bugs.
 >
+> G-4 landed both its halves, but routing is per *relation*, answered from the
+> Edition enfilade's measure. Routing per *key range* — the thing the `Canopy`
+> type indexes — needs the pump to register an interest with a span, which it can
+> only do for a view whose key range is known (the E2b `RangeRel` pushdown). Until
+> that step, the `Canopy` type is a correct, persistent, measured enfilade that
+> the store does not yet consult.
+>
 > G-7 landed its *capability* but not its asymptotics: instancing now reads out
 > of a displaced view (`O(1)` to relocate, query transformed into the shared
 > tree's coordinates and pruned there) instead of materializing the template and
