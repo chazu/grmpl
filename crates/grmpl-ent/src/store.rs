@@ -299,6 +299,16 @@ impl EntStore {
         self.gran.as_ref().map_or(0, |g| g.frames_encoded())
     }
 
+    /// Distinct nodes currently stored in the granfilade — the on-disk size of
+    /// the world in nodes, for measuring how history accumulates and what GC
+    /// reclaims. `0` for an in-memory store.
+    pub fn stored_nodes(&self) -> Result<usize> {
+        match &self.gran {
+            Some(g) => g.node_count(),
+            None => Ok(0),
+        }
+    }
+
     /// **Reachability GC (E3).** Collect granfilade nodes no longer reachable
     /// from a live enfilade root (accumulated as commits path-copy and
     /// `consolidate` truncates). Serialized with commits (holds the edition
@@ -540,6 +550,8 @@ impl EntStore {
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
     /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
     fn persist(&self, inner: &Inner, touched: &[RelId], drop_below: Option<u64>) -> Result<()> {
+        // Consolidation is the only occasion that rewrites existing roots.
+        let write_all_versions = drop_below.is_some();
         let gran = match &self.gran {
             Some(g) => g,
             None => return Ok(()),
@@ -561,11 +573,29 @@ impl EntStore {
             // as-of root is persisted, so `open` is a root lookup rather than a
             // replay of the log — the Fact enfilade is durable state in its own
             // right, not an index derived from a log underneath it.
+            //
+            // Only the version this commit *created* is written. An older
+            // version's root is immutable — a later commit inserts a new root
+            // beside it and never edits it — so rewriting them all would be
+            // `O(live editions)` meta writes per commit, making N commits into an
+            // unconsolidated world `O(N²)`. (Measured before this was fixed: a
+            // commit cost 774µs at history depth 0 and 20.3ms at depth 4000.)
+            // `write_all_versions` is for consolidation, which *does* replace the
+            // checkpoint and retire the roots below it.
             if let Some(roots) = inner.roots(*rel) {
-                for (edition, tree) in roots.versions.iter() {
-                    let (ck, ns) = gran.collect_tree(tree);
+                let versions: Vec<(u64, FactTree)> = if write_all_versions {
+                    roots.versions.iter().map(|(e, t)| (*e, t.clone())).collect()
+                } else {
+                    roots
+                        .versions
+                        .last_le(&inner.current)
+                        .map(|(e, t)| vec![(*e, t.clone())])
+                        .unwrap_or_default()
+                };
+                for (edition, tree) in versions {
+                    let (ck, ns) = gran.collect_tree(&tree);
                     nodes.extend(ns);
-                    meta.push((fact_key(self.branch, *rel, *edition), opt_ck_bytes(ck)));
+                    meta.push((fact_key(self.branch, *rel, edition), opt_ck_bytes(ck)));
                 }
             }
         }
