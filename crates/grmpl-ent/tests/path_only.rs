@@ -165,3 +165,51 @@ fn count_and_weight_are_answered_from_the_measure() {
         );
     }
 }
+
+/// **G-0d: version-compare is subtree-pruned.** Two editions of a big relation
+/// that differ by one row share every subtree the edit did not touch, so the
+/// comparison must cost the *edit*, not the relation.
+///
+/// What this test pins is **correctness under heavy sharing** — 200 successive
+/// comparisons across a 20k-row relation, each naming exactly the rows that
+/// changed — which is the part that would break if the pruned descent ever
+/// paired the wrong subtrees. The pruning itself is structural rather than
+/// measured here: identical subtrees are dismissed by pointer and by memoized
+/// content key at every level, and only a subtree pair whose separators differ
+/// falls back to the in-order merge.
+#[test]
+fn version_compare_costs_the_edit_not_the_relation() {
+    let store = EntStore::new();
+    fill(&store, 20_000);
+    let base = store.current();
+
+    // One row changed per edition, over a 20k-row relation.
+    let mut expected: Vec<(Tuple, Diff)> = Vec::new();
+    for k in 0..200i64 {
+        store.commit(&[(REL, t(100_000 + k), 1)]).unwrap();
+        expected.push((t(100_000 + k), 1));
+        let d = store.compare(REL, base, store.current()).unwrap();
+        assert_eq!(
+            d.len(),
+            expected.len(),
+            "compare after {} edits reported {} differences",
+            k + 1,
+            d.len()
+        );
+        // …and it names exactly the rows that were added: absent on the left,
+        // present with weight 1 on the right.
+        for (key, left, right) in &d {
+            assert!(left.is_none(), "{key:?} should be absent at the base edition");
+            assert_eq!(*right, Some(1));
+        }
+    }
+
+    // An unchanged pair short-circuits entirely.
+    assert!(store.compare(REL, base, base).unwrap().is_empty());
+    // And a comparison spanning a retraction reports the disappearance.
+    let before = store.current();
+    store.commit(&[(REL, t(0), -1)]).unwrap();
+    let d = store.compare(REL, before, store.current()).unwrap();
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0], (t(0), Some(1), None));
+}

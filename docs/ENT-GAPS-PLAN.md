@@ -19,7 +19,8 @@ underneath it in the end state.
 > store's state is one enfilade root, ordered all the way down) · G-7 (`DspEnf` is
 > on the instancing path — **no module in `grmpl-ent` has zero callers now**) ·
 > G-8 (Derived enfilades — materialized views that survive a reopen) · G-9
-> (Arrangements — trailing-column pruning at the source).
+> (Arrangements — trailing-column pruning at the source) · G-0d (version-compare
+> prunes shared subtrees at every level).
 >
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
@@ -32,7 +33,7 @@ underneath it in the end state.
 > G-0c (doc truth) is done — the book now describes what the code does, in both
 > directions.
 >
-> **Remaining.** G-0d (measured version-compare) · the tail of G-10 (soak, then
+> **Remaining.** Only the tail of G-10 (soak, then
 > delete `grmpl-store`). The LSM is now *only* the differential oracle — no
 > binary and no runtime path uses it, and it should stay until the remaining
 > items land, since it is the independent leg that has been catching the bugs.
@@ -56,12 +57,14 @@ underneath it in the end state.
 > overlay that shares until an instance diverges needs a displaced node variant
 > threaded through every tree walk; that is the remaining half.
 >
-> **One estimate was wrong.** G-0d is filed below as small; it is not. Pruning a
-> diff at every node needs the B+ tree to split at an arbitrary key so the two
-> sides can be compared span-by-span, which is a `split`/`join` addition to
-> `tree.rs`, not a rewrite of `diff`. It is also the least load-bearing item here
-> — `compare` has no caller in the running language — so it is now sequenced
-> after G-3, whose `KeyBounds` measure it wants anyway.
+> **On the estimate I got wrong.** G-0d is filed below as small; I then said it
+> needed `split`/`join` on the B+ tree so two versions could be compared
+> span-by-span. Both were wrong. The descent pairs children only when the two
+> nodes carry the **same separators** — then each pair covers exactly the same
+> span and can be compared independently, which is the ordinary case for a path
+> copy — and falls back to an in-order merge for the one subtree pair where an
+> edit split or merged a node. So the pruning is an optimization layered over a
+> correct base, and needs no new tree operation.
 
 **What this document adds.** v4 declared every distinctive Xanadu-`Ent`
 structural component "present and correct", with three deferred *performance*

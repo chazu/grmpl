@@ -252,50 +252,105 @@ where
     }
 
     /// The entries that differ between `self` and `other`, as
-    /// `(key, self_value, other_value)` (a `None` side means absent). Short-
-    /// circuits to empty when the two are the same shared version.
+    /// `(key, self_value, other_value)` (a `None` side means absent).
+    ///
+    /// **Subtree-pruned (plan v5 §G-0d).** Two versions from one lineage share
+    /// every subtree the edit did not touch, so the walk dismisses them without
+    /// descending: by pointer when the two are the same in-memory node, and by
+    /// **memoized content key** when they are the same node reached through
+    /// different handles (a reloaded version, a fork). Pruning happens at *every*
+    /// level, not just the root, which is what makes version-compare cost the
+    /// edit rather than the relation.
+    ///
+    /// The descent pairs children only when the two nodes carry the **same
+    /// separators** — then each pair covers exactly the same key span and can be
+    /// compared independently. That is the ordinary case for a path copy. When an
+    /// edit split or merged a node the separators differ, and *that subtree pair*
+    /// falls back to an in-order merge, which is always correct. So the pruning is
+    /// an optimization over a correct base rather than a new algorithm to trust.
     pub fn diff(&self, other: &Self) -> Vec<EntryDiff<K, V>>
     where
         V: PartialEq,
     {
-        if self.same_version(other) {
-            return Vec::new();
-        }
-        let a: Vec<(&K, &V)> = self.iter().collect();
-        let b: Vec<(&K, &V)> = other.iter().collect();
         let mut out = Vec::new();
+        Self::diff_into(self, other, &mut out);
+        out
+    }
+
+    fn diff_into(a: &Self, b: &Self, out: &mut Vec<EntryDiff<K, V>>)
+    where
+        V: PartialEq,
+    {
+        // The same in-memory node: nothing beneath it can differ.
+        if a.same_version(b) {
+            return;
+        }
+        // The same *content*, reached by different handles — the cross-version
+        // form of the same fact, available because nodes memoize their key.
+        if let (Some(x), Some(y)) = (
+            a.ck_cell().and_then(|c| c.get()),
+            b.ck_cell().and_then(|c| c.get()),
+        ) {
+            if x == y {
+                return;
+            }
+        }
+        match (a.node(), b.node()) {
+            (Some(NodeRef::Internal(ak, ac)), Some(NodeRef::Internal(bk, bc)))
+                if ak == bk && ac.len() == bc.len() =>
+            {
+                // Identical separators ⇒ child `i` of each covers the same span.
+                for (x, y) in ac.iter().zip(bc.iter()) {
+                    Self::diff_into(x, y, out);
+                }
+            }
+            _ => Self::merge_diff(a, b, out),
+        }
+    }
+
+    /// The in-order merge of two subtrees' entries — the always-correct base the
+    /// pruned descent falls back to.
+    fn merge_diff(a: &Self, b: &Self, out: &mut Vec<EntryDiff<K, V>>)
+    where
+        V: PartialEq,
+    {
+        let av: Vec<(&K, &V)> = a.iter().collect();
+        let bv: Vec<(&K, &V)> = b.iter().collect();
         let (mut i, mut j) = (0, 0);
-        while i < a.len() || j < b.len() {
-            match (a.get(i), b.get(j)) {
-                (Some((ak, av)), Some((bk, bv))) => match ak.cmp(bk) {
+        while i < av.len() || j < bv.len() {
+            match (av.get(i), bv.get(j)) {
+                (Some((ak, aval)), Some((bk, bval))) => match ak.cmp(bk) {
                     std::cmp::Ordering::Less => {
-                        out.push(((*ak).clone(), Some((*av).clone()), None));
+                        out.push(((*ak).clone(), Some((*aval).clone()), None));
                         i += 1;
                     }
                     std::cmp::Ordering::Greater => {
-                        out.push(((*bk).clone(), None, Some((*bv).clone())));
+                        out.push(((*bk).clone(), None, Some((*bval).clone())));
                         j += 1;
                     }
                     std::cmp::Ordering::Equal => {
-                        if av != bv {
-                            out.push(((*ak).clone(), Some((*av).clone()), Some((*bv).clone())));
+                        if aval != bval {
+                            out.push((
+                                (*ak).clone(),
+                                Some((*aval).clone()),
+                                Some((*bval).clone()),
+                            ));
                         }
                         i += 1;
                         j += 1;
                     }
                 },
-                (Some((ak, av)), None) => {
-                    out.push(((*ak).clone(), Some((*av).clone()), None));
+                (Some((ak, aval)), None) => {
+                    out.push(((*ak).clone(), Some((*aval).clone()), None));
                     i += 1;
                 }
-                (None, Some((bk, bv))) => {
-                    out.push(((*bk).clone(), None, Some((*bv).clone())));
+                (None, Some((bk, bval))) => {
+                    out.push(((*bk).clone(), None, Some((*bval).clone())));
                     j += 1;
                 }
                 (None, None) => break,
             }
         }
-        out
     }
 
     /// In-order `(key, value)` iterator — the **canonical** ordering of the map,
