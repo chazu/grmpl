@@ -17,6 +17,7 @@
 //! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
@@ -48,11 +49,54 @@ type VersionTree = Tree<u64, FactTree, Count>;
 /// The **Rel enfilade**: the directory of live relations (G-2a).
 type RelTree = Tree<u32, RelRoots, Count>;
 
-/// One relation's roots: its versioned Fact enfilade and its Edition log.
+/// One relation's roots: its versioned Fact enfilade, its Edition log, and any
+/// **Arrangements** — alternate orderings of the same facts (G-9).
 #[derive(Clone, Default)]
 struct RelRoots {
     versions: VersionTree,
     log: LogTree,
+    /// `lead column → the same facts keyed by that column first`.
+    ///
+    /// The primary order prunes on the lead column only, so a predicate on any
+    /// other column has to scan. An Arrangement is one more measured tree over
+    /// the same facts, rotated so the column of interest leads — after which
+    /// pruning on it is the ordinary WID range walk. Built on first use and
+    /// maintained with every commit, so the cost is paid only for columns some
+    /// query actually asks about.
+    orders: BTreeMap<usize, FactTree>,
+}
+
+/// Rotate `tuple` so column `col` leads, the rest following in order — or `None`
+/// if the tuple has no such column, in which case it simply does not belong to
+/// that Arrangement. (Returning it unrotated would be worse than useless: it
+/// would sit in the tree keyed by its *column 0* and match spans meant for
+/// `col`.) Invertible, and it preserves distinctness, so an Arrangement holds
+/// exactly the facts of the primary that have the column.
+fn rotate(tuple: &Tuple, col: usize) -> Option<Tuple> {
+    let cols = tuple.as_slice();
+    if col >= cols.len() {
+        return None;
+    }
+    if col == 0 {
+        return Some(tuple.clone());
+    }
+    let mut out = Vec::with_capacity(cols.len());
+    out.push(cols[col].clone());
+    out.extend(cols[..col].iter().cloned());
+    out.extend(cols[col + 1..].iter().cloned());
+    Some(Tuple::new(out))
+}
+
+/// Undo [`rotate`].
+fn unrotate(tuple: &Tuple, col: usize) -> Tuple {
+    let cols = tuple.as_slice();
+    if col == 0 || col >= cols.len() {
+        return tuple.clone();
+    }
+    let mut out: Vec<Value> = cols[1..=col].to_vec();
+    out.push(cols[0].clone());
+    out.extend(cols[col + 1..].iter().cloned());
+    Tuple::new(out)
 }
 
 /// An ent store: a family of per-relation Fact + Edition enfilades behind one
@@ -187,6 +231,26 @@ impl EntStore {
         Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).1 .0).unwrap_or(0))
     }
 
+    /// **Arrangements (G-9).** Ensure `rel` has an ordering led by column `col`,
+    /// building it from the current primary order if this is its first use.
+    fn ensure_order(inner: &mut Inner, rel: RelId, col: usize) {
+        let Some(roots) = inner.roots(rel) else { return };
+        if roots.orders.contains_key(&col) {
+            return;
+        }
+        let mut roots = roots.clone();
+        let mut arr = FactTree::new();
+        if let Some(primary) = roots.versions.last_le(&inner.current) {
+            for (k, v) in primary.1.iter() {
+                if let Some(key) = rotate(k, col) {
+                    arr = arr.insert(key, *v);
+                }
+            }
+        }
+        roots.orders.insert(col, arr);
+        inner.put(rel, roots);
+    }
+
     /// **Version-compare / backfollow (E6).** How `rel` differs between editions
     /// `a` and `b`, as `(tuple, weight_at_a, weight_at_b)` for every tuple whose
     /// net weight differs. An unchanged relation shares its Fact root across the
@@ -261,7 +325,9 @@ impl EntStore {
                 t
             };
             if !versions.is_empty() || !log.is_empty() {
-                rels = rels.insert(*rel, RelRoots { versions, log });
+                // Arrangements are derived from the primary order, so a fork
+                // rebuilds them on demand rather than carrying them.
+                rels = rels.insert(*rel, RelRoots { versions, log, orders: BTreeMap::new() });
             }
         }
         let child = EntStore {
@@ -534,6 +600,12 @@ impl Inner {
         let net = cur + diff;
         let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
         roots.versions = roots.versions.insert(e, root);
+        // Keep every existing Arrangement in step with the primary order.
+        for (col, arr) in roots.orders.iter_mut() {
+            if let Some(key) = rotate(tuple, *col) {
+                *arr = if net == 0 { arr.remove(&key) } else { arr.insert(key, net) };
+            }
+        }
         self.put(rel, roots);
     }
 
@@ -646,6 +718,50 @@ impl TraceStore for EntStore {
         Ok(false)
     }
 
+    /// **Trailing-column WID pruning (G-9).** Answered from the Arrangement led
+    /// by `col` — one more measured tree over the same facts, so the predicate
+    /// becomes an ordinary lead-column range walk and prunes whole subtrees,
+    /// where the default must read the relation and filter.
+    ///
+    /// The Arrangement is built on first use for that column and maintained by
+    /// every later commit, so a query that never asks about a column never pays
+    /// for one. It is *derived* state — the primary order is the truth — so it is
+    /// rebuilt on demand after a reopen rather than persisted.
+    fn read_range_on(
+        &self,
+        rel: RelId,
+        at: Edition,
+        col: usize,
+        lo: &Value,
+        hi: &Value,
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        let mut inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("read_range_on", at.0, inner.watermark));
+        }
+        // Arrangements track the *current* order; an as-of read below it falls
+        // back to the primary order, which is always exact.
+        if col == 0 || at.0 != inner.current {
+            drop(inner);
+            let rows = self.read_at(rel, at)?;
+            return Ok(rows
+                .into_iter()
+                .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| lo <= v && v < hi))
+                .collect());
+        }
+        Self::ensure_order(&mut inner, rel, col);
+        let Some(arr) = inner.roots(rel).and_then(|r| r.orders.get(&col)) else {
+            return Ok(Vec::new());
+        };
+        // A rotated key leads with `col`, so the span is a lead-column range.
+        let (klo, khi) = (Tuple::from([lo.clone()]), Tuple::from([hi.clone()]));
+        Ok(arr
+            .range_collect(&klo, &khi)
+            .into_iter()
+            .map(|(k, v)| (unrotate(&k, col), v))
+            .collect())
+    }
+
     fn watermark(&self) -> Edition {
         Edition(self.inner.lock().unwrap().watermark)
     }
@@ -671,7 +787,8 @@ impl TraceStore for EntStore {
             for (k, v) in roots.log.range_collect(&(new_wm + 1, 0), &(u64::MAX, u64::MAX)) {
                 log = log.insert(k, v);
             }
-            inner.put(rel, RelRoots { versions, log });
+            // Consolidation retires versions; the Arrangements rebuild on demand.
+            inner.put(rel, RelRoots { versions, log, orders: BTreeMap::new() });
         }
         inner.watermark = new_wm;
         // Every rel's Fact versions and log tail changed — persist all, and

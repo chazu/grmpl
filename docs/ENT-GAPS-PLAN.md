@@ -18,7 +18,8 @@ underneath it in the end state.
 > (the WID measure family — `SumDiff` and `KeyBounds` beside `Count`) · G-2a (the
 > store's state is one enfilade root, ordered all the way down) · G-7 (`DspEnf` is
 > on the instancing path — **no module in `grmpl-ent` has zero callers now**) ·
-> G-8 (Derived enfilades — materialized views that survive a reopen).
+> G-8 (Derived enfilades — materialized views that survive a reopen) · G-9
+> (Arrangements — trailing-column pruning at the source).
 >
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
@@ -31,11 +32,15 @@ underneath it in the end state.
 > G-0c (doc truth) is done — the book now describes what the code does, in both
 > directions.
 >
-> **Remaining.** G-0d (measured version-compare) · G-9 (multi-order
-> arrangements) · the tail of G-10 (soak, then
+> **Remaining.** G-0d (measured version-compare) · the tail of G-10 (soak, then
 > delete `grmpl-store`). The LSM is now *only* the differential oracle — no
 > binary and no runtime path uses it, and it should stay until the remaining
 > items land, since it is the independent leg that has been catching the bugs.
+>
+> G-9 gives the substrate the Arrangements and the `read_range_on` primitive to
+> prune on them; the `grmpl-lang` lowerer does not yet *auto-emit* it from a
+> trailing-column equality the way it does for the lead column, so the pruning is
+> reachable but not automatic.
 >
 > G-4 landed both its halves, but routing is per *relation*, answered from the
 > Edition enfilade's measure. Routing per *key range* — the thing the `Canopy`

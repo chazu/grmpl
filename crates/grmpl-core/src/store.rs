@@ -75,6 +75,35 @@ pub trait TraceStore: EditionStore {
             .collect())
     }
 
+    /// Consolidated contents of `rel` as-of `at` restricted to rows whose
+    /// **column `col`** lies in `[lo, hi)` — the trailing-column counterpart of
+    /// [`read_range`](Self::read_range).
+    ///
+    /// `read_range` prunes on the *lead* column, because that is the one the
+    /// trace's primary order is keyed by. A predicate on any other column has to
+    /// be answered some other way, and the default here is the honest one: read
+    /// the relation and filter. A store that maintains **several orderings** of
+    /// the same facts (the Ent's Arrangements — one measured tree per column
+    /// order) overrides this to prune on `col` too, so a secondary-key view is
+    /// sublinear at the source instead of scanning.
+    ///
+    /// `lo`/`hi` are single-column bounds, compared against the row's `col`th
+    /// value. A `col` beyond a row's arity excludes it.
+    fn read_range_on(
+        &self,
+        rel: RelId,
+        at: Edition,
+        col: usize,
+        lo: &crate::value::Value,
+        hi: &crate::value::Value,
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self
+            .read_at(rel, at)?
+            .into_iter()
+            .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| lo <= v && v < hi))
+            .collect())
+    }
+
     /// **Interest routing.** Could any commit in `(from, to]` have touched one of
     /// `rels`?
     ///
