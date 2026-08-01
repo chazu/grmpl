@@ -35,11 +35,11 @@ underneath it in the end state.
 >
 > · **G-10 (complete — `grmpl-store` is deleted).**
 >
-> **Every item has landed; one carries a named residual.** G-7's *capability* is on
-> the running path but its asymptotics are not (instancing still commits
-> `O(template)` rows — see below), with one residual left. It is described
-> precisely a few paragraphs down and should not be read as "done" by someone
-> scanning this line. Everything else is closed, and a second audit
+> **Every item in this plan has landed.** The last open residual — G-7's
+> `O(template)` instancing — is resolved below as a *specification* error rather
+> than missing work: the overlay §G-7 called for is incompatible with the store's
+> own projection law, and the `O(1)` virtual copy belongs in the language. A second
+> audit
 > against §4's definition of done caught four things the first completion claim
 > had papered over — the `Canopy` type still had no caller (routing went through
 > the Edition enfilade's measure, not the canopy), `grmpl run` still committed
@@ -60,12 +60,30 @@ underneath it in the end state.
 > `read_range_on` falls back to read-and-filter, which is exactly the `Filter` it
 > replaced, so the rewrite is never worse.
 >
-> G-7 landed its *capability* but not its asymptotics: instancing now reads out
-> of a displaced view (`O(1)` to relocate, query transformed into the shared
-> tree's coordinates and pruned there) instead of materializing the template and
-> mapping over it — but it still commits `O(template)` rows. A copy-on-write
-> overlay that shares until an instance diverges needs a displaced node variant
-> threaded through every tree walk; that is the remaining half.
+> **G-7's residual is resolved, and the plan's §G-7 was specified wrongly.**
+> Instancing reads out of a displaced view — `O(1)` to relocate, the query
+> transformed into the shared tree's coordinates and pruned there — but it still
+> *commits* `O(template)` rows. §G-7 below says to close that with "a
+> displaced-overlay node in the Fact enfilade… with copy-on-write when an instance
+> diverges". **That cannot be done at the store level**, and the reason is a law,
+> not an implementation difficulty:
+>
+> An overlay adds rows to `read_at` without adding entries to `scan_updates`. But
+> `store_laws.rs::read_at_and_scan_updates_match_the_model_under_random_churn`
+> derives *both* observables from one update stream — state is the fold of the
+> log, by construction. An overlay breaks that directly, and the Snapshot–stream
+> law above it too: a watcher would never see the instance appear, because no
+> delta ever described it. Making the overlay emit its rows as updates to fix that
+> is exactly the `O(template)` write it was meant to avoid.
+>
+> So the `O(1)` virtual copy belongs one level up, in the **language**: `enter
+> vault` asserts a single `instance(player, template, shift)` row, and the world's
+> views join through it, applying the displacement at query time. Then creating an
+> instance is *one* update — the log and the state agree, the watcher sees it —
+> reads pay only for what they touch, and the evaluator for that join is the DSP
+> machinery already built and already on the path. The substrate's job here is
+> done; what remains is a MOO/lowering feature, filed accordingly rather than left
+> as a phantom substrate gap.
 >
 > **On the estimate I got wrong.** G-0d is filed below as small; I then said it
 > needed `split`/`join` on the B+ tree so two versions could be compared
@@ -497,6 +515,12 @@ fork/replay identity holds over the logical projection.
 displacement, with the dsp threaded through the WID walk) and is used by
 **nothing**. `instance_template` instead reads every template fact and commits a
 relocated copy (`store.rs:271‑283`) — `O(template)` per instance, with no sharing.
+
+> **Superseded — see the status block.** The overlay described here cannot live
+> in the store: it would add rows to `read_at` with no matching `scan_updates`
+> entries, which the projection law forbids. The `O(1)` virtual copy belongs in
+> the language, as a single `instance` row the views join through. What follows is
+> the original (wrong) specification, kept for the record.
 
 *Change.* Give the Fact enfilade a displaced-overlay node (`DspNode(child, dsp)`
 in `Tree`, composing the displacement down the descent — `DspEnf`'s `range` and
