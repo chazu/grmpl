@@ -182,12 +182,16 @@ leaves every store correct and only a store that can prove a negative saves the
 work. Measured: 50 installed watches, one commit to a relation none of them
 reads, zero differential evaluations.
 
-That routes per *relation*. Routing per *key range* — which is what the canopy
-indexes, and what would let two watchers on disjoint parts of one relation miss
-each other's commits — needs the pump to register an interest with a range,
-which it can only do for a view whose key span is known (the E2b `RangeRel`
-pushdown). That step is what puts the `Canopy` type itself on the path, and it
-has not been taken.
+**And per key range, through the canopy itself.** When a view reads one relation
+through one key span — the shape the E2b pushdown produces for an entity-keyed
+view — the pump asks `touched_range_since` instead, and the Ent answers it from
+the canopy: the interest is registered on first ask, every commit stabs the
+canopy as it lands, and the answer is then a WID measure over a fired-interest
+enfilade keyed interest-first. So two watchers over disjoint spans of one
+relation do not wake each other, which is precisely what relation-wide routing
+cannot express. An interval reaching back before an interest existed widens to
+the relation-wide answer, since nothing was routed to it then — conservative,
+never a false negative.
 
 ## The context enfilade — `context.rs`
 

@@ -96,6 +96,28 @@ impl Query {
         out
     }
 
+    /// The single `(relation, [lo, hi))` key span this query reads, when it reads
+    /// exactly one relation through exactly one range restriction.
+    ///
+    /// This is what lets a watcher be routed by **key range** rather than by
+    /// relation: two watchers over disjoint spans of one relation should not wake
+    /// each other. The E2b pushdown turns an entity-keyed view into a `RangeRel`,
+    /// so this is the common shape in practice. Anything wider — a join, a union,
+    /// an unrestricted `Rel` — returns `None`, and the caller falls back to
+    /// relation-wide routing.
+    pub fn key_span(&self) -> Option<(RelId, Tuple, Tuple)> {
+        match self {
+            Query::RangeRel { rel, lo, hi } => Some((*rel, lo.clone(), hi.clone())),
+            Query::Map { input, .. }
+            | Query::Filter { input, .. }
+            | Query::Project { input, .. }
+            | Query::Distinct(input)
+            | Query::Reduce { input, .. } => input.key_span(),
+            Query::Shared(inner) => inner.key_span(),
+            _ => None,
+        }
+    }
+
     fn collect_base_relations(&self, out: &mut std::collections::BTreeSet<RelId>) {
         match self {
             Query::Rel(r) | Query::RangeRel { rel: r, .. } => {

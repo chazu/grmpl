@@ -42,17 +42,10 @@ underneath it in the end state.
 > each against an independent model rather than as agreement with another store.
 > Deleting it without that would have deleted the laws along with it.
 >
-> G-9 gives the substrate the Arrangements and the `read_range_on` primitive to
-> prune on them; the `grmpl-lang` lowerer does not yet *auto-emit* it from a
-> trailing-column equality the way it does for the lead column, so the pruning is
-> reachable but not automatic.
->
-> G-4 landed both its halves, but routing is per *relation*, answered from the
-> Edition enfilade's measure. Routing per *key range* — the thing the `Canopy`
-> type indexes — needs the pump to register an interest with a span, which it can
-> only do for a view whose key range is known (the E2b `RangeRel` pushdown). Until
-> that step, the `Canopy` type is a correct, persistent, measured enfilade that
-> the store does not yet consult.
+> One thing is reachable rather than automatic: G-9 gives the substrate the
+> Arrangements and `read_range_on`, but the `grmpl-lang` lowerer auto-emits
+> `RangeRel` only from a *lead*-column equality, so trailing-column pruning must
+> be asked for. That is a lowerer feature, not a substrate gap.
 >
 > G-7 landed its *capability* but not its asymptotics: instancing now reads out
 > of a displaced view (`O(1)` to relocate, query transformed into the shared

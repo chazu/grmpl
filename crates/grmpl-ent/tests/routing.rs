@@ -197,3 +197,53 @@ fn touched_since_never_reports_a_false_negative() {
         }
     }
 }
+
+/// **The canopy's own job**: two watchers over *disjoint key ranges of the same
+/// relation* must not wake each other.
+///
+/// Relation-wide routing cannot express this — every watcher of a relation wakes
+/// on any change to it. `touched_range_since` asks the narrower question, and the
+/// Ent answers it from the canopy: interests are stabbed once, as each commit
+/// lands, and the answer is then a WID measure over the fired-interest enfilade.
+#[test]
+fn disjoint_key_ranges_of_one_relation_do_not_wake_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
+
+    let lo = |n: i64| Tuple::from([Value::Int(n)]);
+    let (a_lo, a_hi) = (lo(0), lo(100));
+    let (b_lo, b_hi) = (lo(100), lo(200));
+
+    // Register both interests before any commit, so both are routed from here on.
+    let from = store.current();
+    assert!(!store.touched_range_since(from, from, WATCHED, &a_lo, &a_hi).unwrap());
+    assert!(!store.touched_range_since(from, from, WATCHED, &b_lo, &b_hi).unwrap());
+
+    // A commit inside A's span wakes A and leaves B alone.
+    churn(&store, WATCHED, 42);
+    let to = store.current();
+    assert!(
+        store.touched_range_since(from, to, WATCHED, &a_lo, &a_hi).unwrap(),
+        "the watcher whose span contains the change must wake"
+    );
+    assert!(
+        !store.touched_range_since(from, to, WATCHED, &b_lo, &b_hi).unwrap(),
+        "a watcher on a disjoint span of the same relation must NOT wake — \
+         this is exactly what relation-wide routing cannot express"
+    );
+
+    // …and symmetrically.
+    let mid = store.current();
+    churn(&store, WATCHED, 150);
+    let to = store.current();
+    assert!(!store.touched_range_since(mid, to, WATCHED, &a_lo, &a_hi).unwrap());
+    assert!(store.touched_range_since(mid, to, WATCHED, &b_lo, &b_hi).unwrap());
+
+    // Conservative where it must be: an interval reaching back before an interest
+    // existed was never routed to it, so it widens rather than claiming quiet.
+    let (c_lo, c_hi) = (lo(1_000), lo(2_000));
+    assert!(
+        store.touched_range_since(from, store.current(), WATCHED, &c_lo, &c_hi).unwrap(),
+        "an interest registered after the fact must not read an empty fired-set as quiet"
+    );
+}

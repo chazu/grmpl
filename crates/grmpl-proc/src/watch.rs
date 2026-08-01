@@ -203,7 +203,15 @@ impl OnWatch {
             // never lose a delta. On a store with a measured commit log (the
             // Ent's Edition enfilade) it is an `O(log n)` measure; on any other
             // it is the default `true` and the pump behaves exactly as before.
-            if !store.touched_since(from, to, &self.view_relations())? {
+            // When the view reads one relation through one key span — the shape
+            // the E2b pushdown produces for an entity-keyed view — ask the
+            // *narrow* question, so a commit elsewhere in that relation does not
+            // wake this watcher. Otherwise fall back to relation-wide routing.
+            let quiet = match self.view.key_span() {
+                Some((rel, lo, hi)) => !store.touched_range_since(from, to, rel, &lo, &hi)?,
+                None => !store.touched_since(from, to, &self.view_relations())?,
+            };
+            if quiet {
                 return Ok(0);
             }
 

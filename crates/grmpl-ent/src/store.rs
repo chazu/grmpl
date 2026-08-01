@@ -17,7 +17,6 @@
 //! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use grmpl_core::{
@@ -25,6 +24,7 @@ use grmpl_core::{
     SchemaCatalog, Time, TraceStore, Tuple, Update, Value,
 };
 
+use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::{Dsp, DspEnf};
@@ -48,6 +48,13 @@ type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
 type VersionTree = Tree<u64, FactTree, Count>;
 /// The **Rel enfilade**: the directory of live relations (G-2a).
 type RelTree = Tree<u32, RelRoots, Count>;
+/// The **Arrangement enfilade**: a relation's alternate orderings, by lead column.
+type OrderTree = Tree<u32, FactTree, Count>;
+/// The **fired-interest enfilade**: `(interest, edition) → ()`.
+///
+/// Keyed interest-first so "did interest *i* fire anywhere in `(from, to]`" is a
+/// single WID range measure — `O(log n)`, no scan of the interval.
+type FiredTree = Tree<(u64, u64), (), Count>;
 
 /// One relation's roots: its versioned Fact enfilade, its Edition log, and any
 /// **Arrangements** — alternate orderings of the same facts (G-9).
@@ -55,7 +62,10 @@ type RelTree = Tree<u32, RelRoots, Count>;
 struct RelRoots {
     versions: VersionTree,
     log: LogTree,
-    /// `lead column → the same facts keyed by that column first`.
+    /// The **Arrangement enfilade**: `lead column → the same facts keyed by that
+    /// column first`. An enfilade rather than a map, like every other directory
+    /// in the store's state, so "which orderings does this relation carry" is a
+    /// measure and the iteration order is deterministic.
     ///
     /// The primary order prunes on the lead column only, so a predicate on any
     /// other column has to scan. An Arrangement is one more measured tree over
@@ -63,7 +73,7 @@ struct RelRoots {
     /// pruning on it is the ordinary WID range walk. Built on first use and
     /// maintained with every commit, so the cost is paid only for columns some
     /// query actually asks about.
-    orders: BTreeMap<usize, FactTree>,
+    orders: OrderTree,
 }
 
 /// Rotate `tuple` so column `col` leads, the rest following in order — or `None`
@@ -130,6 +140,21 @@ struct Inner {
     /// Context enfilade: inherited scope bindings, plus the durable catalog and
     /// the edition-versioned schema registry ([`crate::context`]).
     ctx: ContextEnf,
+    /// **The canopy** ([`crate::canopy`]): standing `(rel, key-range)` interests,
+    /// held in a measured interval enfilade.
+    canopy: Canopy,
+    /// Which interests each commit stabbed. Routing happens **once, at commit
+    /// time** — the canopy is stabbed with the updates as they land — and the
+    /// answer is then a measure, so a watcher asking "did anything of mine
+    /// change?" never re-reads the interval.
+    fired: FiredTree,
+    /// The interest already registered for a given `(rel, lo, hi)`, so repeated
+    /// asks reuse one rather than minting a new interest per call.
+    interests: Tree<(u32, Tuple, Tuple), InterestId, Count>,
+    /// The edition each interest was registered at. Commits before it were never
+    /// routed to it, so an interval reaching back past it must widen to the
+    /// relation-wide answer rather than read an empty fired-set as "no change".
+    registered: Tree<u64, u64, Count>,
 }
 
 impl Inner {
@@ -235,7 +260,7 @@ impl EntStore {
     /// building it from the current primary order if this is its first use.
     fn ensure_order(inner: &mut Inner, rel: RelId, col: usize) {
         let Some(roots) = inner.roots(rel) else { return };
-        if roots.orders.contains_key(&col) {
+        if roots.orders.get(&(col as u32)).is_some() {
             return;
         }
         let mut roots = roots.clone();
@@ -247,7 +272,7 @@ impl EntStore {
                 }
             }
         }
-        roots.orders.insert(col, arr);
+        roots.orders = roots.orders.insert(col as u32, arr);
         inner.put(rel, roots);
     }
 
@@ -327,7 +352,7 @@ impl EntStore {
             if !versions.is_empty() || !log.is_empty() {
                 // Arrangements are derived from the primary order, so a fork
                 // rebuilds them on demand rather than carrying them.
-                rels = rels.insert(*rel, RelRoots { versions, log, orders: BTreeMap::new() });
+                rels = rels.insert(*rel, RelRoots { versions, log, orders: OrderTree::new() });
             }
         }
         let child = EntStore {
@@ -336,6 +361,10 @@ impl EntStore {
                 watermark: inner.watermark,
                 rels,
                 ctx: inner.ctx.clone(),
+                canopy: Canopy::new(),
+                fired: FiredTree::new(),
+                interests: Tree::new(),
+                registered: Tree::new(),
             }),
             gran: self.gran.clone(),
             branch: child_branch,
@@ -556,7 +585,16 @@ impl EntStore {
 
 impl Inner {
     fn empty() -> Inner {
-        Inner { current: 0, watermark: 0, rels: RelTree::new(), ctx: ContextEnf::new() }
+        Inner {
+            current: 0,
+            watermark: 0,
+            rels: RelTree::new(),
+            ctx: ContextEnf::new(),
+            canopy: Canopy::new(),
+            fired: FiredTree::new(),
+            interests: Tree::new(),
+            registered: Tree::new(),
+        }
     }
 
     /// Rebuild in-memory state from a granfilade: the clock, then each
@@ -571,7 +609,18 @@ impl Inner {
         let current = gran.meta_get(&cur_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
         let watermark = gran.meta_get(&wm_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
         let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(&ctx_key(branch))?.unwrap_or_default()))?;
-        let mut inner = Inner { current, watermark, rels: RelTree::new(), ctx };
+        let mut inner = Inner {
+            current,
+            watermark,
+            rels: RelTree::new(),
+            ctx,
+            // The canopy indexes *live* interests, so it is rebuilt as watchers
+            // ask again after a reopen rather than persisted with stale ones.
+            canopy: Canopy::new(),
+            fired: FiredTree::new(),
+            interests: Tree::new(),
+            registered: Tree::new(),
+        };
 
         for (key, val) in gran.meta_prefix(&branch_key(b"fact:", branch))? {
             let rel = rel_from_key(&key, b"fact:");
@@ -601,9 +650,12 @@ impl Inner {
         let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
         roots.versions = roots.versions.insert(e, root);
         // Keep every existing Arrangement in step with the primary order.
-        for (col, arr) in roots.orders.iter_mut() {
-            if let Some(key) = rotate(tuple, *col) {
-                *arr = if net == 0 { arr.remove(&key) } else { arr.insert(key, net) };
+        let cols: Vec<u32> = roots.orders.iter().map(|(c, _)| *c).collect();
+        for col in cols {
+            let arr = roots.orders.get(&col).cloned().unwrap_or_default();
+            if let Some(key) = rotate(tuple, col as usize) {
+                let next = if net == 0 { arr.remove(&key) } else { arr.insert(key, net) };
+                roots.orders = roots.orders.insert(col, next);
             }
         }
         self.put(rel, roots);
@@ -611,6 +663,17 @@ impl Inner {
 
     /// Apply `updates` as edition `e`: append to each Edition enfilade in submit
     /// order and fold each into the Fact enfilade.
+    /// Stab the canopy with this commit's updates and record which interests it
+    /// touched — the routing work, done once, when the change lands.
+    fn route(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
+        if self.canopy.is_empty() {
+            return;
+        }
+        for id in self.canopy.route(updates) {
+            self.fired = self.fired.insert((id.0, e), ());
+        }
+    }
+
     fn apply(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
         for (i, (rel, tuple, diff)) in updates.iter().enumerate() {
             let mut roots = self.roots(*rel).cloned().unwrap_or_default();
@@ -618,6 +681,7 @@ impl Inner {
             self.put(*rel, roots);
             self.fold_fact(e, *rel, tuple, *diff);
         }
+        self.route(e, updates);
         self.current = e;
     }
 
@@ -750,7 +814,7 @@ impl TraceStore for EntStore {
                 .collect());
         }
         Self::ensure_order(&mut inner, rel, col);
-        let Some(arr) = inner.roots(rel).and_then(|r| r.orders.get(&col)) else {
+        let Some(arr) = inner.roots(rel).and_then(|r| r.orders.get(&(col as u32))) else {
             return Ok(Vec::new());
         };
         // A rotated key leads with `col`, so the span is a lead-column range.
@@ -760,6 +824,62 @@ impl TraceStore for EntStore {
             .into_iter()
             .map(|(k, v)| (unrotate(&k, col), v))
             .collect())
+    }
+
+    /// **Key-range interest routing, through the canopy (G-4).**
+    ///
+    /// The relation-wide [`touched_since`](TraceStore::touched_since) wakes every
+    /// watcher of a relation whatever changed in it. This answers the narrower
+    /// question the canopy exists for: two watchers on disjoint key ranges of one
+    /// relation do not wake each other.
+    ///
+    /// The interest is registered on first ask and kept, so the **routing work
+    /// happens once per commit** — the canopy is stabbed as the change lands —
+    /// and the answer here is a WID range measure over the fired-interest
+    /// enfilade, `O(log n)`, with no re-reading of the interval.
+    ///
+    /// Interests registered *after* a commit cannot have been routed by it, so
+    /// this widens to the relation-wide answer for any interval that predates the
+    /// registration: conservative, never a false negative.
+    fn touched_range_since(
+        &self,
+        from: Edition,
+        to: Edition,
+        rel: RelId,
+        lo: &Tuple,
+        hi: &Tuple,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        if from.0 < inner.watermark {
+            // Below the door we cannot prove anything; stay conservative and let
+            // the caller's own read report the error properly.
+            return Ok(true);
+        }
+        let key = (rel.0, lo.clone(), hi.clone());
+        let (id, fresh) = match inner.interests.get(&key) {
+            Some(id) => (*id, false),
+            None => {
+                let id = inner.canopy.register(rel, lo.clone(), hi.clone());
+                inner.interests = inner.interests.insert(key, id);
+                // Nothing was routed to it before now.
+                inner.registered = inner.registered.insert(id.0, inner.current);
+                (id, true)
+            }
+        };
+        // An empty interval is provably quiet — consistent with `touched_since`,
+        // which measures `(from, to]` and finds nothing. Registration above still
+        // happened, so this doubles as the way a watcher declares its interest
+        // before any commit it wants routed.
+        if to <= from {
+            return Ok(false);
+        }
+        let since = inner.registered.get(&id.0).copied().unwrap_or(0);
+        if fresh || from.0 < since {
+            // The interval predates this interest; fall back to the relation.
+            drop(inner);
+            return self.touched_since(from, to, &[rel]);
+        }
+        Ok(inner.fired.measure_range(&(id.0, from.0 + 1), &(id.0, to.0 + 1)).0 > 0)
     }
 
     fn watermark(&self) -> Edition {
@@ -788,7 +908,7 @@ impl TraceStore for EntStore {
                 log = log.insert(k, v);
             }
             // Consolidation retires versions; the Arrangements rebuild on demand.
-            inner.put(rel, RelRoots { versions, log, orders: BTreeMap::new() });
+            inner.put(rel, RelRoots { versions, log, orders: OrderTree::new() });
         }
         inner.watermark = new_wm;
         // Every rel's Fact versions and log tail changed — persist all, and

@@ -16,7 +16,8 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use grmpl_core::{
-    Authority, DomainId, Diff, Edition, EditionStore, Entity, NoSchemas, RelId, Scope, TraceStore,
+    Authority, Column, DomainId, Diff, Edition, EditionStore, Entity, RelId, Schema,
+    SchemaCatalog, Scope, Ty, TraceStore,
     Tuple, Value,
 };
 use grmpl_diff::Snapshot;
@@ -75,10 +76,14 @@ pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), Strin
         }
         None => BUILTIN_MOO.to_string(),
     };
-    let prog = Arc::new(Program::compile(&src, 1)?);
-    let r = Rels::resolve(&prog)?;
-
+    // Open the world *first*, then compile against its durable catalog: names
+    // resolve to the ids the store already bound, so a relation keeps its id
+    // across reopens however the source is later reordered. Compiling first and
+    // ignoring the catalog would have made the ids a function of source layout.
     let store = open_store(store_dir.as_deref())?;
+    let prog = Arc::new(Program::compile_with_catalog(&src, &store, 1)?);
+    let r = Rels::resolve(&prog)?;
+    declare_schemas(&store, &r)?;
     seed_world(&store, &r)?;
     seed_rules(&store, &r)?;
 
@@ -102,6 +107,31 @@ pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), Strin
     };
     repl.banner(world.as_deref());
     repl.loop_forever()
+}
+
+/// Declare the shapes of the world relations whose columns are unambiguous, so
+/// the commit boundary type-checks every fact the MOO writes.
+///
+/// Schemas are opt-in per relation: an unregistered relation is unchecked, so
+/// this is a real check on the ones named here rather than an all-or-nothing
+/// switch. `put_schema` is idempotent, so re-running `grmpl run` on an existing
+/// world is a no-op.
+fn declare_schemas(store: &EntStore, r: &Rels) -> Result<(), String> {
+    let at = Edition(store.current().0 + 1);
+    let decl: [(RelId, &[(&str, Ty)]); 7] = [
+        (r.located, &[("thing", Ty::Ent), ("place", Ty::Ent)]),
+        (r.named, &[("thing", Ty::Ent), ("name", Ty::Text)]),
+        (r.held, &[("owner", Ty::Ent), ("thing", Ty::Ent)]),
+        (r.exits, &[("from", Ty::Ent), ("way", Ty::Text), ("to", Ty::Ent)]),
+        (r.players, &[("who", Ty::Ent)]),
+        (r.value, &[("thing", Ty::Ent), ("coins", Ty::Int)]),
+        (r.patrol, &[("from", Ty::Ent), ("to", Ty::Ent)]),
+    ];
+    for (rel, cols) in decl {
+        let schema = Schema::new(cols.iter().map(|(n, t)| Column::new(*n, *t)).collect());
+        store.put_schema(rel, &schema, at).map_err(err)?;
+    }
+    Ok(())
 }
 
 fn open_store(dir: Option<&str>) -> Result<EntStore, String> {
@@ -621,7 +651,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         let before = self.store.current();
         enqueue(self.store, self.r.inbox, PLAYER, self.player_seq, tokens(line)).map_err(err)?;
         self.player_seq += 1;
-        self.player.run_to_idle(self.store, &NoSchemas).map_err(err)?;
+        self.player.run_to_idle(self.store, self.store).map_err(err)?;
 
         let told = self.drain_tell(before)?;
         let verb = line.split_whitespace().next().unwrap_or("");
@@ -742,7 +772,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         let before = self.room_of(CAT).ok().flatten();
         enqueue(self.store, self.r.inbox, CAT, self.cat_seq, tokens("tick")).map_err(err)?;
         self.cat_seq += 1;
-        self.cat.run_to_idle(self.store, &NoSchemas).map_err(err)?;
+        self.cat.run_to_idle(self.store, self.store).map_err(err)?;
         let after = self.room_of(CAT).ok().flatten();
 
         let known = self.known_by(PLAYER);
@@ -768,9 +798,9 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         );
         let (ow, _) = self
             .prog
-            .install_watch("world", &[], PLAYER, PLAYER, auth, self.store, &NoSchemas)
+            .install_watch("world", &[], PLAYER, PLAYER, auth, self.store, self.store)
             .map_err(err)?;
-        ow.pump(self.store, &NoSchemas).map_err(err)?;
+        ow.pump(self.store, self.store).map_err(err)?;
         self.delivered = self.count_for(self.r.wmail, PLAYER);
         self.watch = Some(ow);
         println!("Now watching the world — changes will stream as [world] deltas.");
@@ -779,7 +809,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
 
     fn pump_watch(&mut self) -> Result<(), String> {
         if let Some(ow) = &self.watch {
-            ow.pump(self.store, &NoSchemas).map_err(err)?;
+            ow.pump(self.store, self.store).map_err(err)?;
             let at = self.store.current();
             let mut rows: Vec<(i64, i64, String)> = Vec::new();
             for (t, d) in self.store.read_at(self.r.wmail, at).map_err(err)? {

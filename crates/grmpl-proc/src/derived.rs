@@ -112,7 +112,11 @@ impl Materialized {
             // Routed like the pump: a view whose inputs were not touched over the
             // interval cannot have changed, so skip the differential work
             // entirely. Conservative, so this can only save work.
-            if !store.touched_since(from, to, &self.view_relations())? {
+            let quiet = match self.view.key_span() {
+                Some((rel, lo, hi)) => !store.touched_range_since(from, to, rel, &lo, &hi)?,
+                None => !store.touched_since(from, to, &self.view_relations())?,
+            };
+            if quiet {
                 return Ok(0);
             }
 

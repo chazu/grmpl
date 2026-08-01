@@ -128,6 +128,25 @@ pub trait TraceStore: EditionStore {
         Ok(true)
     }
 
+    /// Could any commit in `(from, to]` have touched rows of `rel` whose key lies
+    /// in `[lo, hi)`?
+    ///
+    /// The key-range refinement of [`touched_since`](Self::touched_since), and
+    /// the question a *canopy* exists to answer: two watchers on disjoint parts
+    /// of one relation should not wake each other. Same contract — `false` is a
+    /// proof of no change, `true` merely means "possibly" — so the default
+    /// widens to the whole relation and every store stays correct.
+    fn touched_range_since(
+        &self,
+        from: Edition,
+        to: Edition,
+        rel: RelId,
+        _lo: &Tuple,
+        _hi: &Tuple,
+    ) -> Result<bool> {
+        self.touched_since(from, to, &[rel])
+    }
+
     /// The consolidation **watermark** (P6 history/GC). Every edition ≤ this has
     /// been folded into per-relation checkpoints and its raw updates discarded,
     /// so no intermediate as-of state below it survives. This is the floor of
