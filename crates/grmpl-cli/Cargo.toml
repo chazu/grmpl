@@ -3,7 +3,7 @@ name = "grmpl-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "The `grmpl` binary: `grmpl run <world.grmpl>` stands up a language-defined world with an interactive REPL, and `grmpl showcase` runs a narrated tour of the substrate's distinctive features (relational views, aggregates, both handler surfaces, reactive on-watch, optimistic concurrency, as-of history, deterministic replay, forks, live behaviors-as-relations, and scheduling). An edge/tooling crate above the bright line — it names fjall via grmpl-store exactly as an application would."
+description = "The `grmpl` binary: `grmpl run <world.grmpl>` stands up a language-defined world with an interactive REPL, and `grmpl showcase` runs a narrated tour of the substrate's distinctive features (relational views, aggregates, both handler surfaces, reactive on-watch, optimistic concurrency, as-of history, deterministic replay, forks, live behaviors-as-relations, and scheduling). An edge/tooling crate above the bright line — it names fjall via grmpl-ent exactly as an application would."
 
 [[bin]]
 name = "grmpl"
@@ -14,9 +14,9 @@ grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }
 grmpl-proc = { path = "../grmpl-proc" }
-grmpl-store = { path = "../grmpl-store" }
 grmpl-ent = { path = "../grmpl-ent" }
 tempfile = "3"
 
 [dev-dependencies]
+grmpl-conformance = { path = "../grmpl-conformance" }
 tempfile = "3"

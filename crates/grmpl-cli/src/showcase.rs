@@ -18,7 +18,7 @@ use grmpl_proc::{
     commit_patch, decode_activation, enqueue, record_run, replay_from, CommitOutcome, Process,
     Scheduler, SeqAlloc,
 };
-use grmpl_store::FjallStore;
+use grmpl_ent::EntStore;
 
 const BUILTIN_MOO: &str = include_str!("../../../worlds/moo.grmpl");
 
@@ -223,7 +223,7 @@ fn scene_replay() -> Result<(), String> {
 // 8. Forks: an O(domain) bit-identical copy of the whole world.
 // ===========================================================================
 fn scene_forks() -> Result<(), String> {
-    scene(8, "Forks — a bit-identical copy you can diverge safely");
+    scene(8, "Forks — an O(edit) virtual copy you can diverge safely");
     let w = MooWorld::seeded()?;
     // Do a little history first.
     let lamp_here = Fact::new(w.r.located, Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]));
@@ -233,17 +233,21 @@ fn scene_forks() -> Result<(), String> {
         .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(ALICE), Value::Ent(LAMP)])));
     commit_patch(&w.store, &NoSchemas, &take, &world_authority(&w.r)).map_err(err)?;
 
-    let fork_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-    let fork = w.store.fork(fork_dir.path()).map_err(err)?;
-    let same = w.store.canonical_dump().map_err(err)? == fork.canonical_dump().map_err(err)?;
+    // The Ent's fork is a new branch in the *same* granfilade, sharing every
+    // node with its ancestor: O(edit), not an O(state) byte copy.
+    let encoded_before = w.store.frames_encoded();
+    let fork = w.store.fork_at(w.store.current()).map_err(err)?;
+    let node_frames = w.store.frames_encoded() - encoded_before;
+    let same = projection(&w.store, &w.r)? == projection(&fork, &w.r)?;
     println!("forked the world at edition {}.", w.store.current().0);
-    println!("  fork is byte-identical to its source: {same}");
+    println!("  fork holds the same world as its source: {same}");
+    println!("  node frames written to copy it: {node_frames} (it shares them all)");
 
     // Diverge the fork; the source is untouched.
     let bob_take = Patch::new()
         .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(BOB), Value::Ent(BOOK)])));
     commit_patch(&fork, &NoSchemas, &bob_take, &world_authority(&w.r)).map_err(err)?;
-    let diverged = w.store.canonical_dump().map_err(err)? != fork.canonical_dump().map_err(err)?;
+    let diverged = projection(&w.store, &w.r)? != projection(&fork, &w.r)?;
     println!("  wrote to the fork; source and fork now differ: {diverged}");
     println!("  the source world never saw the fork's commit.");
     Ok(())
@@ -364,7 +368,7 @@ fn scene_scheduling() -> Result<(), String> {
 /// A compiled MOO world over a fresh throwaway store, seeded with two players.
 struct MooWorld {
     prog: Arc<Program>,
-    store: FjallStore,
+    store: EntStore,
     r: Rels,
     _dir: tempfile::TempDir,
 }
@@ -382,6 +386,26 @@ struct Rels {
     wmail: RelId,
     wcursor: RelId,
     wseq: RelId,
+}
+
+impl Rels {
+    /// Every relation this world writes — the domain of its logical projection.
+    fn all(&self) -> [RelId; 12] {
+        [
+            self.located,
+            self.named,
+            self.held,
+            self.exits,
+            self.players,
+            self.value,
+            self.tell,
+            self.inbox,
+            self.cursor,
+            self.wmail,
+            self.wcursor,
+            self.wseq,
+        ]
+    }
 }
 
 impl MooWorld {
@@ -510,10 +534,23 @@ impl MooWorld {
     }
 }
 
-fn fresh_store() -> Result<(FjallStore, tempfile::TempDir), String> {
+fn fresh_store() -> Result<(EntStore, tempfile::TempDir), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-    let store = FjallStore::open(dir.path()).map_err(err)?;
+    let store = EntStore::open(dir.path()).map_err(err)?;
     Ok((store, dir))
+}
+
+/// The **logical projection** of a world: every relation's raw updates in
+/// commit order. This is how `DESIGN.md` and the store contract define identity
+/// — by `scan_updates`, not by node bytes — so it is what a fork or a replay has
+/// to reproduce. (Comparing physical bytes would be both weaker, since it drops
+/// same-edition submit order, and impossible to state for two substrates.)
+fn projection(store: &EntStore, r: &Rels) -> Result<Vec<Vec<grmpl_core::Update>>, String> {
+    let (from, to) = (store.watermark(), store.current());
+    r.all()
+        .iter()
+        .map(|rel| store.scan_updates(*rel, from, to).map_err(err))
+        .collect()
 }
 
 /// The authority a MOO verb commits under — owns every world relation it writes.

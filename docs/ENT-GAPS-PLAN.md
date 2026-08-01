@@ -19,15 +19,19 @@ underneath it in the end state.
 > **The suite moved with it.** `grmpl-conformance` states a law once and runs it
 > against every substrate; all of `grmpl-proc`, `grmpl-lang` and `grmpl-session`
 > — ~90 laws including every seeded oracle — now run on the ent *and* the LSM.
-> `grmpl run`, `grmpld` and `grmpl-bench` open an `EntStore`.
+> **Every binary is on the ent**: `grmpl run`, `grmpl showcase`, `grmpld` and
+> `grmpl-bench`. The showcase's fork scene now prints what the Ent actually does
+> — *"node frames written to copy it: 0 (it shares them all)"* — where it used to
+> compare physical bytes after an `O(state)` directory copy.
 >
 > G-0c (doc truth) is done — the book now describes what the code does, in both
 > directions.
 >
 > **Remaining.** G-0d (measured version-compare) · G-2a (Rel + Version enfilades)
 > · G-3 (the WID measure family) · G-7 (DSP overlay instancing) · G-8 (Derived
-> enfilades) · G-9 (multi-order arrangements) · G-10 (showcase cutover, soak,
-> delete the LSM).
+> enfilades) · G-9 (multi-order arrangements) · the tail of G-10 (soak, then
+> delete `grmpl-store`). The LSM is now *only* the differential oracle — no
+> binary and no runtime path uses it.
 >
 > **One estimate was wrong.** G-0d is filed below as small; it is not. Pruning a
 > diff at every node needs the B+ tree to split at an arbitrary key so the two

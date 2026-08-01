@@ -1080,12 +1080,12 @@ dependencies = [
 name = "grmpl-cli"
 version = "0.0.1"
 dependencies = [
+ "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-ent",
  "grmpl-lang",
  "grmpl-proc",
- "grmpl-store",
  "tempfile",
 ]
 
