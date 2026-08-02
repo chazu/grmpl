@@ -8,7 +8,7 @@ src = "src"
 [output.html]
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/"
+git-repository-url = "https://github.com/chazu/grmpl"
 additional-css = []
 mathjax-support = false
 
