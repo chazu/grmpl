@@ -33,7 +33,10 @@ This book tells the whole arc:
 1. **[Part I](./enfilade/story.md)** — the story and the mechanics of the
    enfilade and the Ent: what problem it was invented to solve, how a *measured
    tree* with two kinds of measure (wids and dsps) works, and what the `Ent`
-   assembles out of that machinery.
+   assembles out of that machinery. It ends with a
+   [name-zoo](./enfilade/names.md) mapping Xanadu's two vocabularies — Green's
+   *poomfilade* and *spanfilade*, Gold's `Ent` and `DagWood` — onto each other
+   and onto grmpl.
 
 2. **[Part II](./properties/index.md)** — the desirable properties that make the
    Ent worth rebuilding: permanent identity, `O(depth)` search of a

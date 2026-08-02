@@ -8,6 +8,7 @@
 - [The enfilade: a measured tree](./enfilade/measured-tree.md)
 - [Wids and Dsps: measures that flow both ways](./enfilade/wids-dsps.md)
 - [The Ent: content plus history](./enfilade/the-ent.md)
+- [The name-zoo: Green, Gold, and what grmpl kept](./enfilade/names.md)
 
 # Part II — Why the Ent
 

@@ -48,15 +48,25 @@ whose Smalltalk source was eventually released. In that source the machinery has
 a whole zoo of names:
 
 - **`Ent`** — the top-level versioned-content backbone.
-- **`Loaf`** and **`Crum`** — the nodes of the measured tree (`CanopyCrum`,
-  `HistoryCrum`, `SensorCrum` are specializations).
+- **`Crum`** — a *node* of the measured tree. `CanopyCrum`, `HistoryCrum` and
+  `SensorCrum` are specializations, each carrying a different measure.
+- **`Loaf`** — a *block of crums*, and the unit actually stored. Crums are the
+  logical nodes; loaves are the physical records holding runs of them.
 - **`Dsp`** — a *displacement*, the mechanism that lets a subtree be relocated or
   virtually copied by changing a key rather than moving data.
 - **wid** — a *width*, the range of addresses a subtree covers.
 - **`Orgl`** / **`OrglRoot`** — an individual content structure (roughly, "one
   document") rooted in an enfilade.
+- **`DagWood`** — the branch structure of the version history: a DAG of
+  branches, each carrying its own linear run of versions.
 - **`GrandNode`** / **`GrandHashTable`** — the *granfilade*, the persistent node
   store underneath everything.
+
+That is Gold's vocabulary. The names in wider circulation — *poomfilade*,
+*spanfilade*, *tumbler* — come from the earlier **Xanadu Green** design, and name
+jobs that Gold and grmpl both do under other names. Rather than interleave two
+zoos, this book uses Gold's throughout and gives the full map, in both
+directions, in [*The name-zoo*](./names.md) at the end of this part.
 
 The next three chapters unpack the mechanics: first the **measured tree**, then
 the two kinds of measure — **wids** flowing up and **dsps** flowing down — and

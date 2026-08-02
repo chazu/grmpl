@@ -8,17 +8,24 @@ stays a set of checkable promises rather than lore.
 
 ## The bright line
 
-The semantic core — `grmpl-core`, `-diff`, `-proc`, `-lang`, `-pattern` — sits
-**above the line**. It is pure value types plus the substrate **traits**:
-`TraceStore`, `EditionStore`, `Catalog`, `SchemaCatalog`, `Transport`. It names
-no storage or network technology.
+The semantic core — `grmpl-core`, `-diff`, `-proc`, `-lang`, `-pattern`,
+`-type` — sits **above the line**. It is pure value types plus the substrate
+**traits**: `TraceStore`, `EditionStore`, `Catalog`, `SchemaCatalog`,
+`Transport`. It names no storage or network technology.
 
-- Only `grmpl-store` names `fjall` (the LSM stand-in).
-- Only `grmpl-ent` names the enfilade/granfilade implementation.
+- Only `grmpl-ent` names `fjall`, as the granfilade's node store — and the
+  enfilade/granfilade implementation generally.
 - Only `grmpl-transport` names `iroh`.
 
 Substrate crates depend on the traits; the traits never depend on the substrate.
 **The language observes opaque `Edition`s, never physical sequence numbers.**
+
+Two crates sit deliberately outside this scheme. `grmpl-conformance` is
+dev-only: it states each law once, against the traits, and runs it against every
+substrate. `grmpl-session` is an **edge** crate — it sits *above* the bright
+line, wiring the core to clients, so it may name a concrete transport (std TCP)
+exactly as an application would. The bright line constrains the core; it does not
+constrain the app built on the core.
 
 This is what lets the `Ent` be swapped in underneath a fully-working language.
 Because `grmpl-lang` and `grmpl-proc` depend only on the store *traits*, a

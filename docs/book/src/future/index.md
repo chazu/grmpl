@@ -8,58 +8,43 @@ concrete, deferred performance work with a named reason; others are capabilities
 the Ent unlocks that grmpl has not yet reached for. All of them are *natural* on
 the Ent and *awkward-to-impossible* on an append log.
 
-## Near-term: optimizations of already-correct capabilities
+## What has already come off this list
 
-These are deferred deliberately — the capability exists and is correct; only its
-asymptotics are on the table.
+Everything Plan v5 tracked as a gap has landed, and the descriptions moved to
+[the implementation chapter](../grmpl/implementation.md). They are worth naming
+here, because each one was on this page as future work and is now load-bearing:
 
-> Three items once listed here have since landed and moved to the
-> implementation chapter: **path-only persistence** (a commit's work is now flat
-> in relation size, not just its on-disk growth) and **durable forks sharing one
-> granfilade** (a 5000-row fork encodes zero node frames). What follows is what
-> is genuinely still ahead.
+- **Path-only persistence** — a commit's *work*, not just its on-disk growth, is
+  flat in relation size.
+- **Durable forks sharing one granfilade** — a 5000-row fork encodes zero node
+  frames.
+- **Multi-order arrangements** — alternate column orderings per relation, so a
+  *trailing*-column equality prunes at the source too, not just a lead-column
+  one. It was, as predicted, purely "more measured trees."
+- **Subtree-pruned version-compare** — backfollow now prunes at every node, on
+  shared content keys and on disjoint `KeyBounds`, so comparing two editions
+  costs the size of the difference.
+- **Persistent Derived enfilades** — a materialized view is an ordinary relation
+  in the Fact enfilade, so it survives a reopen and is carried by a fork.
+- **The canopy on the reactive path** — the canopy is an enfilade, and the pump
+  routes through the substrate instead of re-evaluating on every pump.
 
-### Multi-order arrangements
+What follows is what is genuinely still ahead.
 
-The lead-column WID pushdown is done: an entity-keyed view prunes to its key at
-the source. **Multi-order arrangements** maintain several column orderings per
-relation (several measured trees over the same facts), so `RangeRel` can prune on
-*trailing* columns too — making secondary-key preconditions and joins sublinear
-as well. Non-lead filters run correctly today; they just run unpruned. This is
-purely "more measured trees," the same primitive replicated per order.
+## Interest compilation into scope covers
 
-### Subtree-pruned version-compare
+The canopy routes per *watcher*: a commit stabs the interval enfilade and the
+answer is a set of interests that could have been touched. That is the right
+mechanism for local reactivity and the wrong granularity for a cluster, which
+needs to know not "which watchers" but "which *machines*."
 
-Backfollow short-circuits when two editions share a Fact root, but otherwise
-walks both sides. Making it `O(measure)` — pruning at *every* node on shared
-subtrees, disjoint key bounds, and trace membership carried as a WID upward
-measure (Gold's `HistoryCrum inTrace:`) — needs the enfilade to split at an
-arbitrary key so two versions can be compared span by span. That is a
-`split`/`join` addition to the tree, which is why it is here and not filed as a
-tidy-up.
-
-## Persistent Derived enfilades
-
-Today the Derived enfilade lives as *behavior*: `grmpl-diff` maintains views
-incrementally, but arrangements are an in-memory per-eval memo. Making them a
-**persistent, shared derived tree** — materialized views that survive reopen and
-share structure across editions like the Fact enfilade does — turns incremental
-view maintenance into a first-class, durable member of the plex. This is the one
-enfilade with no Xanadu ancestor, and its persistent form is where grmpl's
-differential extension of the `Ent` fully lands.
-
-## The canopy on the reactive path, then interest compilation
-
-The canopy is a real interval tree with an endorsement lattice, routing
-conservatively — but it is a `Vec` plus a segment tree rather than an enfilade,
-and **nothing routes through it**: the pump re-evaluates its view on every pump
-instead of asking whether a commit could have touched it. Making it an enfilade
-(so it versions and persists with the plex) and putting it on the pump's path is
-the near-term step. The frontier beyond that is compiling `watch` interest into
-**wid-summarized scope covers** so that interest routing is not just per-watcher stabbing but a
-measure the cluster can read off a subtree: "everything under this scope is
-watched for these kinds of change." That is the bridge from local reactivity to
-distributed interest management.
+The step is compiling `watch` interest into **wid-summarized scope covers**, so
+interest routing becomes a measure a cluster can read off a subtree rather than a
+per-watcher stabbing: *"everything under this scope is watched for these kinds of
+change."* The endorsement lattice is already the right shape for this — it is a
+conservative upward summary — so the work is in the covers, not the algebra. This
+is the bridge from local reactivity to distributed interest management, and it is
+the last piece needed before the item below.
 
 ## Distribution along scope covers (P15)
 
@@ -102,12 +87,14 @@ edition in `O(depth)`:
 
 ## Provenance and version-compare as a first-class surface
 
-Backfollow / version-compare is implemented as an `O(measure)` operation
-(trace membership is a WID upward measure). The enhancement is exposing it as a
-*language and tooling* surface: "show me every edition in which this fact held,"
-"diff the world between these two editions," "where did this content come from" —
-Xanadu's original transclusion-and-provenance vision, now over a relational
-world. Because provenance is a measure rather than a scan, these queries are
+Backfollow / version-compare is implemented, and subtree-pruned: comparing two
+editions costs the size of the difference, not the size of the relation. What is
+missing is not the mechanism but the *surface*. Exposing it to the language and
+to tooling — "show me every edition in which this fact held," "diff the world
+between these two editions," "where did this content come from" — is Xanadu's
+original transclusion-and-provenance vision, now over a relational world. This is
+the job Green gave the **spanfilade**: given a span, find everywhere it is
+quoted. Because provenance is a measure rather than a scan, these queries are
 cheap enough to be interactive.
 
 ## Parsing and transformation over measured sequences
@@ -125,9 +112,11 @@ becomes one more enfilade.
 ---
 
 The through-line: grmpl already earns the name `Ent` by its laws and by an
-implementation with every distinctive structural component present. What is left
-is to spend that structure — turning `O(depth)` search, `O(edit)` copy, upward
-interest summaries, and downward inherited context into a persistent derived
-layer, a provenance surface, and, ultimately, a distributed world that migrates
+implementation with every distinctive structural component present *and on the
+running system's path*. The building phase is over; the persistent derived layer
+that used to head this chapter is now in the Fact enfilade with everything else.
+What is left is to **spend** that structure — turning `O(depth)` search,
+`O(edit)` copy, upward interest summaries, and downward inherited context into a
+provenance surface, a parser, and, ultimately, a distributed world that migrates
 freely while its identities never move. Those are not features you bolt on. They
 are what the enfilade was for.

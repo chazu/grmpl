@@ -8,6 +8,14 @@ grmpl's semantics were designed around the enfilade even while the store was
 still an LSM stand-in, so cutting over to `grmpl-ent` lit up the structure the
 laws had assumed all along.
 
+> The tour below is selective, not a changelog: it stops at the phases that
+> illustrate an `Ent` property. The ones it skips are real but less
+> illustrative — **P7** (the Core IR, a reified CBPV split), **P9** (the pattern
+> algebra: inputs, printing, streams), **P10** (replay and forks), **P11** (the
+> concatenative surface), **P13** (benchmarks and engine statefulness) and
+> **P14** (diff generalization to abelian groups). `docs/ROADMAP.md` is the
+> complete list. **P15** — distribution — is Part IV.
+
 ## The world model — relations, not objects
 
 An object is an entity identifier participating in relations — `located`,
@@ -55,7 +63,8 @@ A `Reduce` operator groups by key and folds each group (`Count`/`Sum`/`Min`/
 
 *Ent property:* the seed of the **Derived enfilade** — maintained query state
 that is `find`'s derivative. Grouping is a fold, the same monoidal shape as a WID
-measure.
+measure. That enfilade is now persistent: a materialized view is an ordinary
+relation in the Fact enfilade, so it survives a reopen and is carried by a fork.
 
 ## P3 — client sessions and world construction
 
@@ -89,9 +98,12 @@ pumped in as messages, in one atomic commit that also advances a durable
 watch-cursor. Cascades are async message chains, never reentrancy — the pump only
 *appends*.
 
-*Ent property:* the **Attention law** and the beginnings of the **Canopy**.
-`watch` is the maintained derivative of `find` (Snapshot–stream law); the pump's
-`eval_delta` over `[cursor, current)` is a differential read of retained history.
+*Ent property:* the **Attention law** and the **Canopy**. `watch` is the
+maintained derivative of `find` (Snapshot–stream law); the pump's `eval_delta`
+over `[cursor, current)` is a differential read of retained history. The pump no
+longer re-evaluates blindly: it asks the substrate whether the interval could
+have touched it, and on the Ent that question is answered by a measure — relation
+-wide from the Edition enfilade, or per key span from the canopy itself.
 
 ## P6 — history: as-of, retention, GC
 

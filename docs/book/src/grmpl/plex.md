@@ -59,6 +59,15 @@ granfilade so that structural sharing works *across* the family — an edit touc
 the Fact tree, the Edition log, maybe the Canopy, and writes new roots for all of
 them in a single atomic batch.
 
+> **Five is a taxonomy, not a node count.** These five name the *jobs*. The
+> running store subdivides further, because the directories that hold the
+> enfilades are enfilades too: a Version enfilade mapping each edition to its Fact
+> root, a Rel enfilade of live relations, Arrangement enfilades for alternate
+> orderings, a fired-interest enfilade, and the branch enfilade of the `DagWood`.
+> The store's whole state is one root, ordered all the way down. The
+> [implementation chapter](./implementation.md#the-stores-enfilades--storers)
+> walks them.
+
 ## The patch is the semantic center
 
 What ties the plex to a *language* is a single operation. A handler is
