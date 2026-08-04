@@ -35,7 +35,7 @@
 //! [`install_including_current`]: OnWatch::install_including_current
 
 use grmpl_core::{
-    Authority, CursorMove, Diff, Edition, Entity, Fact, Patch, Result, RelId, SchemaCatalog,
+    Authority, CursorMove, Diff, Edition, Entity, Fact, Patch, RelId, Result, SchemaCatalog,
     TraceStore, Tuple, Value,
 };
 use grmpl_diff::{eval_delta, multiset, Query};
@@ -177,11 +177,7 @@ impl OnWatch {
     /// cursor; the delivered messages are a deterministic function of committed
     /// data alone (`eval_delta` over `[from, to)`, tuple-sorted, at seqs from the
     /// shared counter).
-    pub fn pump(
-        &self,
-        store: &dyn TraceStore,
-        schemas: &dyn SchemaCatalog,
-    ) -> Result<usize> {
+    pub fn pump(&self, store: &dyn TraceStore, schemas: &dyn SchemaCatalog) -> Result<usize> {
         // Bounded retry: a rejected commit means a peer advanced the cursor or
         // the shared seq counter under us; re-read both and resolve. A later
         // pump retries if contention does not settle within the cap.

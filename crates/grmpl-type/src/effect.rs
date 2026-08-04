@@ -48,8 +48,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use grmpl_core::{Authority, BehaviorChecker, Error as CoreError, Fact, RelId, Value};
-use grmpl_lang::ast::Stmt;
-use grmpl_lang::{Program, StoredBehavior, Word};
+use grmpl_lang::{BehaviorIr, BehaviorOp, Program, ResolvedGrantSet, StoredBehavior};
 
 /// The inferred **effect row** of an `on` handler: the relations it may write,
 /// at relation granularity, split by write kind. Both sets are deterministically
@@ -63,6 +62,7 @@ use grmpl_lang::{Program, StoredBehavior, Word};
 pub struct EffectRow {
     writes: BTreeSet<RelId>,
     sends: BTreeSet<RelId>,
+    capabilities: BTreeSet<String>,
 }
 
 impl EffectRow {
@@ -78,6 +78,11 @@ impl EffectRow {
         self.sends.iter().copied()
     }
 
+    /// Semantic capability names this behavior may invoke.
+    pub fn capabilities(&self) -> impl Iterator<Item = &str> + '_ {
+        self.capabilities.iter().map(String::as_str)
+    }
+
     /// Does this handler write (assert/retract) relation `rel`?
     pub fn writes_relation(&self, rel: RelId) -> bool {
         self.writes.contains(&rel)
@@ -85,7 +90,7 @@ impl EffectRow {
 
     /// True when the handler produces no world writes and no messages.
     pub fn is_empty(&self) -> bool {
-        self.writes.is_empty() && self.sends.is_empty()
+        self.writes.is_empty() && self.sends.is_empty() && self.capabilities.is_empty()
     }
 }
 
@@ -94,10 +99,16 @@ impl EffectRow {
 pub enum EffectError {
     /// No `on` handler is declared for the named inbox.
     NoHandler(String),
+    /// The source could not be type-checked and lowered to executable IR.
+    Lowering(String),
     /// A handler statement names a relation the program never declared, so it
     /// has no [`RelId`] to place in the effect row. (This is also a runtime
     /// error; catching it here makes it a compile-time one.)
     UndeclaredRelation(String),
+    /// Durable code invokes a capability not declared by the package.
+    UndeclaredCapability(String),
+    /// The package declared a capability but this runtime did not resolve a host grant.
+    UngrantedCapability(String),
     /// A relation the handler writes is not owned by the authority at the
     /// relation level — no owned [`Scope`](grmpl_core::Scope) names it, so the
     /// write can never be permitted regardless of key-range. Committing such a
@@ -109,8 +120,15 @@ impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EffectError::NoHandler(inbox) => write!(f, "no on-handler for inbox `{inbox}`"),
+            EffectError::Lowering(error) => write!(f, "behavior lowering failed: {error}"),
             EffectError::UndeclaredRelation(rel) => {
                 write!(f, "handler writes undeclared relation `{rel}`")
+            }
+            EffectError::UndeclaredCapability(name) => {
+                write!(f, "behavior invokes undeclared capability `{name}`")
+            }
+            EffectError::UngrantedCapability(name) => {
+                write!(f, "behavior invokes ungranted capability `{name}`")
             }
             EffectError::Unauthorized { rel } => write!(
                 f,
@@ -136,68 +154,65 @@ impl std::error::Error for EffectError {}
 /// or [`EffectError::UndeclaredRelation`] if a write names an undeclared
 /// relation.
 pub fn infer_handler_effects(prog: &Program, inbox: &str) -> Result<EffectRow, EffectError> {
-    let arms = prog
-        .on_arms(inbox)
-        .ok_or_else(|| EffectError::NoHandler(inbox.to_string()))?;
+    let arms = prog.handler_irs(inbox).map_err(|error| {
+        if error.starts_with("no on-handler") {
+            EffectError::NoHandler(inbox.to_string())
+        } else if let Some(relation) = error
+            .strip_prefix("operation names undeclared relation `")
+            .and_then(|tail| tail.strip_suffix('`'))
+        {
+            EffectError::UndeclaredRelation(relation.to_owned())
+        } else {
+            EffectError::Lowering(error)
+        }
+    })?;
     let mut row = EffectRow::default();
     for arm in arms {
-        for stmt in &arm.stmts {
-            match stmt {
-                Stmt::Assert { rel, .. } | Stmt::Retract { rel, .. } => {
-                    row.writes.insert(rel_id(prog, rel)?);
-                }
-                Stmt::Emit { rel, .. } => {
-                    row.sends.insert(rel_id(prog, rel)?);
-                }
-                // Reads and preconditions produce no world effect.
-                Stmt::Resolve { .. } | Stmt::Find { .. } | Stmt::Expect { .. } => {}
-            }
-        }
-    }
-    // Concatenative arms name the same write relations; scan their words too so
-    // the effect row is surface-agnostic.
-    let concat_arms = prog.on_concat_arms(inbox).unwrap_or(&[]);
-    for arm in concat_arms {
-        for word in &arm.words {
-            add_word_effect(prog, word, &mut row)?;
-        }
+        add_ir_effects(prog, &arm, &mut row)?;
     }
     Ok(row)
 }
 
-/// Fold one point-free [`Word`]'s world effect into `row`: `assert`/`retract`
-/// are writes, `emit` is a send, everything else is a read/precondition/shuffle
-/// with no world effect. The one interpreter of a word's *effect*, shared by
-/// concatenative `on`-handler arms ([`infer_handler_effects`]) and P12 stored
-/// behaviors ([`infer_stored_behavior_effects`]) so the two never diverge.
-///
-/// The `match` is exhaustive (no wildcard): a future write- or send-carrying
-/// `Word` variant forces a recompile here rather than being silently omitted
-/// from the Authority effect row.
-fn add_word_effect(prog: &Program, word: &Word, row: &mut EffectRow) -> Result<(), EffectError> {
-    match word {
-        Word::Assert(rel) | Word::Retract(rel) => {
-            row.writes.insert(rel_id(prog, rel)?);
+fn add_ir_effects(
+    prog: &Program,
+    behavior: &BehaviorIr,
+    row: &mut EffectRow,
+) -> Result<(), EffectError> {
+    fn walk(
+        prog: &Program,
+        operations: &[BehaviorOp],
+        row: &mut EffectRow,
+    ) -> Result<(), EffectError> {
+        for operation in operations {
+            match operation {
+                BehaviorOp::Assert { relation, .. } | BehaviorOp::Retract { relation, .. } => {
+                    row.writes.insert(rel_id(prog, relation)?);
+                }
+                BehaviorOp::Emit { relation, .. } => {
+                    row.sends.insert(rel_id(prog, relation)?);
+                }
+                BehaviorOp::If {
+                    then_ops, else_ops, ..
+                } => {
+                    walk(prog, then_ops, row)?;
+                    walk(prog, else_ops, row)?;
+                }
+                BehaviorOp::InvokeCapability { capability, .. } => {
+                    row.capabilities.insert(capability.clone());
+                    let (_, state_relation) = prog
+                        .capability(capability)
+                        .ok_or_else(|| EffectError::UndeclaredCapability(capability.clone()))?;
+                    row.writes.insert(state_relation);
+                }
+                BehaviorOp::Resolve { .. }
+                | BehaviorOp::Find { .. }
+                | BehaviorOp::Let { .. }
+                | BehaviorOp::Expect { .. } => {}
+            }
         }
-        Word::Emit(rel) => {
-            row.sends.insert(rel_id(prog, rel)?);
-        }
-        Word::SelfEntity
-        | Word::Lit(_)
-        | Word::Dup
-        | Word::Drop
-        | Word::Swap
-        | Word::Over
-        | Word::Rot
-        | Word::Nip
-        | Word::Tuck
-        | Word::TwoDup
-        | Word::TwoDrop
-        | Word::Resolve { .. }
-        | Word::Find { .. }
-        | Word::Expect(_) => {}
+        Ok(())
     }
-    Ok(())
+    walk(prog, &behavior.operations, row)
 }
 
 fn rel_id(prog: &Program, rel: &str) -> Result<RelId, EffectError> {
@@ -257,9 +272,7 @@ pub fn infer_stored_behavior_effects(
     behavior: &StoredBehavior,
 ) -> Result<EffectRow, EffectError> {
     let mut row = EffectRow::default();
-    for word in &behavior.body {
-        add_word_effect(prog, word, &mut row)?;
-    }
+    add_ir_effects(prog, &behavior.body, &mut row)?;
     Ok(row)
 }
 
@@ -294,12 +307,22 @@ pub fn check_stored_behavior_authority(
 /// [`Value::Code`]: grmpl_core::Value::Code
 pub struct EffectChecker<'a> {
     prog: &'a Program,
+    grants: Option<&'a ResolvedGrantSet>,
 }
 
 impl<'a> EffectChecker<'a> {
     /// A checker resolving stored relation names against `prog`.
     pub fn new(prog: &'a Program) -> EffectChecker<'a> {
-        EffectChecker { prog }
+        EffectChecker { prog, grants: None }
+    }
+
+    /// A checker for loaded package code. Capability symbols must resolve in
+    /// this exact immutable host-grant environment.
+    pub fn with_grants(prog: &'a Program, grants: &'a ResolvedGrantSet) -> EffectChecker<'a> {
+        EffectChecker {
+            prog,
+            grants: Some(grants),
+        }
     }
 }
 
@@ -309,14 +332,57 @@ impl BehaviorChecker for EffectChecker<'_> {
             if let Value::Code(_) = cell {
                 let behavior = StoredBehavior::from_value(cell)
                     .map_err(|e| CoreError::Codec(format!("stored behavior decode: {e}")))?;
-                check_stored_behavior_authority(self.prog, &behavior, authority).map_err(|e| {
-                    CoreError::Authority(format!(
-                        "stored behavior in relation {}: {e}",
-                        fact.rel.0
-                    ))
-                })?;
+                let effects = check_stored_behavior_authority(self.prog, &behavior, authority)
+                    .map_err(|e| {
+                        CoreError::Authority(format!(
+                            "stored behavior in relation {}: {e}",
+                            fact.rel.0
+                        ))
+                    })?;
+                if let Some(grants) = self.grants {
+                    for capability in effects.capabilities() {
+                        if grants.get(capability).is_none() {
+                            return Err(CoreError::Authority(format!(
+                                "stored behavior in relation {}: {}",
+                                fact.rel.0,
+                                EffectError::UngrantedCapability(capability.to_owned())
+                            )));
+                        }
+                    }
+                    validate_granted_invocations(&behavior.body.operations, grants).map_err(
+                        |error| {
+                            CoreError::Authority(format!(
+                                "stored behavior in relation {}: {error}",
+                                fact.rel.0
+                            ))
+                        },
+                    )?;
+                }
             }
         }
         Ok(())
     }
+}
+
+fn validate_granted_invocations(
+    operations: &[BehaviorOp],
+    grants: &ResolvedGrantSet,
+) -> Result<(), String> {
+    for operation in operations {
+        match operation {
+            BehaviorOp::InvokeCapability {
+                capability,
+                arguments,
+                ..
+            } => grants.validate_invocation(capability, arguments)?,
+            BehaviorOp::If {
+                then_ops, else_ops, ..
+            } => {
+                validate_granted_invocations(then_ops, grants)?;
+                validate_granted_invocations(else_ops, grants)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

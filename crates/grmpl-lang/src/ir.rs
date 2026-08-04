@@ -303,16 +303,25 @@ fn lower_filter(input: QueryIr, pred: PredExpr) -> Query {
             let base = Query::range_on(r, col, key, hi);
             return residual_filter(base, residual);
         }
-        return Query::Filter { input: Box::new(Query::rel(r)), pred: pred.lower() };
+        return Query::Filter {
+            input: Box::new(Query::rel(r)),
+            pred: pred.lower(),
+        };
     }
-    Query::Filter { input: Box::new(input.lower()), pred: pred.lower() }
+    Query::Filter {
+        input: Box::new(input.lower()),
+        pred: pred.lower(),
+    }
 }
 
 /// Re-attach whatever conjuncts the pushdown did not consume.
 fn residual_filter(base: Query, residual: Option<PredExpr>) -> Query {
     match residual {
         None => base,
-        Some(p) => Query::Filter { input: Box::new(base), pred: p.lower() },
+        Some(p) => Query::Filter {
+            input: Box::new(base),
+            pred: p.lower(),
+        },
     }
 }
 
@@ -348,7 +357,9 @@ fn lead_successor(v: &Value) -> Option<Value> {
 /// selected, so the caller can always build the range.
 fn pushdown_col_eq(pred: &PredExpr, want: usize) -> Option<(Value, Option<PredExpr>)> {
     let conjuncts = conjuncts_of(pred);
-    let k = conjuncts.iter().position(|p| col_lit(p).is_some_and(|(c, _)| c == want))?;
+    let k = conjuncts
+        .iter()
+        .position(|p| col_lit(p).is_some_and(|(c, _)| c == want))?;
     let (_, key) = col_lit(conjuncts[k]).expect("position found a column literal");
     Some((key, residual_of(&conjuncts, k)))
 }
@@ -377,8 +388,12 @@ fn col_lit(p: &PredExpr) -> Option<(usize, Value)> {
 
 /// Every conjunct but the `k`th, recombined.
 fn residual_of(conjuncts: &[&PredExpr], k: usize) -> Option<PredExpr> {
-    let rest: Vec<PredExpr> =
-        conjuncts.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, p)| (*p).clone()).collect();
+    let rest: Vec<PredExpr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != k)
+        .map(|(_, p)| (*p).clone())
+        .collect();
     match rest.len() {
         0 => None,
         1 => Some(rest.into_iter().next().unwrap()),

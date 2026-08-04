@@ -11,7 +11,7 @@
 //! * crash *after* commit → the cursor already advanced, the message is skipped.
 
 use grmpl_core::{
-    Authority, CursorMove, Diff, Edition, Entity, Error, Fact, Patch, Result, RelId, SchemaCatalog,
+    Authority, CursorMove, Diff, Edition, Entity, Error, Fact, Patch, RelId, Result, SchemaCatalog,
     TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
@@ -94,10 +94,20 @@ impl Process {
             None => return Ok(None),
         };
         let snap = Snapshot::new(store, at);
-        let mut patch = (self.behavior)(&snap, &body)?;
+        let mut patch = (self.behavior)(&snap, &body).map_err(|error| match error {
+            Error::Behavior(message) => Error::Behavior(format!(
+                "actor {} inbox sequence {seq}: {message}",
+                self.entity.0
+            )),
+            other => other,
+        })?;
         patch.cursor_advance = Some(CursorMove {
             rel: self.cursor_rel,
-            retract: if seq > 0 { Some(cursor_tuple(self.entity, seq)) } else { None },
+            retract: if seq > 0 {
+                Some(cursor_tuple(self.entity, seq))
+            } else {
+                None
+            },
             assert: cursor_tuple(self.entity, seq + 1),
         });
         Ok(Some(patch))
@@ -113,6 +123,14 @@ impl Process {
         }
     }
 
+    /// Inspect the durable inbox without evaluating behavior.
+    pub fn next_pending_sequence(&self, store: &dyn TraceStore) -> Result<Option<i64>> {
+        let position = self.position(store)?;
+        Ok(self
+            .message_at(store, position, store.current())?
+            .map(|_| position))
+    }
+
     /// Process at most one pending message, committing atomically under
     /// `schemas` (commit-boundary arity/type enforcement — pass
     /// [`grmpl_core::NoSchemas`] to opt out). `None` if idle; `Some(outcome)`
@@ -124,9 +142,12 @@ impl Process {
         schemas: &dyn SchemaCatalog,
     ) -> Result<Option<CommitOutcome>> {
         match self.prepare(store)? {
-            Some(prepared) => {
-                Ok(Some(commit_patch(store, schemas, &prepared.patch, &self.authority)?))
-            }
+            Some(prepared) => Ok(Some(commit_patch(
+                store,
+                schemas,
+                &prepared.patch,
+                &self.authority,
+            )?)),
             None => Ok(None),
         }
     }
@@ -204,6 +225,31 @@ impl Process {
             }
         }
     }
+
+    /// Process at most one message, rebuilding it after each optimistic
+    /// rejection. `None` means the actor was idle.
+    pub fn step_retrying(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+        policy: crate::retry::Backoff,
+    ) -> Result<Option<Edition>> {
+        let mut attempt = policy;
+        loop {
+            match self.step(store, schemas)? {
+                None => return Ok(None),
+                Some(CommitOutcome::Committed(edition)) => return Ok(Some(edition)),
+                Some(CommitOutcome::Rejected) => {
+                    if !attempt.wait() {
+                        return Err(Error::Store(format!(
+                            "process {:?}: inbox message rejected on every attempt",
+                            self.entity
+                        )));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Append a message to a process's inbox at `seq` (the "sender" side; a separate
@@ -231,8 +277,11 @@ pub fn seed_seq(store: &dyn TraceStore, seqs: RelId, process: Entity) -> Result<
     let alloc = SeqAlloc::read(store, seqs, vec![Value::Ent(process)])?;
     let patch = alloc.seed(Patch::new());
     if !patch.asserts.is_empty() {
-        let updates: Vec<(RelId, Tuple, Diff)> =
-            patch.asserts.iter().map(|f| (f.rel, f.tuple.clone(), 1)).collect();
+        let updates: Vec<(RelId, Tuple, Diff)> = patch
+            .asserts
+            .iter()
+            .map(|f| (f.rel, f.tuple.clone(), 1))
+            .collect();
         store.commit(&updates)?;
     }
     Ok(())
@@ -262,8 +311,11 @@ pub fn enqueue_seq(
         let seq = alloc.fresh();
         let patch = alloc.seal(Patch::new().assert(inbox_fact(inbox, process, seq, body.clone())));
 
-        let preconditions: Vec<(RelId, Tuple)> =
-            patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();
+        let preconditions: Vec<(RelId, Tuple)> = patch
+            .preconditions
+            .iter()
+            .map(|f| (f.rel, f.tuple.clone()))
+            .collect();
         let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
         for f in &patch.asserts {
             updates.push((f.rel, f.tuple.clone(), 1));
@@ -276,13 +328,19 @@ pub fn enqueue_seq(
             return Ok(seq);
         }
     }
-    Err(Error::Store("inbox seq allocation did not settle within retry cap".into()))
+    Err(Error::Store(
+        "inbox seq allocation did not settle within retry cap".into(),
+    ))
 }
 
 // Re-export so tests can build inbox facts without duplicating the layout.
 pub fn inbox_fact(inbox: RelId, process: Entity, seq: i64, body: Tuple) -> Fact {
     Fact::new(
         inbox,
-        Tuple::from([Value::Ent(process), Value::Int(seq), Value::Tuple(body.0.clone())]),
+        Tuple::from([
+            Value::Ent(process),
+            Value::Int(seq),
+            Value::Tuple(body.0.clone()),
+        ]),
     )
 }

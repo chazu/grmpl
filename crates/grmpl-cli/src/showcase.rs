@@ -13,12 +13,12 @@ use grmpl_core::{
     Scope, TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
+use grmpl_ent::EntStore;
 use grmpl_lang::{dispatch, PredExpr, Program, StoredBehavior, Word};
 use grmpl_proc::{
     commit_patch, decode_activation, enqueue, record_run, replay_from, CommitOutcome, Process,
     Scheduler, SeqAlloc,
 };
-use grmpl_ent::EntStore;
 
 const BUILTIN_MOO: &str = include_str!("../../../worlds/moo.grmpl");
 
@@ -116,25 +116,41 @@ fn scene_handlers() -> Result<(), String> {
 // 4. Optimistic concurrency: two writers race one precondition.
 // ===========================================================================
 fn scene_optimistic() -> Result<(), String> {
-    scene(4, "Optimistic concurrency — racing writers, exactly one wins");
+    scene(
+        4,
+        "Optimistic concurrency — racing writers, exactly one wins",
+    );
     let w = MooWorld::seeded()?;
     let auth = world_authority(&w.r);
-    let lamp_here = Fact::new(w.r.located, Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]));
+    let lamp_here = Fact::new(
+        w.r.located,
+        Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]),
+    );
 
     // Both build the same guarded take against the current world.
     let take_for = |who: Entity| {
         Patch::new()
             .expect(lamp_here.clone())
             .retract(lamp_here.clone())
-            .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(who), Value::Ent(LAMP)])))
+            .assert(Fact::new(
+                w.r.held,
+                Tuple::from([Value::Ent(who), Value::Ent(LAMP)]),
+            ))
     };
 
     println!("alice and bob both `expect located(lamp, foyer)` then take it:");
     let a = commit_patch(&w.store, &NoSchemas, &take_for(ALICE), &auth).map_err(err)?;
     let b = commit_patch(&w.store, &NoSchemas, &take_for(BOB), &auth).map_err(err)?;
     println!("  alice: {}", outcome(&a));
-    println!("  bob:   {}   (its precondition vanished — commit_if rejected it)", outcome(&b));
-    println!("  lamp held by alice: {}, by bob: {}", w.holds(ALICE, LAMP)?, w.holds(BOB, LAMP)?);
+    println!(
+        "  bob:   {}   (its precondition vanished — commit_if rejected it)",
+        outcome(&b)
+    );
+    println!(
+        "  lamp held by alice: {}, by bob: {}",
+        w.holds(ALICE, LAMP)?,
+        w.holds(BOB, LAMP)?
+    );
     Ok(())
 }
 
@@ -142,11 +158,18 @@ fn scene_optimistic() -> Result<(), String> {
 // 5. Reactive on-watch: a maintained view pumps deltas, exactly once.
 // ===========================================================================
 fn scene_reactive() -> Result<(), String> {
-    scene(5, "Reactive on-watch — a view change streams as an activation");
+    scene(
+        5,
+        "Reactive on-watch — a view change streams as an activation",
+    );
     let w = MooWorld::seeded()?;
     let auth = Authority::new(
         DomainId(1),
-        vec![Scope::whole(w.r.wmail), Scope::whole(w.r.wcursor), Scope::whole(w.r.wseq)],
+        vec![
+            Scope::whole(w.r.wmail),
+            Scope::whole(w.r.wcursor),
+            Scope::whole(w.r.wseq),
+        ],
     );
     let (ow, _) = w
         .prog
@@ -157,11 +180,17 @@ fn scene_reactive() -> Result<(), String> {
     let base = w.activation_count()?;
     println!("alice is watching the `world` view. Now bob takes the book...");
 
-    let book_here = Fact::new(w.r.located, Tuple::from([Value::Ent(BOOK), Value::Ent(FOYER)]));
+    let book_here = Fact::new(
+        w.r.located,
+        Tuple::from([Value::Ent(BOOK), Value::Ent(FOYER)]),
+    );
     let bob_take = Patch::new()
         .expect(book_here.clone())
         .retract(book_here)
-        .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(BOB), Value::Ent(BOOK)])));
+        .assert(Fact::new(
+            w.r.held,
+            Tuple::from([Value::Ent(BOB), Value::Ent(BOOK)]),
+        ));
     commit_patch(&w.store, &NoSchemas, &bob_take, &world_authority(&w.r)).map_err(err)?;
 
     let delivered = ow.pump(&w.store, &NoSchemas).map_err(err)?;
@@ -180,23 +209,49 @@ fn scene_history() -> Result<(), String> {
     scene(6, "As-of history — the past is not overwritten");
     let w = MooWorld::seeded()?;
     let e0 = w.store.current();
-    println!("edition {} — alice's room holds: {}", e0.0, names(&w.view("here", &[Value::Ent(ALICE)])?, 1).join(", "));
+    println!(
+        "edition {} — alice's room holds: {}",
+        e0.0,
+        names(&w.view("here", &[Value::Ent(ALICE)])?, 1).join(", ")
+    );
 
     // Mutate: alice takes the lamp.
-    let lamp_here = Fact::new(w.r.located, Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]));
+    let lamp_here = Fact::new(
+        w.r.located,
+        Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]),
+    );
     let take = Patch::new()
         .expect(lamp_here.clone())
         .retract(lamp_here)
-        .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(ALICE), Value::Ent(LAMP)])));
+        .assert(Fact::new(
+            w.r.held,
+            Tuple::from([Value::Ent(ALICE), Value::Ent(LAMP)]),
+        ));
     commit_patch(&w.store, &NoSchemas, &take, &world_authority(&w.r)).map_err(err)?;
 
     let now = w.store.current();
-    let past = w.prog.view("here", &[Value::Ent(ALICE)]).map_err(err)?
-        .find(&Snapshot::new(&w.store, e0)).map_err(err)?;
-    let present = w.prog.view("here", &[Value::Ent(ALICE)]).map_err(err)?
-        .find(&Snapshot::at_current(&w.store)).map_err(err)?;
-    println!("edition {} (as-of the past): {}", e0.0, names(&past, 1).join(", "));
-    println!("edition {} (now):            {}", now.0, names(&present, 1).join(", "));
+    let past = w
+        .prog
+        .view("here", &[Value::Ent(ALICE)])
+        .map_err(err)?
+        .find(&Snapshot::new(&w.store, e0))
+        .map_err(err)?;
+    let present = w
+        .prog
+        .view("here", &[Value::Ent(ALICE)])
+        .map_err(err)?
+        .find(&Snapshot::at_current(&w.store))
+        .map_err(err)?;
+    println!(
+        "edition {} (as-of the past): {}",
+        e0.0,
+        names(&past, 1).join(", ")
+    );
+    println!(
+        "edition {} (now):            {}",
+        now.0,
+        names(&present, 1).join(", ")
+    );
     println!("Same query, two editions — history is queryable, never mutated in place.");
     Ok(())
 }
@@ -205,7 +260,10 @@ fn scene_history() -> Result<(), String> {
 // 7. Deterministic replay: behavior is pure in (snapshot, message).
 // ===========================================================================
 fn scene_replay() -> Result<(), String> {
-    scene(7, "Deterministic replay — re-derive every patch from history");
+    scene(
+        7,
+        "Deterministic replay — re-derive every patch from history",
+    );
     let w = MooWorld::seeded()?;
     let alice = w.player(ALICE)?;
     w.enqueue(ALICE, 0, "take lamp")?;
@@ -213,8 +271,14 @@ fn scene_replay() -> Result<(), String> {
 
     let live = record_run(&w.store, &alice, &NoSchemas).map_err(err)?;
     let replayed = replay_from(&w.store, &alice, Edition::ZERO).map_err(err)?;
-    println!("ran {} messages live, then replayed from edition 0.", live.len());
-    println!("  live log == replayed log, step for step: {}", live == replayed);
+    println!(
+        "ran {} messages live, then replayed from edition 0.",
+        live.len()
+    );
+    println!(
+        "  live log == replayed log, step for step: {}",
+        live == replayed
+    );
     println!("  (each Step carries the exact patch and edition it committed.)");
     Ok(())
 }
@@ -226,11 +290,17 @@ fn scene_forks() -> Result<(), String> {
     scene(8, "Forks — an O(edit) virtual copy you can diverge safely");
     let w = MooWorld::seeded()?;
     // Do a little history first.
-    let lamp_here = Fact::new(w.r.located, Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]));
+    let lamp_here = Fact::new(
+        w.r.located,
+        Tuple::from([Value::Ent(LAMP), Value::Ent(FOYER)]),
+    );
     let take = Patch::new()
         .expect(lamp_here.clone())
         .retract(lamp_here)
-        .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(ALICE), Value::Ent(LAMP)])));
+        .assert(Fact::new(
+            w.r.held,
+            Tuple::from([Value::Ent(ALICE), Value::Ent(LAMP)]),
+        ));
     commit_patch(&w.store, &NoSchemas, &take, &world_authority(&w.r)).map_err(err)?;
 
     // The Ent's fork is a new branch in the *same* granfilade, sharing every
@@ -244,8 +314,10 @@ fn scene_forks() -> Result<(), String> {
     println!("  node frames written to copy it: {node_frames} (it shares them all)");
 
     // Diverge the fork; the source is untouched.
-    let bob_take = Patch::new()
-        .assert(Fact::new(w.r.held, Tuple::from([Value::Ent(BOB), Value::Ent(BOOK)])));
+    let bob_take = Patch::new().assert(Fact::new(
+        w.r.held,
+        Tuple::from([Value::Ent(BOB), Value::Ent(BOOK)]),
+    ));
     commit_patch(&fork, &NoSchemas, &bob_take, &world_authority(&w.r)).map_err(err)?;
     let diverged = projection(&w.store, &w.r)? != projection(&fork, &w.r)?;
     println!("  wrote to the fork; source and fork now differ: {diverged}");
@@ -274,36 +346,62 @@ fn scene_live_behaviors() -> Result<(), String> {
     let auth = Authority::new(DomainId(1), vec![Scope::whole(direct), Scope::whole(proto)]);
 
     // A behavior is a value: guard = match-all, body = point-free words.
-    let greet = StoredBehavior::new(
+    let greet = StoredBehavior::from_words(
+        &prog,
         PredExpr::And(vec![]),
-        vec![Word::SelfEntity, Word::Assert("greeted".into())],
-    );
-    let wave = StoredBehavior::new(
+        vec![grmpl_core::Ty::Text],
+        vec![Word::Drop, Word::SelfEntity, Word::Assert("greeted".into())],
+    )?;
+    let wave = StoredBehavior::from_words(
+        &prog,
         PredExpr::And(vec![]),
-        vec![Word::SelfEntity, Word::Assert("waved".into())],
-    );
+        vec![grmpl_core::Ty::Text],
+        vec![Word::Drop, Word::SelfEntity, Word::Assert("waved".into())],
+    )?;
 
     // player inherits from avatar; avatar's behavior is `greet`.
     let install = Patch::new()
-        .assert(Fact::new(proto, Tuple::from([Value::Ent(player), Value::Ent(avatar)])))
-        .assert(Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])));
+        .assert(Fact::new(
+            proto,
+            Tuple::from([Value::Ent(player), Value::Ent(avatar)]),
+        ))
+        .assert(Fact::new(
+            direct,
+            Tuple::from([Value::Ent(avatar), greet.to_value()]),
+        ));
     commit_patch(&store, &NoSchemas, &install, &auth).map_err(err)?;
 
     let msg = Tuple::from([Value::text("ping")]);
     let snap = Snapshot::at_current(&store);
-    let patch = dispatch(&prog, direct, proto, player, &snap, &msg).map_err(err)?.ok_or("no behavior matched")?;
+    let patch = dispatch(&prog, direct, proto, player, &snap, &msg)
+        .map_err(err)?
+        .ok_or("no behavior matched")?;
     println!("dispatch resolves through the prototype chain (a recursive view):");
-    println!("  player's inherited behavior asserts: {}", rel_name(&patch, greeted, waved));
+    println!(
+        "  player's inherited behavior asserts: {}",
+        rel_name(&patch, greeted, waved)
+    );
 
     // Live redefinition: an ordinary retract + assert. No new mechanism.
     let redefine = Patch::new()
-        .retract(Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])))
-        .assert(Fact::new(direct, Tuple::from([Value::Ent(avatar), wave.to_value()])));
+        .retract(Fact::new(
+            direct,
+            Tuple::from([Value::Ent(avatar), greet.to_value()]),
+        ))
+        .assert(Fact::new(
+            direct,
+            Tuple::from([Value::Ent(avatar), wave.to_value()]),
+        ));
     commit_patch(&store, &NoSchemas, &redefine, &auth).map_err(err)?;
 
     let snap = Snapshot::at_current(&store);
-    let patch = dispatch(&prog, direct, proto, player, &snap, &msg).map_err(err)?.ok_or("no behavior matched")?;
-    println!("after retract+assert of the avatar's code cell, same message now asserts: {}", rel_name(&patch, greeted, waved));
+    let patch = dispatch(&prog, direct, proto, player, &snap, &msg)
+        .map_err(err)?
+        .ok_or("no behavior matched")?;
+    println!(
+        "after retract+assert of the avatar's code cell, same message now asserts: {}",
+        rel_name(&patch, greeted, waved)
+    );
     println!("  the world's behavior changed at runtime — no redeploy, just a commit.");
     Ok(())
 }
@@ -320,7 +418,11 @@ fn scene_scheduling() -> Result<(), String> {
     const PROC: Entity = Entity(1);
     let auth = Authority::new(
         DomainId(1),
-        vec![Scope::whole(TIMERS), Scope::whole(SEQS), Scope::whole(INBOX)],
+        vec![
+            Scope::whole(TIMERS),
+            Scope::whole(SEQS),
+            Scope::whole(INBOX),
+        ],
     );
 
     // Seed the seq counter once on the un-raced path.
@@ -449,7 +551,12 @@ impl MooWorld {
                 (r.value, Tuple::from([e(BOOK), Value::Int(3)]), 1),
             ])
             .map_err(err)?;
-        Ok(MooWorld { prog, store, r, _dir })
+        Ok(MooWorld {
+            prog,
+            store,
+            r,
+            _dir,
+        })
     }
 
     fn view(&self, name: &str, args: &[Value]) -> Result<Vec<(Tuple, grmpl_core::Diff)>, String> {
@@ -480,7 +587,11 @@ impl MooWorld {
     fn tell_since(&self, who: Entity, since: Edition) -> Result<String, String> {
         let to = self.store.current();
         let mut last = String::from("(nothing said)");
-        for u in self.store.scan_updates(self.r.tell, since, to).map_err(err)? {
+        for u in self
+            .store
+            .scan_updates(self.r.tell, since, to)
+            .map_err(err)?
+        {
             let s = u.tuple.as_slice();
             if u.diff > 0 && s.first() == Some(&Value::Ent(who)) {
                 if let Some(Value::Text(text)) = s.get(1) {

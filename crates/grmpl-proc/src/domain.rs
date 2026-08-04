@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use grmpl_core::{
     Authority, Diff, DomainId, Edition, Error, Message, Patch, RelId, Result, SchemaCatalog,
-    TraceStore, Tuple, Transport, Value,
+    TraceStore, Transport, Tuple, Value,
 };
 
 use crate::commit::{check_schema, CommitOutcome};
@@ -68,8 +68,11 @@ impl<'a> Domain<'a> {
     fn all_hold(&self, preconds: &[(RelId, Tuple)]) -> Result<bool> {
         let at = self.store.current();
         for (rel, tuple) in preconds {
-            let held =
-                self.store.read_at(*rel, at)?.into_iter().any(|(t, d)| d > 0 && &t == tuple);
+            let held = self
+                .store
+                .read_at(*rel, at)?
+                .into_iter()
+                .any(|(t, d)| d > 0 && &t == tuple);
             if !held {
                 return Ok(false);
             }
@@ -86,8 +89,11 @@ impl<'a> Domain<'a> {
         let alloc = SeqAlloc::read(self.store, self.outseq, Vec::new())?;
         let patch = alloc.seed(Patch::new());
         if !patch.asserts.is_empty() {
-            let updates: Vec<(RelId, Tuple, Diff)> =
-                patch.asserts.iter().map(|f| (f.rel, f.tuple.clone(), 1)).collect();
+            let updates: Vec<(RelId, Tuple, Diff)> = patch
+                .asserts
+                .iter()
+                .map(|f| (f.rel, f.tuple.clone(), 1))
+                .collect();
             self.store.commit(&updates)?;
         }
         Ok(())
@@ -120,7 +126,12 @@ impl<'a> Domain<'a> {
             .collect();
 
         // Authority law: world writes must be owned.
-        for f in patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()) {
+        for f in patch
+            .asserts
+            .iter()
+            .chain(patch.retracts.iter())
+            .chain(sched.iter())
+        {
             if !authority.permits(f) {
                 return Err(Error::Authority(format!(
                     "write to relation {:?} outside authority domain {:?}",
@@ -132,11 +143,18 @@ impl<'a> Domain<'a> {
         // Schema law (P1): world writes must conform to their registered schema.
         check_schema(
             schemas,
-            patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
+            patch
+                .asserts
+                .iter()
+                .chain(patch.retracts.iter())
+                .chain(sched.iter()),
         )?;
 
-        let base_preconditions: Vec<(RelId, Tuple)> =
-            patch.preconditions.iter().map(|f| (f.rel, f.tuple.clone())).collect();
+        let base_preconditions: Vec<(RelId, Tuple)> = patch
+            .preconditions
+            .iter()
+            .map(|f| (f.rel, f.tuple.clone()))
+            .collect();
 
         // Seq-independent effects: world writes, the cursor move, timers, and any
         // *local* emits all ride every commit attempt unchanged.
@@ -170,10 +188,12 @@ impl<'a> Domain<'a> {
         // No remote emit: no outbox seq to allocate — commit exactly as before,
         // in one atomic `commit_if`.
         if remotes.is_empty() {
-            return Ok(match self.store.commit_if(&base_preconditions, &base_updates)? {
-                Some(e) => CommitOutcome::Committed(e),
-                None => CommitOutcome::Rejected,
-            });
+            return Ok(
+                match self.store.commit_if(&base_preconditions, &base_updates)? {
+                    Some(e) => CommitOutcome::Committed(e),
+                    None => CommitOutcome::Rejected,
+                },
+            );
         }
 
         // Remote emits: draw outbox seqs from the durable, race-safe `SeqAlloc`.
@@ -238,9 +258,17 @@ impl<'a> Domain<'a> {
             }
             let s = row.as_slice();
             let (seq, target, inbox, body) = match (s.first(), s.get(1), s.get(2), s.get(3)) {
-                (Some(Value::Int(seq)), Some(Value::Int(t)), Some(Value::Int(ib)), Some(Value::Tuple(b))) => {
-                    (*seq, DomainId(*t as u64), RelId(*ib as u32), Tuple(b.clone()))
-                }
+                (
+                    Some(Value::Int(seq)),
+                    Some(Value::Int(t)),
+                    Some(Value::Int(ib)),
+                    Some(Value::Tuple(b)),
+                ) => (
+                    *seq,
+                    DomainId(*t as u64),
+                    RelId(*ib as u32),
+                    Tuple(b.clone()),
+                ),
                 _ => return Err(Error::Codec("malformed outbox row".into())),
             };
             let envelope = encode_envelope(seq, &Message { inbox, body });
@@ -263,7 +291,11 @@ impl<'a> Domain<'a> {
             }
             self.store.commit(&[
                 (msg.inbox, msg.body, 1),
-                (self.seen, Tuple::from([Value::Int(sender.0 as i64), Value::Int(seq)]), 1),
+                (
+                    self.seen,
+                    Tuple::from([Value::Int(sender.0 as i64), Value::Int(seq)]),
+                    1,
+                ),
             ])?;
             n += 1;
         }
@@ -273,5 +305,9 @@ impl<'a> Domain<'a> {
 
 /// A pending outbox count helper (for tests/observability).
 pub fn outbox_len(store: &dyn TraceStore, outbox: RelId, at: Edition) -> Result<usize> {
-    Ok(store.read_at(outbox, at)?.into_iter().filter(|(_, d)| *d > 0).count())
+    Ok(store
+        .read_at(outbox, at)?
+        .into_iter()
+        .filter(|(_, d)| *d > 0)
+        .count())
 }

@@ -1,24 +1,28 @@
 //! `grmpl shotengai [STORE_DIR]` — the durable Kasumi Shotengai game.
 //!
-//! The world laws live in `worlds/shotengai.grmpl`. This edge host owns only
-//! terminal I/O, initial conditions, finite rule tables, DSP instancing, combat
-//! coordination, and whole-store branch routing.
+//! The world package, initial conditions, finite rule tables, player combat,
+//! and scalar omen RNG live in `worlds/shotengai.grmpl`. This edge host owns
+//! terminal I/O, actor driving, card shuffling, DSP instancing, presentation,
+//! and whole-store branch routing.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Duration;
 
+use grmpl::{DriveStatus, NamedAuthority, NamedScope, Runtime, RuntimePolicy};
 use grmpl_core::{
     Authority, Diff, DomainId, Edition, EditionStore, Entity, Fact, Patch, RelId, Scope,
     TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
 use grmpl_ent::{BranchId, Dag, EntStore};
-use grmpl_lang::Program;
-use grmpl_proc::{
-    commit_patch, decode_activation, enqueue_seq, seed_seq, CommitOutcome, OnWatch, Process,
-};
+#[cfg(test)]
+use grmpl_lang::ResolvedGrantSet;
+use grmpl_lang::{GrantSet, Program};
+use grmpl_proc::{commit_patch, decode_activation, CommitOutcome, OnWatch};
 
 const WORLD_SOURCE: &str = include_str!("../../../worlds/shotengai.grmpl");
 
@@ -27,35 +31,59 @@ const WORLD: Entity = Entity(2);
 
 // Surface rooms.
 const EAST_GATE: Entity = Entity(10);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const ARCADE: Entity = Entity(11);
 const KISSATEN: Entity = Entity(12);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const REPAIR_SHOP: Entity = Entity(13);
 const SENTO: Entity = Entity(14);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const COOPERATIVE: Entity = Entity(15);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const SHRINE_ALLEY: Entity = Entity(16);
 const CINEMA: Entity = Entity(17);
 const ROOFTOP: Entity = Entity(18);
 
 // Surface things and residents.
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const RED_UMBRELLA: Entity = Entity(20);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const BRASS_TOKEN: Entity = Entity(21);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const OLD_RADIO: Entity = Entity(22);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const TEA_TIN: Entity = Entity(23);
+#[allow(dead_code)] // used by the headless time-driver regression
 const CAT: Entity = Entity(30);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const PROPRIETOR: Entity = Entity(31);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const REPAIRER: Entity = Entity(32);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const CARETAKER: Entity = Entity(33);
+#[cfg(test)]
+const COMBAT: Entity = Entity(34);
 
 // Jobs and their signature abilities.
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const COURIER: Entity = Entity(100);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const COOK: Entity = Entity(101);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const REPAIRER_JOB: Entity = Entity(102);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const SHRINE_ATTENDANT: Entity = Entity(103);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const NIGHT_WATCH: Entity = Entity(104);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const QUICK_STEP: Entity = Entity(200);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const SEARING_PAN: Entity = Entity(201);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const LIVE_WIRE: Entity = Entity(202);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const PAPER_WARD: Entity = Entity(203);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const LANTERN_WALL: Entity = Entity(204);
 
 // The self-contained dungeon template. Every template fact is keyed by an
@@ -64,28 +92,30 @@ const LANTERN_WALL: Entity = Entity(204);
 const DUNGEON_BASE: u64 = 1_000;
 const DUNGEON_SPAN: u64 = 100;
 const DUNGEON_ENTRY: Entity = Entity(1_000);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const FLOODED_STORE: Entity = Entity(1_001);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const FORGOTTEN_ARCADE: Entity = Entity(1_002);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const LEDGER_VAULT: Entity = Entity(1_003);
 const MIRROR_CHAMBER: Entity = Entity(1_004);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const MANNEQUIN_STOCKROOM: Entity = Entity(1_005);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const RECEIPT_MOTH: Entity = Entity(1_010);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const SHUTTER_MAW: Entity = Entity(1_011);
 const LAST_CUSTOMER: Entity = Entity(1_012);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const MANNEQUIN_SHELL: Entity = Entity(1_013);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const DUNGEON_COIN: Entity = Entity(1_020);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const RED_THREAD: Entity = Entity(1_021);
+#[allow(dead_code)] // mirrors the package's stable source-level entity id
 const COPYING_MIRROR: Entity = Entity(1_022);
 const INSTANCE_BASE: u64 = 100_000;
 const INSTANCE_STRIDE: u64 = 1_000;
-
-const PATROL: [(Entity, Entity); 5] = [
-    (EAST_GATE, ARCADE),
-    (ARCADE, KISSATEN),
-    (KISSATEN, SHRINE_ALLEY),
-    (SHRINE_ALLEY, COOPERATIVE),
-    (COOPERATIVE, EAST_GATE),
-];
 
 #[derive(Clone, Copy)]
 struct Rels {
@@ -116,13 +146,18 @@ struct Rels {
     monster_power: RelId,
     monster_reward: RelId,
     defeated: RelId,
-    attack_result: RelId,
     combat_event: RelId,
+    combat_claimed: RelId,
+    player_defeat: RelId,
+    boss_unlock: RelId,
     session_branch: RelId,
     echo_depth: RelId,
     instance_state: RelId,
     instance_counter: RelId,
     rng_state: RelId,
+    clock: RelId,
+    timers: RelId,
+    patrol_due: RelId,
     card: RelId,
     cardval: RelId,
     cardrank: RelId,
@@ -132,6 +167,8 @@ struct Rels {
     sum15three: RelId,
     tell: RelId,
     inbox: RelId,
+    patrol_inbox: RelId,
+    combat_inbox: RelId,
     inbox_seq: RelId,
     cursor: RelId,
     wmail: RelId,
@@ -174,13 +211,18 @@ impl Rels {
             monster_power: get("monster_power")?,
             monster_reward: get("monster_reward")?,
             defeated: get("defeated")?,
-            attack_result: get("attack_result")?,
             combat_event: get("combat_event")?,
+            combat_claimed: get("combat_claimed")?,
+            player_defeat: get("player_defeat")?,
+            boss_unlock: get("boss_unlock")?,
             session_branch: get("session_branch")?,
             echo_depth: get("echo_depth")?,
             instance_state: get("instance_state")?,
             instance_counter: get("instance_counter")?,
             rng_state: get("rng_state")?,
+            clock: get("clock")?,
+            timers: get("timers")?,
+            patrol_due: get("patrol_due")?,
             card: get("card")?,
             cardval: get("cardval")?,
             cardrank: get("cardrank")?,
@@ -190,6 +232,8 @@ impl Rels {
             sum15three: get("sum15three")?,
             tell: get("tell")?,
             inbox: get("inbox")?,
+            patrol_inbox: get("patrol_inbox")?,
+            combat_inbox: get("combat_inbox")?,
             inbox_seq: get("inbox_seq")?,
             cursor: get("cursor")?,
             wmail: get("wmail")?,
@@ -227,13 +271,18 @@ impl Rels {
             self.monster_power,
             self.monster_reward,
             self.defeated,
-            self.attack_result,
             self.combat_event,
+            self.combat_claimed,
+            self.player_defeat,
+            self.boss_unlock,
             self.session_branch,
             self.echo_depth,
             self.instance_state,
             self.instance_counter,
             self.rng_state,
+            self.clock,
+            self.timers,
+            self.patrol_due,
             self.card,
             self.cardval,
             self.cardrank,
@@ -243,6 +292,8 @@ impl Rels {
             self.sum15three,
             self.tell,
             self.inbox,
+            self.patrol_inbox,
+            self.combat_inbox,
             self.inbox_seq,
             self.cursor,
             self.wmail,
@@ -251,7 +302,7 @@ impl Rels {
         ]
     }
 
-    fn template(self) -> [RelId; 11] {
+    fn template(self) -> [RelId; 13] {
         [
             self.located,
             self.named,
@@ -264,10 +315,13 @@ impl Rels {
             self.monster_power,
             self.monster_reward,
             self.defeated,
+            self.boss_unlock,
+            self.combat_claimed,
         ]
     }
 }
 
+#[cfg(test)]
 fn player_authority(r: Rels) -> Authority {
     Authority::new(
         DomainId(1),
@@ -280,14 +334,29 @@ fn player_authority(r: Rels) -> Authority {
             Scope::whole(r.combat_event),
             Scope::whole(r.tell),
             Scope::whole(r.cursor),
+            Scope::whole(r.rng_state),
+            Scope::whole(r.timers),
         ],
     )
 }
 
-fn patrol_authority(r: Rels) -> Authority {
+#[cfg(test)]
+fn combat_authority(r: Rels) -> Authority {
     Authority::new(
         DomainId(1),
-        vec![Scope::whole(r.located), Scope::whole(r.cursor)],
+        vec![
+            Scope::whole(r.ability_rank),
+            Scope::whole(r.combat_claimed),
+            Scope::whole(r.combat_event),
+            Scope::whole(r.defeated),
+            Scope::whole(r.exits),
+            Scope::whole(r.hp),
+            Scope::whole(r.job_points),
+            Scope::whole(r.job_rank),
+            Scope::whole(r.monster_reward),
+            Scope::whole(r.player_defeat),
+            Scope::whole(r.tell),
+        ],
     )
 }
 
@@ -313,28 +382,96 @@ fn coordinator_authority(r: Rels) -> Authority {
     )
 }
 
+fn actor_runtime_policy() -> Result<RuntimePolicy, String> {
+    let capabilities = GrantSet::new()
+        .grant_random("omens", "rng_state", WORLD, "xorshift64star_v1")?
+        .grant_schedule(
+            "world_clock",
+            "clock",
+            "timers",
+            "inbox_seq",
+            ["PLAYER", "CAT", "COMBAT"],
+        )?;
+    let named = |relations: &[&str]| {
+        NamedAuthority::new(
+            DomainId(1),
+            relations.iter().copied().map(NamedScope::whole).collect(),
+        )
+    };
+    let actor_authorities = std::collections::BTreeMap::from([
+        (
+            "PLAYER".into(),
+            named(&[
+                "active_job",
+                "combat_event",
+                "cursor",
+                "held",
+                "hp",
+                "knows",
+                "located",
+                "rng_state",
+                "tell",
+                "timers",
+            ]),
+        ),
+        (
+            "CAT".into(),
+            named(&["cursor", "located", "patrol_due", "timers"]),
+        ),
+        (
+            "COMBAT".into(),
+            named(&[
+                "ability_rank",
+                "combat_claimed",
+                "combat_event",
+                "cursor",
+                "defeated",
+                "exits",
+                "hp",
+                "job_points",
+                "job_rank",
+                "monster_reward",
+                "player_defeat",
+                "tell",
+            ]),
+        ),
+    ]);
+    Ok(RuntimePolicy::new(
+        capabilities,
+        actor_authorities,
+        named(&[
+            "clock",
+            "timers",
+            "inbox_seq",
+            "inbox",
+            "patrol_inbox",
+            "combat_inbox",
+        ]),
+    ))
+}
+
 /// One granfilade family with the root control branch kept open and at most one
 /// non-root branch selected for this single-player terminal session.
 struct WorldFamily {
-    root: EntStore,
-    active: Option<EntStore>,
+    root: Arc<EntStore>,
+    active: Option<Arc<EntStore>>,
 }
 
 impl WorldFamily {
-    fn open(root: EntStore, r: Rels) -> Result<WorldFamily, String> {
+    fn open(root: Arc<EntStore>, r: Rels) -> Result<WorldFamily, String> {
         let branch = live_int_for(&root, r.session_branch, PLAYER, 1)
             .unwrap_or(Dag::ROOT as i64)
             .max(0) as BranchId;
         let active = if branch == Dag::ROOT {
             None
         } else {
-            Some(root.branch(branch).map_err(err)?)
+            Some(Arc::new(root.branch(branch).map_err(err)?))
         };
         Ok(WorldFamily { root, active })
     }
 
     fn active(&self) -> &EntStore {
-        self.active.as_ref().unwrap_or(&self.root)
+        self.active.as_ref().map_or(self.root.as_ref(), Arc::as_ref)
     }
 
     fn active_branch(&self) -> BranchId {
@@ -356,67 +493,62 @@ impl WorldFamily {
             )
             .map_err(err)?
             .ok_or_else(|| "the durable branch route changed concurrently".to_string())?;
-        self.active = Some(child);
+        self.active = Some(Arc::new(child));
         Ok(())
+    }
+
+    fn shared_active(&self) -> Arc<dyn grmpl_core::WorldStore> {
+        match &self.active {
+            Some(active) => active.clone(),
+            None => self.root.clone(),
+        }
     }
 }
 
 /// The headless game. The interactive terminal and the test suite both drive
 /// this API, so the tested command path is the player-facing one.
 struct Game {
+    runtime: Arc<Runtime>,
     program: Arc<Program>,
+    #[cfg(test)]
+    grants: Arc<ResolvedGrantSet>,
     family: WorldFamily,
     r: Rels,
-    player: Process,
-    patrol: Process,
     watch: Option<OnWatch>,
     delivered: usize,
 }
 
 impl Game {
     fn open(path: &Path) -> Result<Game, String> {
-        let root = EntStore::open(path)
-            .map_err(|e| format!("cannot open shotengai store at {}: {e:?}", path.display()))?;
-        let program = Arc::new(Program::compile_with_catalog(WORLD_SOURCE, &root, 1)?);
+        let root =
+            Arc::new(EntStore::open(path).map_err(|e| {
+                format!("cannot open shotengai store at {}: {e:?}", path.display())
+            })?);
+        let store: Arc<dyn grmpl_core::WorldStore> = root.clone();
+        let runtime =
+            Runtime::load_driven_package(store, WORLD_SOURCE, 1, &actor_runtime_policy()?)?;
+        let program = Arc::clone(runtime.program());
         let r = Rels::resolve(&program)?;
-        program
-            .register_schemas(&root, &root, Edition(root.current().0 + 1))
-            .map_err(err)?;
-        seed_world(&root, r)?;
-        seed_rule_tables(&root, r)?;
-        seed_seq(&root, r.inbox_seq, PLAYER).map_err(err)?;
-        seed_seq(&root, r.inbox_seq, CAT).map_err(err)?;
 
         let family = WorldFamily::open(root, r)?;
-        if family.active_branch() != Dag::ROOT {
-            let store = family.active();
-            program
-                .register_schemas(store, store, Edition(store.current().0 + 1))
-                .map_err(err)?;
-            seed_seq(store, r.inbox_seq, PLAYER).map_err(err)?;
-            seed_seq(store, r.inbox_seq, CAT).map_err(err)?;
-        }
-
-        let player = Process {
-            entity: PLAYER,
-            authority: player_authority(r),
-            inbox: r.inbox,
-            cursor_rel: r.cursor,
-            behavior: Program::behavior(&program, "inbox", PLAYER)?,
+        let runtime = if family.active_branch() == Dag::ROOT {
+            runtime
+        } else {
+            Runtime::load_driven_package(
+                family.shared_active(),
+                WORLD_SOURCE,
+                1,
+                &actor_runtime_policy()?,
+            )?
         };
-        let patrol = Process {
-            entity: CAT,
-            authority: patrol_authority(r),
-            inbox: r.inbox,
-            cursor_rel: r.cursor,
-            behavior: Program::behavior(&program, "inbox", CAT)?,
-        };
+        let program = Arc::clone(runtime.program());
         Ok(Game {
+            runtime: Arc::clone(&runtime),
             program,
+            #[cfg(test)]
+            grants: runtime.shared_grants(),
             family,
             r,
-            player,
-            patrol,
             watch: None,
             delivered: 0,
         })
@@ -424,6 +556,21 @@ impl Game {
 
     fn store(&self) -> &EntStore {
         self.family.active()
+    }
+
+    fn rebind_runtime(&mut self) -> Result<(), String> {
+        self.runtime = Runtime::load_driven_package(
+            self.family.shared_active(),
+            WORLD_SOURCE,
+            1,
+            &actor_runtime_policy()?,
+        )?;
+        self.program = Arc::clone(self.runtime.program());
+        #[cfg(test)]
+        {
+            self.grants = self.runtime.shared_grants();
+        }
+        Ok(())
     }
 }
 
@@ -438,21 +585,48 @@ pub fn run(store_dir: Option<String>) -> Result<(), String> {
     println!("Type `help` for commands, `quit` to leave.\n");
     print_lines(game.look());
 
-    let stdin = io::stdin();
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        loop {
+            let mut line = String::new();
+            let message = match stdin.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(Some(line)),
+                Err(error) => Err(format!("stdin: {error}")),
+            };
+            let done = !matches!(message, Ok(Some(_)));
+            if send.send(message).is_err() || done {
+                break;
+            }
+        }
+    });
+    print!("\n> ");
+    io::stdout().flush().ok();
     loop {
-        print!("\n> ");
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => {
+        let line = match receive.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
                 println!("\nThe arcade lights click off behind you.");
                 return Ok(());
             }
-            Ok(_) => {}
-            Err(e) => return Err(format!("stdin: {e}")),
-        }
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {
+                let output = game.advance_time(250)?;
+                if !output.is_empty() {
+                    println!();
+                    print_lines(output);
+                    print!("\n> ");
+                    io::stdout().flush().ok();
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         let line = line.trim();
         if line.is_empty() {
+            print!("\n> ");
+            io::stdout().flush().ok();
             continue;
         }
         if matches!(line, "quit" | "q" | "exit") {
@@ -460,6 +634,8 @@ pub fn run(store_dir: Option<String>) -> Result<(), String> {
             return Ok(());
         }
         print_lines(game.execute(line)?);
+        print!("\n> ");
+        io::stdout().flush().ok();
     }
 }
 
@@ -467,478 +643,6 @@ fn print_lines(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
     }
-}
-
-// ===========================================================================
-// Initial conditions and finite rules
-// ===========================================================================
-
-fn seed_world(store: &EntStore, r: Rels) -> Result<(), String> {
-    if live_entity_text(store, r.named, PLAYER).is_some() {
-        return Ok(());
-    }
-
-    let e = Value::Ent;
-    let text = Value::text;
-    let mut facts: Vec<(RelId, Tuple, Diff)> = Vec::new();
-    let mut put = |rel: RelId, tuple: Tuple| facts.push((rel, tuple, 1));
-
-    for (entity, name, description) in [
-        (PLAYER, "you", "Your reflection seems half a beat late."),
-        (
-            EAST_GATE,
-            "East Gate",
-            "A rusted arch announces Kasumi Shotengai beneath a roof of cloudy panels.",
-        ),
-        (
-            ARCADE,
-            "Central Arcade",
-            "Most shutters are down, but warm rectangles of light survive between them.",
-        ),
-        (
-            KISSATEN,
-            "Tsukikage Kissaten",
-            "Dark wood, cooling coffee, and a card table polished by decades of hands.",
-        ),
-        (
-            REPAIR_SHOP,
-            "Hoshino Repair",
-            "Radios, fans, and clocks wait in careful rows for one more life.",
-        ),
-        (
-            SENTO,
-            "Kasumi Sento",
-            "Steam rolls through the tiled entryway. The bath restores exhausted wanderers.",
-        ),
-        (
-            COOPERATIVE,
-            "Cooperative Office",
-            "Ledgers fill the walls. An old time clock offers work that feels like fate.",
-        ),
-        (
-            SHRINE_ALLEY,
-            "Shrine Alley",
-            "A narrow lane bends around a pocket shrine and disappears under red lanterns.",
-        ),
-        (
-            CINEMA,
-            "Shuttered Cinema",
-            "Film posters bleach behind glass. A freight lift waits behind the ticket booth.",
-        ),
-        (
-            ROOFTOP,
-            "Rooftop PA Room",
-            "Dusty speakers and a switchboard listen to every change below.",
-        ),
-        (
-            RED_UMBRELLA,
-            "red umbrella",
-            "Its paper is dry although rain ticks against the roof.",
-        ),
-        (
-            BRASS_TOKEN,
-            "brass token",
-            "A shopping-street token stamped with a shop that no longer exists.",
-        ),
-        (
-            OLD_RADIO,
-            "old radio",
-            "The dial glows at a station between stations.",
-        ),
-        (
-            TEA_TIN,
-            "tea tin",
-            "A dented tin fragrant with roasted tea.",
-        ),
-        (
-            CAT,
-            "Mugi",
-            "A patched calico cat who knows every unlocked door.",
-        ),
-        (
-            PROPRIETOR,
-            "Sachiko",
-            "The kissaten proprietor watches the arcade through rising steam.",
-        ),
-        (
-            REPAIRER,
-            "Daichi",
-            "A repairer with a pencil behind one ear and burn marks on both hands.",
-        ),
-        (
-            CARETAKER,
-            "Reiko",
-            "The cooperative caretaker keeps keys whose locks have been forgotten.",
-        ),
-    ] {
-        put(r.named, Tuple::from([e(entity), text(name)]));
-        put(r.described, Tuple::from([e(entity), text(description)]));
-    }
-
-    for (thing, room) in [
-        (PLAYER, EAST_GATE),
-        (RED_UMBRELLA, EAST_GATE),
-        (BRASS_TOKEN, ARCADE),
-        (OLD_RADIO, REPAIR_SHOP),
-        (TEA_TIN, KISSATEN),
-        (CAT, EAST_GATE),
-        (PROPRIETOR, KISSATEN),
-        (REPAIRER, REPAIR_SHOP),
-        (CARETAKER, COOPERATIVE),
-    ] {
-        put(r.located, Tuple::from([e(thing), e(room)]));
-    }
-
-    for (who, public) in [
-        (CAT, "a calico cat"),
-        (PROPRIETOR, "the kissaten proprietor"),
-        (REPAIRER, "a radio repairer"),
-        (CARETAKER, "the cooperative caretaker"),
-    ] {
-        put(r.person, Tuple::from([e(who)]));
-        put(r.label, Tuple::from([e(who), text(public)]));
-    }
-    put(r.knows, Tuple::from([e(PLAYER), e(PLAYER)]));
-    put(r.players, Tuple::from([e(PLAYER), text("you")]));
-
-    for (thing, coins) in [
-        (RED_UMBRELLA, 6),
-        (BRASS_TOKEN, 10),
-        (OLD_RADIO, 18),
-        (TEA_TIN, 4),
-    ] {
-        put(r.value, Tuple::from([e(thing), Value::Int(coins)]));
-    }
-
-    for (from, way, to) in [
-        (EAST_GATE, "north", ARCADE),
-        (ARCADE, "south", EAST_GATE),
-        (ARCADE, "east", KISSATEN),
-        (KISSATEN, "west", ARCADE),
-        (ARCADE, "west", REPAIR_SHOP),
-        (REPAIR_SHOP, "east", ARCADE),
-        (REPAIR_SHOP, "west", SENTO),
-        (SENTO, "east", REPAIR_SHOP),
-        (ARCADE, "north", COOPERATIVE),
-        (COOPERATIVE, "south", ARCADE),
-        (COOPERATIVE, "east", SHRINE_ALLEY),
-        (SHRINE_ALLEY, "west", COOPERATIVE),
-        (COOPERATIVE, "west", CINEMA),
-        (CINEMA, "east", COOPERATIVE),
-        (KISSATEN, "up", ROOFTOP),
-        (ROOFTOP, "down", KISSATEN),
-    ] {
-        put(r.exits, Tuple::from([e(from), text(way), e(to)]));
-    }
-    for (from, to) in PATROL {
-        put(r.patrol, Tuple::from([e(from), e(to)]));
-    }
-    put(r.job_clock, Tuple::from([e(COOPERATIVE)]));
-
-    let jobs = [
-        (COURIER, "courier", "Courier", QUICK_STEP, "quick step"),
-        (COOK, "cook", "Cook", SEARING_PAN, "searing pan"),
-        (REPAIRER_JOB, "repairer", "Repairer", LIVE_WIRE, "live wire"),
-        (
-            SHRINE_ATTENDANT,
-            "shrine attendant",
-            "Shrine Attendant",
-            PAPER_WARD,
-            "paper ward",
-        ),
-        (
-            NIGHT_WATCH,
-            "night watch",
-            "Night Watch",
-            LANTERN_WALL,
-            "lantern wall",
-        ),
-    ];
-    for (job, job_key, job_name, ability, ability_name) in jobs {
-        put(r.job, Tuple::from([e(job), text(job_key)]));
-        put(r.ability, Tuple::from([e(ability), text(ability_name)]));
-        put(r.named, Tuple::from([e(job), text(job_name)]));
-        put(r.named, Tuple::from([e(ability), text(ability_name)]));
-        put(r.job_rank, Tuple::from([e(PLAYER), e(job), Value::Int(1)]));
-        put(
-            r.job_points,
-            Tuple::from([e(PLAYER), e(job), Value::Int(0)]),
-        );
-        put(
-            r.ability_rank,
-            Tuple::from([e(PLAYER), e(ability), Value::Int(1)]),
-        );
-    }
-    put(r.active_job, Tuple::from([e(PLAYER), e(COURIER)]));
-    put(r.hp, Tuple::from([e(PLAYER), Value::Int(20)]));
-
-    put(
-        r.session_branch,
-        Tuple::from([e(PLAYER), Value::Int(Dag::ROOT as i64)]),
-    );
-    put(r.echo_depth, Tuple::from([e(WORLD), Value::Int(0)]));
-    put(r.instance_counter, Tuple::from([e(PLAYER), Value::Int(0)]));
-    put(
-        r.rng_state,
-        Tuple::from([e(WORLD), Value::Int(0x1_2345_6789)]),
-    );
-
-    seed_dungeon_template(r, &mut put);
-
-    store
-        .commit(&facts)
-        .map_err(|e| format!("seed shotengai world: {e:?}"))?;
-    Ok(())
-}
-
-fn seed_dungeon_template(r: Rels, put: &mut impl FnMut(RelId, Tuple)) {
-    let e = Value::Ent;
-    let text = Value::text;
-    for (entity, name, description) in [
-        (
-            DUNGEON_ENTRY,
-            "Basement Landing",
-            "The lift doors close on a corridor much longer than the cinema above.",
-        ),
-        (
-            FLOODED_STORE,
-            "Flooded Storage",
-            "Black water reflects price cards hanging from a ceiling that cannot be seen.",
-        ),
-        (
-            FORGOTTEN_ARCADE,
-            "Forgotten Arcade",
-            "Shop fronts repeat into darkness, stocked with memories instead of goods.",
-        ),
-        (
-            MANNEQUIN_STOCKROOM,
-            "Mannequin Stockroom",
-            "Headless figures turn a fraction toward you whenever the lights flicker.",
-        ),
-        (
-            LEDGER_VAULT,
-            "Ledger Vault",
-            "Every purchase the shotengai forgot is written in books chained to the floor.",
-        ),
-        (
-            MIRROR_CHAMBER,
-            "Mirror Chamber",
-            "A standing mirror contains the arcade in impossible, perfect detail.",
-        ),
-        (
-            RECEIPT_MOTH,
-            "receipt moth",
-            "A moth folded from thermal paper, trailing itemized dust.",
-        ),
-        (
-            SHUTTER_MAW,
-            "shutter maw",
-            "A corrugated shop shutter that opens only to reveal teeth.",
-        ),
-        (
-            LAST_CUSTOMER,
-            "last customer",
-            "A mannequin carrying every bag and wearing no face.",
-        ),
-        (
-            MANNEQUIN_SHELL,
-            "mannequin shell",
-            "A hollow display figure animated by the scrape of coat hangers.",
-        ),
-        (
-            DUNGEON_COIN,
-            "square coin",
-            "A coin with four edges and five shadows.",
-        ),
-        (
-            RED_THREAD,
-            "red thread",
-            "It pulls gently toward another version of your hand.",
-        ),
-        (
-            COPYING_MIRROR,
-            "copying mirror",
-            "Its reflection continues even when you stand still.",
-        ),
-    ] {
-        put(r.named, Tuple::from([e(entity), text(name)]));
-        put(r.described, Tuple::from([e(entity), text(description)]));
-    }
-    for (thing, room) in [
-        (RECEIPT_MOTH, FLOODED_STORE),
-        (SHUTTER_MAW, FORGOTTEN_ARCADE),
-        (MANNEQUIN_SHELL, MANNEQUIN_STOCKROOM),
-        (LAST_CUSTOMER, LEDGER_VAULT),
-        (DUNGEON_COIN, FLOODED_STORE),
-        (RED_THREAD, FORGOTTEN_ARCADE),
-        (COPYING_MIRROR, MIRROR_CHAMBER),
-    ] {
-        put(r.located, Tuple::from([e(thing), e(room)]));
-    }
-    for (from, way, to) in [
-        (DUNGEON_ENTRY, "north", FLOODED_STORE),
-        (FLOODED_STORE, "south", DUNGEON_ENTRY),
-        (FLOODED_STORE, "north", FORGOTTEN_ARCADE),
-        (FORGOTTEN_ARCADE, "south", FLOODED_STORE),
-        (FORGOTTEN_ARCADE, "north", MANNEQUIN_STOCKROOM),
-        (MANNEQUIN_STOCKROOM, "south", FORGOTTEN_ARCADE),
-        (MANNEQUIN_STOCKROOM, "north", LEDGER_VAULT),
-        (LEDGER_VAULT, "south", MANNEQUIN_STOCKROOM),
-    ] {
-        put(r.exits, Tuple::from([e(from), text(way), e(to)]));
-    }
-    for (monster, hp, guard, power, reward) in [
-        (RECEIPT_MOTH, 8, 1, 3, 1),
-        (SHUTTER_MAW, 13, 3, 5, 1),
-        (MANNEQUIN_SHELL, 16, 4, 6, 1),
-        (LAST_CUSTOMER, 22, 5, 7, 1),
-    ] {
-        put(r.monster, Tuple::from([e(monster)]));
-        put(r.hp, Tuple::from([e(monster), Value::Int(hp)]));
-        put(r.defense, Tuple::from([e(monster), Value::Int(guard)]));
-        put(
-            r.monster_power,
-            Tuple::from([e(monster), Value::Int(power)]),
-        );
-        put(
-            r.monster_reward,
-            Tuple::from([e(monster), Value::Int(reward)]),
-        );
-    }
-    put(r.value, Tuple::from([e(DUNGEON_COIN), Value::Int(25)]));
-    put(r.value, Tuple::from([e(RED_THREAD), Value::Int(12)]));
-}
-
-fn seed_rule_tables(store: &EntStore, r: Rels) -> Result<(), String> {
-    if !store
-        .read_at(r.attack_result, store.current())
-        .map_err(err)?
-        .is_empty()
-    {
-        return Ok(());
-    }
-    let i = Value::Int;
-    let e = Value::Ent;
-    let mut facts: Vec<(RelId, Tuple, Diff)> = Vec::new();
-
-    // Every attack used by the initial content is a lookup in this finite table.
-    for power in 0..=14i64 {
-        for guard in 0..=8i64 {
-            for old_hp in 0..=40i64 {
-                let damage = (power - guard / 2).max(1);
-                let new_hp = (old_hp - damage).max(0);
-                let outcome = if new_hp == 0 { "defeated" } else { "standing" };
-                facts.push((
-                    r.attack_result,
-                    Tuple::from([
-                        i(power),
-                        i(guard),
-                        i(old_hp),
-                        i(new_hp),
-                        Value::text(outcome),
-                    ]),
-                    1,
-                ));
-            }
-        }
-    }
-
-    let job_defs = [
-        (COURIER, QUICK_STEP, (4, 2, 20)),
-        (COOK, SEARING_PAN, (3, 3, 24)),
-        (REPAIRER_JOB, LIVE_WIRE, (3, 5, 28)),
-        (SHRINE_ATTENDANT, PAPER_WARD, (5, 1, 18)),
-        (NIGHT_WATCH, LANTERN_WALL, (2, 6, 30)),
-    ];
-    for (job, ability, (base_power, base_guard, base_hp)) in job_defs {
-        for rank in 1..=3i64 {
-            facts.push((
-                r.job_stats,
-                Tuple::from([
-                    e(job),
-                    i(rank),
-                    i(base_power + rank - 1),
-                    i(base_guard + rank - 1),
-                    i(base_hp + 2 * (rank - 1)),
-                ]),
-                1,
-            ));
-        }
-        for (old_rank, old_points, new_rank, new_points, old_ar, new_ar) in [
-            (1, 0, 1, 1, 1, 1),
-            (1, 1, 2, 0, 1, 2),
-            (2, 0, 2, 1, 2, 2),
-            (2, 1, 3, 0, 2, 3),
-            (3, 0, 3, 0, 3, 3),
-        ] {
-            facts.push((
-                r.job_progression,
-                Tuple::from([
-                    e(job),
-                    i(old_rank),
-                    i(old_points),
-                    i(1),
-                    i(new_rank),
-                    i(new_points),
-                    e(ability),
-                    i(old_ar),
-                    i(new_ar),
-                ]),
-                1,
-            ));
-        }
-    }
-
-    for (ability, powers) in [
-        (QUICK_STEP, [6, 8, 10]),
-        (SEARING_PAN, [5, 9, 12]),
-        (LIVE_WIRE, [7, 10, 13]),
-        (PAPER_WARD, [6, 10, 14]),
-        (LANTERN_WALL, [5, 8, 11]),
-    ] {
-        for (offset, power) in powers.into_iter().enumerate() {
-            facts.push((
-                r.ability_power,
-                Tuple::from([e(ability), i(offset as i64 + 1), i(power)]),
-                1,
-            ));
-        }
-    }
-
-    // Cribbage remains as the relational minigame in the kissaten.
-    for code in 0..52i64 {
-        let rank = code % 13;
-        facts.push((r.cardval, Tuple::from([i(code), i((rank + 1).min(10))]), 1));
-        facts.push((r.cardrank, Tuple::from([i(code), i(rank)]), 1));
-    }
-    for a in 0..5i64 {
-        for b in (a + 1)..5 {
-            facts.push((r.slotpair, Tuple::from([i(a), i(b)]), 1));
-        }
-    }
-    for a in 0..5i64 {
-        for b in (a + 1)..5 {
-            for c in (b + 1)..5 {
-                facts.push((r.slottrio, Tuple::from([i(a), i(b), i(c)]), 1));
-            }
-        }
-    }
-    for a in 1..=10i64 {
-        for b in 1..=10i64 {
-            if a + b == 15 {
-                facts.push((r.sum15two, Tuple::from([i(a), i(b)]), 1));
-            }
-            for c in 1..=10i64 {
-                if a + b + c == 15 {
-                    facts.push((r.sum15three, Tuple::from([i(a), i(b), i(c)]), 1));
-                }
-            }
-        }
-    }
-    store
-        .commit(&facts)
-        .map_err(|e| format!("seed shotengai rules: {e:?}"))?;
-    Ok(())
 }
 
 // ===========================================================================
@@ -964,7 +668,7 @@ impl Game {
             "leave" => self.leave_dungeon(false),
             "activate" => self.activate_mirror(line),
             "branches" | "lineage" => Ok(self.lineage()),
-            "take" | "drop" | "go" | "say" | "greet" | "change" | "attack" | "use" => {
+            "take" | "drop" | "go" | "say" | "greet" | "change" | "attack" | "use" | "omen" => {
                 self.turn(line)
             }
             other => Ok(vec![format!("I don't understand `{other}`. Try `help`.")]),
@@ -1335,6 +1039,7 @@ fn live_int_for(store: &EntStore, rel: RelId, key: Entity, column: usize) -> Opt
     .map(|tuple| int_at(&tuple, column))
 }
 
+#[cfg(test)]
 fn live_entity_text(store: &EntStore, rel: RelId, key: Entity) -> Option<String> {
     live_row(store, rel, |tuple| {
         tuple.as_slice().first() == Some(&Value::Ent(key))
@@ -1342,6 +1047,7 @@ fn live_entity_text(store: &EntStore, rel: RelId, key: Entity) -> Option<String>
     .map(|tuple| text_at(&tuple, 1))
 }
 
+#[cfg(test)]
 fn tokens(line: &str) -> Tuple {
     Tuple::new(line.split_whitespace().map(Value::text).collect::<Vec<_>>())
 }
@@ -1422,17 +1128,11 @@ fn err(error: impl std::fmt::Debug) -> String {
 impl Game {
     fn turn(&mut self, line: &str) -> Result<Vec<String>, String> {
         let before = self.store().current();
-        enqueue_seq(
-            self.store(),
-            self.r.inbox,
-            self.r.inbox_seq,
-            PLAYER,
-            tokens(line),
-        )
-        .map_err(err)?;
-        self.player
-            .run_to_idle(self.store(), self.store())
+        self.ensure_clock_sample()?;
+        self.runtime
+            .enqueue(PLAYER, "inbox", "inbox_seq", line)
             .map_err(err)?;
+        self.drive_actors()?;
 
         let verb = line.split_whitespace().next().unwrap_or("");
         let told = self.drain_tell(before)?;
@@ -1460,15 +1160,78 @@ impl Game {
                     });
                 } else {
                     out.extend(told);
-                    self.resolve_combat(before, &mut out)?;
                 }
             }
             _ if told.is_empty() => out.push("Nothing happens.".into()),
             _ => out.extend(told),
         }
 
-        self.tick_patrol(&mut out)?;
+        if self.read_entity_set(self.r.player_defeat).contains(&PLAYER) {
+            self.store()
+                .commit(&[(self.r.player_defeat, Tuple::from([Value::Ent(PLAYER)]), -1)])
+                .map_err(err)?;
+            out.push("The basement folds shut around you.".into());
+            out.extend(self.leave_dungeon(true)?);
+        }
         self.pump_watch(&mut out)?;
+        Ok(out)
+    }
+
+    fn ensure_clock_sample(&self) -> Result<(), String> {
+        if self
+            .store()
+            .read_at(self.r.clock, self.store().current())
+            .map_err(err)?
+            .into_iter()
+            .all(|(_, weight)| weight <= 0)
+        {
+            self.runtime.record_sample(0, 0).map_err(err)?;
+        }
+        Ok(())
+    }
+
+    fn drive_actors(&self) -> Result<(), String> {
+        match self.runtime.drive_to_idle().map_err(err)?.status {
+            DriveStatus::Idle => Ok(()),
+            DriveStatus::FuelExhausted => {
+                Err("shotengai actor driver exhausted its fuel budget".into())
+            }
+            DriveStatus::ActorFault {
+                actor,
+                sequence,
+                message,
+            } => Err(format!(
+                "shotengai actor {} faulted at inbox sequence {sequence}: {message}",
+                actor.0
+            )),
+        }
+    }
+
+    fn advance_time(&mut self, delta_ms: i64) -> Result<Vec<String>, String> {
+        self.ensure_clock_sample()?;
+        let before_edition = self.store().current();
+        let before_room = self.room_of(CAT);
+        let latest = self
+            .store()
+            .read_at(self.r.clock, self.store().current())
+            .map_err(err)?
+            .into_iter()
+            .filter_map(|(tuple, weight)| match tuple.as_slice() {
+                [Value::Int(seq), Value::Int(ms), Value::Int(_)] if weight > 0 => Some((*seq, *ms)),
+                _ => None,
+            })
+            .max()
+            .map(|(_, ms)| ms)
+            .unwrap_or(0);
+        self.runtime
+            .record_sample(latest.saturating_add(delta_ms), 0)
+            .map_err(err)?;
+        self.drive_actors()?;
+        let after_room = self.room_of(CAT);
+        let mut out = self.drain_tell(before_edition)?;
+        if before_room != after_room {
+            out.push("The cat follows its patrol clock.".into());
+        }
         Ok(out)
     }
 
@@ -1488,35 +1251,6 @@ impl Game {
             }
         }
         Ok(out)
-    }
-
-    fn tick_patrol(&self, out: &mut Vec<String>) -> Result<(), String> {
-        let player_room = self.room_of(PLAYER);
-        let before = self.room_of(CAT);
-        enqueue_seq(
-            self.store(),
-            self.r.inbox,
-            self.r.inbox_seq,
-            CAT,
-            tokens("tick"),
-        )
-        .map_err(err)?;
-        self.patrol
-            .run_to_idle(self.store(), self.store())
-            .map_err(err)?;
-        let after = self.room_of(CAT);
-        let known = self.known_by(PLAYER);
-        let name = if known.contains(&CAT) {
-            self.name_of(CAT)
-        } else {
-            "The cat".into()
-        };
-        if player_room.is_some() && before == player_room && after != player_room {
-            out.push(format!("{name} slips beneath a shutter."));
-        } else if player_room.is_some() && after == player_room && before != player_room {
-            out.push(format!("{name} appears between your feet."));
-        }
-        Ok(())
     }
 
     fn heal_to_job_max(&self) -> Result<(), String> {
@@ -1549,239 +1283,6 @@ impl Game {
             CommitOutcome::Committed(_) => Ok(()),
             CommitOutcome::Rejected => Err("HP changed while changing jobs".into()),
         }
-    }
-
-    fn resolve_combat(&mut self, since: Edition, out: &mut Vec<String>) -> Result<(), String> {
-        let to = self.store().current();
-        let mut events = Vec::new();
-        for update in self
-            .store()
-            .scan_updates(self.r.combat_event, since, to)
-            .map_err(err)?
-        {
-            if update.diff <= 0 || update.tuple.as_slice().first() != Some(&Value::Ent(PLAYER)) {
-                continue;
-            }
-            if let (Some(monster), Some(Value::Text(outcome))) =
-                (entity_at(&update.tuple, 1), update.tuple.as_slice().get(2))
-            {
-                events.push((update.tuple.clone(), monster, outcome.to_string()));
-            }
-        }
-        for (event, monster, outcome) in events {
-            // The event is an edge handoff, not durable combat state. Consume
-            // exactly the positive weight the behavior asserted.
-            self.store()
-                .commit(&[(self.r.combat_event, event, -1)])
-                .map_err(err)?;
-            if outcome == "defeated" {
-                self.award_victory(monster, out)?;
-            } else {
-                let old_hp = self.entity_int(self.r.hp, monster).unwrap_or(0);
-                out.push(format!("{} remains at {old_hp} HP.", self.name_of(monster)));
-                self.counterattack(monster, out)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn award_victory(&mut self, monster: Entity, out: &mut Vec<String>) -> Result<(), String> {
-        if self.read_entity_set(self.r.defeated).contains(&monster) {
-            out.push(format!("{} is already defeated.", self.name_of(monster)));
-            return Ok(());
-        }
-        let reward_row = live_row(self.store(), self.r.monster_reward, |tuple| {
-            tuple.as_slice().first() == Some(&Value::Ent(monster))
-        });
-        let Some(reward_row) = reward_row else {
-            out.push(format!(
-                "{} has no unclaimed reward.",
-                self.name_of(monster)
-            ));
-            return Ok(());
-        };
-        let reward = int_at(&reward_row, 1);
-        let job = self
-            .entity_entity(self.r.active_job, PLAYER)
-            .ok_or_else(|| "player has no active job".to_string())?;
-        let rank = self
-            .keyed_int(self.r.job_rank, PLAYER, job, 2)
-            .ok_or_else(|| "active job has no rank".to_string())?;
-        let points = self
-            .keyed_int(self.r.job_points, PLAYER, job, 2)
-            .ok_or_else(|| "active job has no point row".to_string())?;
-        let progression = live_row(self.store(), self.r.job_progression, |tuple| {
-            tuple.as_slice().first() == Some(&Value::Ent(job))
-                && tuple.as_slice().get(1) == Some(&Value::Int(rank))
-                && tuple.as_slice().get(2) == Some(&Value::Int(points))
-                && tuple.as_slice().get(3) == Some(&Value::Int(reward))
-        })
-        .ok_or_else(|| {
-            format!("no progression rule for rank {rank}, points {points}, reward {reward}")
-        })?;
-        let new_rank = int_at(&progression, 4);
-        let new_points = int_at(&progression, 5);
-        let ability =
-            entity_at(&progression, 6).ok_or_else(|| "progression has no ability".to_string())?;
-        let old_ability_rank = int_at(&progression, 7);
-        let new_ability_rank = int_at(&progression, 8);
-
-        let job_rank_old = Fact::new(
-            self.r.job_rank,
-            Tuple::from([Value::Ent(PLAYER), Value::Ent(job), Value::Int(rank)]),
-        );
-        let job_points_old = Fact::new(
-            self.r.job_points,
-            Tuple::from([Value::Ent(PLAYER), Value::Ent(job), Value::Int(points)]),
-        );
-        let ability_old = Fact::new(
-            self.r.ability_rank,
-            Tuple::from([
-                Value::Ent(PLAYER),
-                Value::Ent(ability),
-                Value::Int(old_ability_rank),
-            ]),
-        );
-        let monster_zero = Fact::new(self.r.hp, Tuple::from([Value::Ent(monster), Value::Int(0)]));
-        let reward_claim = Fact::new(self.r.monster_reward, reward_row);
-        let mut patch = Patch::new()
-            .expect(monster_zero)
-            .expect(reward_claim.clone())
-            .expect(job_rank_old.clone())
-            .expect(job_points_old.clone())
-            .expect(ability_old.clone())
-            .retract(job_rank_old)
-            .retract(job_points_old)
-            .retract(ability_old)
-            .retract(reward_claim)
-            .assert(Fact::new(
-                self.r.job_rank,
-                Tuple::from([Value::Ent(PLAYER), Value::Ent(job), Value::Int(new_rank)]),
-            ))
-            .assert(Fact::new(
-                self.r.job_points,
-                Tuple::from([Value::Ent(PLAYER), Value::Ent(job), Value::Int(new_points)]),
-            ))
-            .assert(Fact::new(
-                self.r.ability_rank,
-                Tuple::from([
-                    Value::Ent(PLAYER),
-                    Value::Ent(ability),
-                    Value::Int(new_ability_rank),
-                ]),
-            ))
-            .assert(Fact::new(
-                self.r.defeated,
-                Tuple::from([Value::Ent(monster)]),
-            ));
-
-        if let Some((shift, _)) = self.instance_info() {
-            if monster == shifted(LAST_CUSTOMER, shift) {
-                let vault = shifted(LEDGER_VAULT, shift);
-                let chamber = shifted(MIRROR_CHAMBER, shift);
-                patch = patch
-                    .assert(Fact::new(
-                        self.r.exits,
-                        Tuple::from([Value::Ent(vault), Value::text("east"), Value::Ent(chamber)]),
-                    ))
-                    .assert(Fact::new(
-                        self.r.exits,
-                        Tuple::from([Value::Ent(chamber), Value::text("west"), Value::Ent(vault)]),
-                    ));
-            }
-        }
-
-        match commit_patch(
-            self.store(),
-            self.store(),
-            &patch,
-            &coordinator_authority(self.r),
-        )
-        .map_err(err)?
-        {
-            CommitOutcome::Rejected => {
-                out.push("The victory was claimed by another turn first.".into());
-                return Ok(());
-            }
-            CommitOutcome::Committed(_) => {}
-        }
-        out.push(format!(
-            "{} collapses. +{reward} job point.",
-            self.name_of(monster)
-        ));
-        if new_rank > rank {
-            out.push(format!(
-                "Your {} job reaches rank {new_rank}; {} rises to rank {new_ability_rank}.",
-                self.name_of(job),
-                self.name_of(ability)
-            ));
-            self.heal_to_job_max()?;
-        }
-        if monster == self.shifted_boss() {
-            out.push(
-                "The chained ledgers open. An east passage appears where the wall was.".into(),
-            );
-        }
-        Ok(())
-    }
-
-    fn counterattack(&mut self, monster: Entity, out: &mut Vec<String>) -> Result<(), String> {
-        let power = self.entity_int(self.r.monster_power, monster).unwrap_or(1);
-        let (_, _, _, _, _, guard, _) = self
-            .current_job()
-            .ok_or_else(|| "player has no combat stats".to_string())?;
-        let old_hp = self.entity_int(self.r.hp, PLAYER).unwrap_or(0);
-        let result = self
-            .attack_result(power, guard, old_hp)
-            .ok_or_else(|| format!("no counterattack rule for {power}/{guard}/{old_hp}"))?;
-        let (new_hp, outcome) = result;
-        let old = Fact::new(
-            self.r.hp,
-            Tuple::from([Value::Ent(PLAYER), Value::Int(old_hp)]),
-        );
-        let patch = Patch::new()
-            .expect(old.clone())
-            .retract(old)
-            .assert(Fact::new(
-                self.r.hp,
-                Tuple::from([Value::Ent(PLAYER), Value::Int(new_hp)]),
-            ));
-        if matches!(
-            commit_patch(
-                self.store(),
-                self.store(),
-                &patch,
-                &coordinator_authority(self.r)
-            )
-            .map_err(err)?,
-            CommitOutcome::Rejected
-        ) {
-            return Err("player HP changed during counterattack".into());
-        }
-        out.push(format!(
-            "{} strikes back. Your HP falls to {new_hp}.",
-            self.name_of(monster)
-        ));
-        if outcome == "defeated" {
-            out.push("The basement folds shut around you.".into());
-            out.extend(self.leave_dungeon(true)?);
-        }
-        Ok(())
-    }
-
-    fn attack_result(&self, power: i64, guard: i64, old_hp: i64) -> Option<(i64, String)> {
-        live_row(self.store(), self.r.attack_result, |tuple| {
-            tuple.as_slice().first() == Some(&Value::Int(power))
-                && tuple.as_slice().get(1) == Some(&Value::Int(guard))
-                && tuple.as_slice().get(2) == Some(&Value::Int(old_hp))
-        })
-        .map(|tuple| (int_at(&tuple, 3), text_at(&tuple, 4)))
-    }
-
-    fn shifted_boss(&self) -> Entity {
-        self.instance_info()
-            .map(|(shift, _)| shifted(LAST_CUSTOMER, shift))
-            .unwrap_or(LAST_CUSTOMER)
     }
 
     fn deal(&mut self) -> Result<Vec<String>, String> {
@@ -2223,6 +1724,7 @@ impl Game {
             .ok_or_else(|| "the echo marker changed during the fork".to_string())?;
         let child_branch = child.branch_id();
         self.family.route_to(child, self.r)?;
+        self.rebind_runtime()?;
         // The canopy registration is branch-local. The durable cursor was
         // copied, but the player opts back into the new branch's live feed.
         self.watch = None;
@@ -2338,9 +1840,21 @@ mod tests {
         let (_dir, mut game) = fresh_game();
         assert!(game.look().join("\n").contains("East Gate"));
         assert!(game.look().join("\n").contains("a calico cat"));
+        let cat_before_command = game.room_of(CAT);
         let greeting = run(&mut game, "greet cat").join("\n");
         assert!(greeting.contains("Mugi"));
-        assert!(greeting.contains("slips beneath a shutter"), "{greeting}");
+        assert_eq!(
+            game.room_of(CAT),
+            cat_before_command,
+            "player input must no longer inject a patrol tick"
+        );
+        let clock_output = game.advance_time(1_000).unwrap().join("\n");
+        assert_ne!(
+            game.room_of(CAT),
+            cat_before_command,
+            "committed time must move the cat without another player command"
+        );
+        assert!(clock_output.contains("patrol clock"), "{clock_output}");
         assert!(run(&mut game, "take umbrella").join("\n").contains("Taken"));
         assert!(game.inventory().join("\n").contains("red umbrella"));
         assert!(run(&mut game, "say hello").join("\n").contains("hello"));
@@ -2367,6 +1881,28 @@ mod tests {
         assert!(cards.look().join("\n").contains("live report"));
         assert!(cards.treasure().join("\n").contains("sum aggregate"));
         assert!(cards.who().join("\n").contains("branch 0"));
+    }
+
+    #[test]
+    fn package_reopen_is_an_edition_preserving_noop_and_omen_uses_committed_rng() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut game = Game::open(dir.path()).unwrap();
+        let installed = game.store().current();
+        assert_eq!(installed, Edition(1));
+        let old_state = game.entity_int(game.r.rng_state, WORLD).unwrap();
+        let output = run(&mut game, "omen").join("\n");
+        assert!(output.contains("arcade"), "{output}");
+        let successor = game.entity_int(game.r.rng_state, WORLD).unwrap();
+        assert_ne!(successor, old_state);
+        let after_omen = game.store().current();
+        drop(game);
+
+        let reopened = Game::open(dir.path()).unwrap();
+        assert_eq!(reopened.store().current(), after_omen);
+        assert_eq!(
+            reopened.entity_int(reopened.r.rng_state, WORLD),
+            Some(successor)
+        );
     }
 
     #[test]
@@ -2401,9 +1937,17 @@ mod tests {
             Some(1)
         );
         run(&mut game, "go north");
-        run(&mut game, "use live");
-        run(&mut game, "use live");
-        run(&mut game, "use live");
+        let mut shutter_transcript = Vec::new();
+        shutter_transcript.extend(run(&mut game, "use live"));
+        shutter_transcript.extend(run(&mut game, "use live"));
+        shutter_transcript.extend(run(&mut game, "use live"));
+        let shutter = shifted(SHUTTER_MAW, game.instance_info().unwrap().0);
+        assert_eq!(
+            game.entity_int(game.r.monster_reward, shutter),
+            None,
+            "three live-wire uses must claim the shutter maw reward; hp={:?}; transcript={shutter_transcript:?}",
+            game.entity_int(game.r.hp, shutter)
+        );
         assert_eq!(
             game.keyed_int(game.r.job_rank, PLAYER, REPAIRER_JOB, 2),
             Some(2)
@@ -2464,8 +2008,12 @@ mod tests {
             .unwrap();
         let at = game.store().current();
         let snapshot = Snapshot::new(game.store(), at);
-        let behavior_a = Program::behavior(&game.program, "inbox", PLAYER).unwrap();
-        let behavior_b = Program::behavior(&game.program, "inbox", PLAYER).unwrap();
+        let behavior_a =
+            Program::behavior_with_grants(&game.program, "inbox", PLAYER, Arc::clone(&game.grants))
+                .unwrap();
+        let behavior_b =
+            Program::behavior_with_grants(&game.program, "inbox", PLAYER, Arc::clone(&game.grants))
+                .unwrap();
         let patch_a = behavior_a(&snapshot, &tokens("attack moth")).unwrap();
         let patch_b = behavior_b(&snapshot, &tokens("attack moth")).unwrap();
         let first = commit_patch(
@@ -2486,6 +2034,135 @@ mod tests {
         assert_eq!(second, CommitOutcome::Rejected);
         let monster = shifted(RECEIPT_MOTH, game.instance_info().unwrap().0);
         assert_eq!(game.entity_int(game.r.hp, monster), Some(before_hp - 4));
+    }
+
+    #[test]
+    fn racing_victory_claims_award_the_reward_exactly_once() {
+        let (_dir, mut game) = fresh_game();
+        go_to_cinema(&mut game);
+        run(&mut game, "enter basement");
+        run(&mut game, "go north");
+        let monster = shifted(RECEIPT_MOTH, game.instance_info().unwrap().0);
+        let old_hp = game.entity_int(game.r.hp, monster).unwrap();
+        game.store()
+            .commit(&[
+                (
+                    game.r.hp,
+                    Tuple::from([Value::Ent(monster), Value::Int(old_hp)]),
+                    -1,
+                ),
+                (
+                    game.r.hp,
+                    Tuple::from([Value::Ent(monster), Value::Int(0)]),
+                    1,
+                ),
+                (
+                    game.r.combat_event,
+                    Tuple::from([
+                        Value::Ent(PLAYER),
+                        Value::Ent(monster),
+                        Value::text("defeated"),
+                    ]),
+                    1,
+                ),
+            ])
+            .unwrap();
+
+        let snapshot = Snapshot::at_current(game.store());
+        let behavior_a = Program::behavior_with_grants(
+            &game.program,
+            "combat_inbox",
+            COMBAT,
+            Arc::clone(&game.grants),
+        )
+        .unwrap();
+        let behavior_b = Program::behavior_with_grants(
+            &game.program,
+            "combat_inbox",
+            COMBAT,
+            Arc::clone(&game.grants),
+        )
+        .unwrap();
+        let patch_a = behavior_a(&snapshot, &tokens("combat-step")).unwrap();
+        let patch_b = behavior_b(&snapshot, &tokens("combat-step")).unwrap();
+        drop(snapshot);
+
+        let first = commit_patch(
+            game.store(),
+            game.store(),
+            &patch_a,
+            &combat_authority(game.r),
+        )
+        .unwrap();
+        let second = commit_patch(
+            game.store(),
+            game.store(),
+            &patch_b,
+            &combat_authority(game.r),
+        )
+        .unwrap();
+        assert!(matches!(first, CommitOutcome::Committed(_)));
+        assert_eq!(second, CommitOutcome::Rejected);
+        assert_eq!(game.entity_int(game.r.monster_reward, monster), None);
+        assert_eq!(
+            game.keyed_int(game.r.job_points, PLAYER, COURIER, 2),
+            Some(1)
+        );
+        assert_eq!(
+            game.store()
+                .read_at(game.r.combat_claimed, game.store().current())
+                .unwrap()
+                .into_iter()
+                .find(|(tuple, diff)| {
+                    *diff > 0 && tuple.as_slice() == [Value::Ent(monster), Value::Bool(true)]
+                })
+                .map(|(_, diff)| diff),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn combat_timer_survives_reopen_before_actor_attention() {
+        let (dir, mut game) = fresh_game();
+        go_to_cinema(&mut game);
+        run(&mut game, "enter basement");
+        run(&mut game, "go north");
+        let player_hp = game.entity_int(game.r.hp, PLAYER).unwrap();
+        let snapshot = Snapshot::at_current(game.store());
+        let behavior =
+            Program::behavior_with_grants(&game.program, "inbox", PLAYER, Arc::clone(&game.grants))
+                .unwrap();
+        let patch = behavior(&snapshot, &tokens("attack moth")).unwrap();
+        drop(snapshot);
+        assert!(matches!(
+            commit_patch(
+                game.store(),
+                game.store(),
+                &patch,
+                &player_authority(game.r)
+            )
+            .unwrap(),
+            CommitOutcome::Committed(_)
+        ));
+        let fired = game
+            .runtime
+            .drive_with_fuel(std::num::NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!((fired.timers_fired, fired.actor_steps), (1, 0));
+        drop(game);
+
+        let reopened = Game::open(dir.path()).unwrap();
+        reopened.drive_actors().unwrap();
+        assert!(reopened
+            .store()
+            .read_at(reopened.r.combat_event, reopened.store().current())
+            .unwrap()
+            .into_iter()
+            .all(|(_, weight)| weight <= 0));
+        assert!(
+            reopened.entity_int(reopened.r.hp, PLAYER).unwrap() < player_hp,
+            "the pending combat message must counterattack exactly once after reopen"
+        );
     }
 
     #[test]

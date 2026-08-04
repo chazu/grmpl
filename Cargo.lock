@@ -1076,6 +1076,7 @@ dependencies = [
  "grmpl-lang",
  "grmpl-pattern",
  "grmpl-proc",
+ "grmpl-type",
  "tempfile",
 ]
 
@@ -1146,6 +1147,7 @@ dependencies = [
  "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
+ "grmpl-ent",
  "grmpl-pattern",
  "grmpl-proc",
  "tempfile",

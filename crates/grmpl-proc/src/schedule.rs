@@ -25,9 +25,7 @@
 //!    "current time" or "random roll") reads the sample back from the trace, so
 //!    replaying the trace reproduces identical results.
 
-use grmpl_core::{
-    Authority, Entity, Fact, Patch, RelId, Result, Scheduled, Tuple, Value,
-};
+use grmpl_core::{Authority, Entity, Fact, Patch, RelId, Result, Scheduled, Tuple, Value};
 
 use crate::commit::{commit_patch, CommitOutcome};
 use crate::process::inbox_fact;
@@ -49,12 +47,16 @@ pub fn timer_row(s: &Scheduled) -> Tuple {
 }
 
 /// Decode a timer row into `(due, inbox, target, body)`.
-fn decode_timer_row(t: &Tuple) -> Option<(i64, RelId, Entity, Tuple)> {
+fn decode_timer_row(t: &Tuple) -> Result<(i64, RelId, Entity, Tuple)> {
     match t.as_slice() {
-        [Value::Int(due), Value::Int(inbox), Value::Ent(target), Value::Tuple(body)] => {
-            Some((*due, RelId(*inbox as u32), *target, Tuple(body.clone())))
+        [Value::Int(due), Value::Int(inbox), Value::Ent(target), Value::Tuple(body)]
+            if (0..=u32::MAX as i64).contains(inbox) =>
+        {
+            Ok((*due, RelId(*inbox as u32), *target, Tuple(body.clone())))
         }
-        _ => None,
+        _ => Err(grmpl_core::Error::Codec(format!(
+            "malformed timer row: {t:?}"
+        ))),
     }
 }
 
@@ -101,11 +103,21 @@ impl SeqAlloc {
                 }
             }
         }
-        SeqAlloc { rel, key, start, present, n: 0 }
+        SeqAlloc {
+            rel,
+            key,
+            start,
+            present,
+            n: 0,
+        }
     }
 
     /// Build from the store's current edition, keyed by `key`.
-    pub fn read(store: &dyn grmpl_core::TraceStore, rel: RelId, key: Vec<Value>) -> Result<SeqAlloc> {
+    pub fn read(
+        store: &dyn grmpl_core::TraceStore,
+        rel: RelId,
+        key: Vec<Value>,
+    ) -> Result<SeqAlloc> {
         let at = store.current();
         Ok(SeqAlloc::from_rows(rel, key, store.read_at(rel, at)?))
     }
@@ -184,7 +196,7 @@ impl SeqAlloc {
 /// Fires timers whose simulation-time due point has been reached.
 ///
 /// Bound to the durable timer relation `timers` (where [`Scheduled`] entries
-/// land) and the seq-counter relation `seqs` (per `(inbox, target)` inbox
+/// land) and the seq-counter relation `seqs` (per-target inbox
 /// ordering). [`fire_due`](Self::fire_due) delivers every due timer exactly
 /// once.
 pub struct Scheduler {
@@ -195,12 +207,16 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(timers: RelId, seqs: RelId, authority: Authority) -> Scheduler {
-        Scheduler { timers, seqs, authority }
+        Scheduler {
+            timers,
+            seqs,
+            authority,
+        }
     }
 
-    /// The seq-counter key for an `(inbox, target)` pair.
-    fn seq_key(inbox: RelId, target: Entity) -> Vec<Value> {
-        vec![Value::Int(inbox.0 as i64), Value::Ent(target)]
+    /// The canonical seq-counter key for an actor inbox.
+    fn seq_key(target: Entity) -> Vec<Value> {
+        vec![Value::Ent(target)]
     }
 
     /// Is `row` still a live (positive-weight) timer at the current edition?
@@ -226,12 +242,16 @@ impl Scheduler {
         now: i64,
     ) -> Result<usize> {
         let at = store.current();
-        let mut due: Vec<Tuple> = store
-            .read_at(self.timers, at)?
-            .into_iter()
-            .filter(|(t, d)| *d > 0 && decode_timer_row(t).is_some_and(|(due, ..)| due <= now))
-            .map(|(t, _)| t)
-            .collect();
+        let mut due = Vec::new();
+        for (row, weight) in store.read_at(self.timers, at)? {
+            if weight <= 0 {
+                continue;
+            }
+            let (at, ..) = decode_timer_row(&row)?;
+            if at <= now {
+                due.push(row);
+            }
+        }
         due.sort();
 
         let mut fired = 0;
@@ -252,10 +272,7 @@ impl Scheduler {
         schemas: &dyn grmpl_core::SchemaCatalog,
         row: &Tuple,
     ) -> Result<bool> {
-        let (_, inbox, target, body) = match decode_timer_row(row) {
-            Some(t) => t,
-            None => return Ok(false), // not a timer row we understand; leave it
-        };
+        let (_, inbox, target, body) = decode_timer_row(row)?;
         let timer = Fact::new(self.timers, row.clone());
 
         for _ in 0..64 {
@@ -264,7 +281,7 @@ impl Scheduler {
             if !self.timer_live(store, row)? {
                 return Ok(false);
             }
-            let mut alloc = SeqAlloc::read(store, self.seqs, Self::seq_key(inbox, target))?;
+            let mut alloc = SeqAlloc::read(store, self.seqs, Self::seq_key(target))?;
             let seq = alloc.fresh();
             let patch = Patch::new()
                 .expect(timer.clone())
@@ -281,6 +298,43 @@ impl Scheduler {
         // Contention did not settle within the cap; a later tick retries.
         Ok(false)
     }
+
+    /// Fire at most the least live timer due at `now`.
+    pub fn fire_next_due(
+        &self,
+        store: &dyn grmpl_core::TraceStore,
+        schemas: &dyn grmpl_core::SchemaCatalog,
+        now: i64,
+    ) -> Result<FireNextOutcome> {
+        let at = store.current();
+        let mut due = Vec::new();
+        for (row, weight) in store.read_at(self.timers, at)? {
+            if weight <= 0 {
+                continue;
+            }
+            let (at, ..) = decode_timer_row(&row)?;
+            if at <= now {
+                due.push(row);
+            }
+        }
+        due.sort();
+        let Some(row) = due.first() else {
+            return Ok(FireNextOutcome::NoneDue);
+        };
+        if self.fire_one(store, schemas, row)? {
+            Ok(FireNextOutcome::Fired)
+        } else {
+            Ok(FireNextOutcome::Contended)
+        }
+    }
+}
+
+/// Result of attempting one canonical timer-fire step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FireNextOutcome {
+    Fired,
+    NoneDue,
+    Contended,
 }
 
 // ---------------------------------------------------------------------------
@@ -332,14 +386,22 @@ impl ClockDriver {
         wall_ms: i64,
         rand: i64,
     ) -> Result<(i64, i64, i64)> {
-        let seq = self.latest(store)?.map(|(s, ..)| s + 1).unwrap_or(0);
+        let latest = self.latest(store)?;
+        if let Some((_, previous, _)) = latest {
+            if wall_ms < previous {
+                return Err(grmpl_core::Error::Store(format!(
+                    "clock sample regressed from {previous} to {wall_ms}"
+                )));
+            }
+        }
+        let seq = latest.map(|(s, ..)| s + 1).unwrap_or(0);
         let row = Tuple::from([Value::Int(seq), Value::Int(wall_ms), Value::Int(rand)]);
         let patch = Patch::new().assert(Fact::new(self.clock, row));
         match commit_patch(store, schemas, &patch, &self.authority)? {
             CommitOutcome::Committed(_) => Ok((seq, wall_ms, rand)),
-            CommitOutcome::Rejected => {
-                Err(grmpl_core::Error::Store("clock sample rejected (unexpected: clock is single-writer)".into()))
-            }
+            CommitOutcome::Rejected => Err(grmpl_core::Error::Store(
+                "clock sample rejected (unexpected: clock is single-writer)".into(),
+            )),
         }
     }
 }

@@ -19,7 +19,7 @@
 //! [`OnWatch`](crate::OnWatch) writes — one row per watch, its `edition` the
 //! exclusive frontier already delivered.
 
-use grmpl_core::{Edition, Result, RelId, TraceStore, Value};
+use grmpl_core::{Edition, RelId, Result, TraceStore, Value};
 
 /// The minimum durable watch cursor across every cursor relation in
 /// `cursor_rels`: the least `edition` among all live (positive-weight) cursor

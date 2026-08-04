@@ -8,29 +8,32 @@ product binary, `grmpl`:
 ```text
 grmpl run [WORLD.grmpl] [STORE_DIR]
 grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]
+grmpl shotengai [STORE_DIR]
 grmpl showcase
 ```
 
 `run` and `serve` are adapters over the same `grmpl::Runtime` and built-in
-`grmpl::MooRuntime`. They compile through the durable catalog, register the
-program's schemas, seed the same world package, allocate durable inbox
+`grmpl::MooRuntime`. They load through the durable catalog, register the
+program's schemas, atomically install source-owned bootstrap facts, allocate durable inbox
 sequences, instantiate the same behaviors, and use the same retry policy.
 `grmpld` has been removed. The semantic crates (`grmpl-core`, `grmpl-diff`,
 `grmpl-proc`, `grmpl-lang`, `grmpl-pattern`, and `grmpl-ent`) remain internal
 modules with intentionally narrow interfaces; merging them would reduce
 locality without reducing the public surface.
 
-The Kasumi Shotengai prototype is deliberately outside this migration. Its
-working files are not part of this change.
+Kasumi Shotengai uses the same v4 package compiler, atomic installer, and actor
+driver. Its remaining native DSP, fork, shuffle, and presentation seams are the
+explicit phase-3 boundary, not a second bootstrap/runtime path.
 
 ## Runtime architecture
 
 `grmpl::Runtime` is the public deep module. It owns the store/program binding
 and exposes relation resolution, current views, process construction,
-race-safe command enqueueing, and source-declared watch installation.
+race-safe command enqueueing, source-declared watch installation, committed
+clock sampling, and bounded canonical actor draining.
 `grmpl::MooRuntime` is a world package over that general runtime: it resolves
-the MOO relation set, bootstraps the built-in manor, and supplies the small set
-of native capabilities the language cannot yet express. `grmpl::Server` adds
+the MOO relation set and supplies presentation and player-provisioning seams.
+`grmpl::Server` adds
 durable player identity and sessions without choosing a transport.
 
 ```text
@@ -63,6 +66,17 @@ The language-defined portion of `worlds/moo.grmpl` includes:
   whole-world views.
 - A source-declared reactive world watch with durable pump cursor and sequence
   relations.
+- Versioned package/entity/bootstrap declarations and explicit allocation/RNG
+  requirements.
+- Immutable `let`, checked `Int` and finite binary64 `Float` expressions,
+  comparisons, short-circuit booleans, and `if`/`else`.
+- `fresh` and scalar `random ... below ...`, with their durable state changes
+  sealed into the same patch as dependent effects.
+- Manor `create`/`dig`, Shotengai combat damage, and Shotengai's `omen` draw.
+  Named, concatenative, and stored bodies execute one typed `BehaviorIr`.
+- Static `authority`/`actor` declarations and granted `schedule` statements.
+  Shotengai's cat patrol, counterattack, victory claim, and job advancement are
+  durable actor messages rather than adapter-injected continuations.
 
 These operations lower to ordinary patches and queries. There is no separate
 TCP implementation of them.
@@ -72,16 +86,14 @@ TCP implementation of them.
 Some current MOO behavior is native because the language has no expression for
 the operation, not because the transport owns a second world:
 
-- Opening the Ent store, compiling a program through its durable name catalog,
-  and registering versioned schemas.
-- Initial manor/template facts and finite cribbage rule tables.
-- Durable entity allocation and atomic player provisioning.
-- `dig` and `create`, which require fresh entity IDs.
+- Opening the Ent store, resolving host grants, and registering versioned schemas.
+- Atomic player provisioning. Login remains a host lifecycle operation even
+  though its allocator uses the durable counter contract.
 - Formatted `look` output and adapter-specific presentation of query rows.
-- Driving player/NPC processes and retrying rejected optimistic commits.
+- Recording external time and calling the package's bounded actor driver.
 - TCP accept/read/write and terminal input/output.
-- Card shuffling/dealing. The terminal adapter currently owns its deterministic
-  process-local PRNG state.
+- Card shuffling/dealing. Sampling without replacement remains a phase-3
+  collection/shuffle capability, distinct from scalar random draws.
 - Private vault creation through Ent DSP relocation, instance selection, and
   teardown in the terminal adapter.
 
@@ -108,55 +120,17 @@ language-defined movement, dynamic world construction, deterministic replay,
 fork checkpoints, schema-aware commits, and exactly-once/in-order reactive
 materialization with durable delivery resume.
 
-## What Shotengai still needs from grmpl
+## What remains after phase 2
 
-The excluded Shotengai prototype demonstrates that the substrate is already
-capable of the world, but too much orchestration must currently be written in a
-world-specific Rust adapter. A clean port should add the following capabilities
-to the public world model, in leverage order.
+Shotengai now uses package bootstrap, typed combat expressions, committed
+scalar RNG, and durable scheduled actors. The remaining adapter work is
+intentionally bounded. The roadmap and transaction laws are in
+[WORLD-PACKAGE-REMAINING-WORK.md](WORLD-PACKAGE-REMAINING-WORK.md).
 
-1. **Transactional expressions and control flow.** Add integer arithmetic,
-   comparisons, boolean conditions, and conditional branches to behavior
-   bodies. Shotengai currently works around their absence with finite relations
-   for damage, progression, card totals, and other calculations. Tables are
-   useful world data, but they should not be the only way to express bounded
-   arithmetic or choose an effect.
+- Phase 3: DSP template instancing/retirement, whole-world fork and branch
+  routing, deterministic collection/shuffle semantics, and richer presentation
+  values.
 
-2. **Granted deterministic primitives.** Add capability-checked behavior
-   primitives for fresh entity allocation and committed RNG consumption. Both
-   must participate in the behavior's guarded patch: allocation must seal the
-   entity counter, and RNG must expect/retract/assert its durable state in the
-   same commit. This would move player-created objects, dungeon IDs, combat
-   rolls, and card deals out of bespoke Rust coordinators without introducing
-   ambient nondeterminism.
-
-3. **World bootstrap in the package.** Add source-level fact literals or a
-   declarative bootstrap section with an idempotent installation contract.
-   Initial places, people, jobs, abilities, monsters, dungeon templates, and
-   finite rule tables currently require a large Rust seeder even though they are
-   ordinary relation data.
-
-4. **Transactional substrate effects.** Expose DSP template instancing and
-   whole-world fork/routing as explicit, authority-scoped effects with defined
-   commit boundaries. Shotengai's basement and Copying Mirror currently call
-   `instance_template`, `fork_at`, branch routing, cleanup, and lineage APIs
-   directly from Rust. A port needs durable instance allocation/retirement and
-   branch selection to compose with the command that requested them. Branch
-   quotas or retirement policy are also needed before world-copying is public.
-
-5. **Durable actor scheduling.** Surface the existing scheduling machinery in
-   `.grmpl` so NPC patrols, job clocks, and multi-step combat can advance from
-   committed time/events rather than an adapter calling `tick` after terminal
-   input. Ordering and retry behavior must remain replay-deterministic.
-
-6. **Presentation values.** Add basic text interpolation/list rendering or a
-   structured response value. This is lower leverage than transactional
-   capabilities—terminal and TCP can legitimately render differently—but it is
-   needed before rich room, combat, job, lineage, and card output can leave the
-   Shotengai Rust adapter completely.
-
-Arithmetic/control flow, allocation/RNG, and bootstrap are the minimum useful
-language tranche. DSP/fork effects should follow as carefully scoped runtime
-capabilities rather than general host escape hatches. With those pieces,
-Shotengai can become another world package over `grmpl::Runtime` instead of a
-new runtime or binary.
+The v4 tranche deliberately has no v3 migrator. Existing v3 stores remain
+untouched and require a matching v3 build; v4 packages install only into fresh
+stores.

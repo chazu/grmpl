@@ -1,8 +1,9 @@
 //! `grmpl run [WORLD.grmpl] [STORE_DIR]` — stand up a language-defined world and
 //! drive it from an interactive REPL.
 //!
-//! The host is deliberately thin: it does terminal I/O, seeds world + rule DATA,
-//! and drives the clock. Every rule lives in `worlds/moo.grmpl`:
+//! The host is deliberately thin: it does terminal I/O, grants native powers,
+//! and drives the clock. Initial world/rule data and every portable rule live
+//! in `worlds/moo.grmpl`:
 //!   * reads are `view`s (the host runs the query and prints the rows),
 //!   * the player's verbs are the compiled `on parse` behavior,
 //!   * the wandering cat is *also* just a behavior — the host enqueues it a

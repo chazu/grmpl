@@ -28,9 +28,12 @@ use grmpl_core::{
     Tuple, Value,
 };
 use grmpl_diff::Snapshot;
-use grmpl_lang::{PredExpr, Program, StoredBehavior, Word};
-use grmpl_proc::{commit_patch, commit_patch_checked, CommitOutcome};
 use grmpl_ent::EntStore;
+use grmpl_lang::{
+    BehaviorIr, BehaviorOp, CompiledPackage, ExprIr, GrantSet, PredExpr, Program, ResolvedGrantSet,
+    StoredBehavior, ValueExpr,
+};
+use grmpl_proc::{commit_patch, commit_patch_checked, CommitOutcome};
 use grmpl_type::{check_stored_behavior_authority, EffectChecker};
 
 /// xorshift64\* — the crate-wide seeded PRNG idiom, no external dependency.
@@ -68,12 +71,14 @@ fn program() -> Program {
 /// A stack-valid behavior that asserts into each relation in `writes`: for each,
 /// push one literal then `assert`. Guard matches every message.
 fn behavior_writing(writes: &BTreeSet<usize>) -> StoredBehavior {
-    let mut body = Vec::new();
-    for &i in writes {
-        body.push(Word::Lit(Value::Int(0)));
-        body.push(Word::Assert(WORLD[i].to_string()));
-    }
-    StoredBehavior::new(PredExpr::And(vec![]), body)
+    let body = writes
+        .iter()
+        .map(|&i| BehaviorOp::Assert {
+            relation: WORLD[i].to_string(),
+            arguments: vec![ExprIr::Value(ValueExpr::Literal(Value::Int(0)))],
+        })
+        .collect();
+    StoredBehavior::new(PredExpr::And(vec![]), vec![], BehaviorIr::new(body))
 }
 
 /// A whole-relation authority owning `slot` (so the *carrier* fact is always
@@ -181,7 +186,11 @@ fn unauthorized_behavior_is_rejected_at_commit() {
         matches!(outcome, Err(grmpl_core::Error::Authority(_))),
         "installing code that writes an unowned relation must be rejected, got {outcome:?}"
     );
-    assert_eq!(store.current(), before, "a rejected install must allocate no edition");
+    assert_eq!(
+        store.current(),
+        before,
+        "a rejected install must allocate no edition"
+    );
 
     // Grant w1 and the same install now commits.
     let auth = authority(&prog, &[0usize, 1].into_iter().collect());
@@ -194,4 +203,156 @@ fn unauthorized_behavior_is_rejected_at_commit() {
         ),
         "once authorized, the behavior installs"
     );
+}
+
+#[test]
+fn stored_capability_code_requires_both_a_grant_and_state_authority() {
+    let source = r#"
+package stored_capability bootstrap 1
+entity WORLD = 1
+rel rng_state(owner: Ent, state: Int)
+rel slot(code: Code)
+requires random rolls(state: rng_state, owner: WORLD, algorithm: xorshift64star_v1)
+bootstrap { rng_state(WORLD, 1) }
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
+    let package = CompiledPackage::compile_with_catalog(source, &store, 100).unwrap();
+    let slot = package.program.rel_id("slot").unwrap();
+    let rng_state = package.program.rel_id("rng_state").unwrap();
+    let behavior = StoredBehavior::new(
+        PredExpr::And(vec![]),
+        vec![],
+        BehaviorIr::new(vec![BehaviorOp::InvokeCapability {
+            capability: "rolls".into(),
+            arguments: vec![ExprIr::Value(ValueExpr::Literal(Value::Int(100)))],
+            destinations: vec!["roll".into()],
+        }]),
+    );
+    let carrier = Fact::new(slot, Tuple::from([behavior.to_value()]));
+    let install = Patch::new().assert(carrier.clone());
+    let full_authority = Authority::new(
+        DomainId(1),
+        vec![Scope::whole(slot), Scope::whole(rng_state)],
+    );
+
+    let no_grants = ResolvedGrantSet::default();
+    let before = store.current();
+    let outcome = commit_patch_checked(
+        &store,
+        &NoSchemas,
+        &EffectChecker::with_grants(&package.program, &no_grants),
+        &install,
+        &full_authority,
+    );
+    assert!(
+        matches!(outcome, Err(grmpl_core::Error::Authority(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        store.current(),
+        before,
+        "ungranted code must allocate no edition"
+    );
+
+    let grants = GrantSet::new()
+        .grant_random("rolls", "rng_state", Entity(1), "xorshift64star_v1")
+        .unwrap();
+    let resolved = package.resolve_grants(&grants).unwrap();
+    let carrier_only = Authority::new(DomainId(1), vec![Scope::whole(slot)]);
+    let outcome = commit_patch_checked(
+        &store,
+        &NoSchemas,
+        &EffectChecker::with_grants(&package.program, &resolved),
+        &install,
+        &carrier_only,
+    );
+    assert!(
+        matches!(outcome, Err(grmpl_core::Error::Authority(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        store.current(),
+        before,
+        "unauthorized state access must allocate no edition"
+    );
+
+    assert!(matches!(
+        commit_patch_checked(
+            &store,
+            &NoSchemas,
+            &EffectChecker::with_grants(&package.program, &resolved),
+            &Patch::new().assert(carrier),
+            &full_authority,
+        ),
+        Ok(CommitOutcome::Committed(_))
+    ));
+}
+
+#[test]
+fn stored_schedule_code_cannot_bypass_the_granted_target_allowlist() {
+    let source = r#"
+        package stored_schedule bootstrap 1
+        entity ACTOR = 7
+        rel clock(seq: Int, wall_ms: Int, random: Int)
+        rel timers(due: Int, inbox: Int, target: Ent, body: Tuple)
+        rel inbox(process: Ent, seq: Int, body: Tuple)
+        rel inbox_seq(process: Ent, next: Int)
+        rel cursor(process: Ent, pos: Int)
+        rel slot(code: Code)
+        requires schedule world_clock(clock: clock, timers: timers, sequences: inbox_seq)
+        authority writes { write cursor }
+        actor ACTOR { inbox inbox cursor cursor authority writes }
+        form command { "noop" -> Noop() }
+        on inbox parse command { match Noop() { } }
+        bootstrap { inbox_seq(ACTOR, 0) }
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
+    let package = CompiledPackage::compile_with_catalog(source, &store, 100).unwrap();
+    let grants = GrantSet::new()
+        .grant_schedule("world_clock", "clock", "timers", "inbox_seq", ["ACTOR"])
+        .unwrap();
+    let resolved = package.resolve_grants(&grants).unwrap();
+    let slot = package.program.rel_id("slot").unwrap();
+    let timers = package.program.rel_id("timers").unwrap();
+    let authority = Authority::new(DomainId(1), vec![Scope::whole(slot), Scope::whole(timers)]);
+    let code = |target: &str| {
+        StoredBehavior::new(
+            PredExpr::And(vec![]),
+            vec![],
+            BehaviorIr::new(vec![BehaviorOp::InvokeCapability {
+                capability: "world_clock".into(),
+                arguments: vec![
+                    ExprIr::Value(ValueExpr::Literal(Value::text(target))),
+                    ExprIr::Value(ValueExpr::Literal(Value::Int(0))),
+                    ExprIr::Value(ValueExpr::Literal(Value::text("noop"))),
+                ],
+                destinations: vec![],
+            }]),
+        )
+        .to_value()
+    };
+
+    let before = store.current();
+    let rejected = commit_patch_checked(
+        &store,
+        &NoSchemas,
+        &EffectChecker::with_grants(&package.program, &resolved),
+        &Patch::new().assert(Fact::new(slot, Tuple::from([code("OTHER")]))),
+        &authority,
+    );
+    assert!(matches!(rejected, Err(grmpl_core::Error::Authority(_))));
+    assert_eq!(store.current(), before);
+
+    assert!(matches!(
+        commit_patch_checked(
+            &store,
+            &NoSchemas,
+            &EffectChecker::with_grants(&package.program, &resolved),
+            &Patch::new().assert(Fact::new(slot, Tuple::from([code("ACTOR")]))),
+            &authority,
+        ),
+        Ok(CommitOutcome::Committed(_))
+    ));
 }

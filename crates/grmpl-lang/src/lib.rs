@@ -30,17 +30,24 @@
 
 pub mod ast;
 pub mod behavior;
+pub mod behavior_ir;
 pub mod compile;
 pub mod concat;
 pub mod ir;
 pub mod lexer;
+pub mod package;
 pub mod parser;
 
 pub use behavior::{
     decode_behavior, dispatch, encode_behavior, implemented_behaviors, implements_ir,
     select_behavior, StoredBehavior,
 };
-pub use compile::{NamedAgg, Program};
+pub use behavior_ir::{BehaviorIr, BehaviorOp, BoolExpr, CompareOp, ExprIr, FindArg, ValueExpr};
+pub use compile::{CapabilityKind, NamedAgg, Program};
 pub use concat::{ConcatArm, Schemas, StackEffect, Word};
 pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};
+pub use package::{
+    AuthorityRequest, CapabilityGrant, CapabilityRequirement, CompiledActor, CompiledBootstrapFact,
+    CompiledPackage, GrantSet, ResolvedCapabilityGrant, ResolvedGrantSet, INSTALL_MARKER_RELATION,
+};
 pub use parser::parse;

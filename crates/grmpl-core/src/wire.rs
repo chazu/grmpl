@@ -36,7 +36,7 @@ use crate::value::{Entity, RelId, Tuple, Value};
 /// The wire/on-disk format version. Prefixes every serialized artifact. Bump
 /// on any change to the tag set or framing so stale bytes are rejected rather
 /// than misread. All framings (`message`, store `record`) share this byte.
-pub const FORMAT_VERSION: u8 = 3;
+pub const FORMAT_VERSION: u8 = 4;
 
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -47,6 +47,7 @@ const TAG_BYTES: u8 = 6;
 // P12: a code-carrying value (serialized behavior IR). Opaque bytes here — the
 // IR framing lives in `grmpl-lang` and rides the same [`FORMAT_VERSION`] byte.
 const TAG_CODE: u8 = 7;
+const TAG_FLOAT: u8 = 8;
 
 // Column-type tags — a *separate* namespace from the value tags above, used
 // only inside the schema framing. Bump FORMAT_VERSION if these change.
@@ -58,11 +59,13 @@ const TY_TUPLE: u8 = 5;
 const TY_ANY: u8 = 6;
 const TY_BYTES: u8 = 7;
 const TY_CODE: u8 = 8;
+const TY_FLOAT: u8 = 9;
 
 fn ty_tag(t: Ty) -> u8 {
     match t {
         Ty::Ent => TY_ENT,
         Ty::Int => TY_INT,
+        Ty::Float => TY_FLOAT,
         Ty::Text => TY_TEXT,
         Ty::Bool => TY_BOOL,
         Ty::Tuple => TY_TUPLE,
@@ -76,6 +79,7 @@ fn ty_from_tag(tag: u8) -> Result<Ty> {
     Ok(match tag {
         TY_ENT => Ty::Ent,
         TY_INT => Ty::Int,
+        TY_FLOAT => Ty::Float,
         TY_TEXT => Ty::Text,
         TY_BOOL => Ty::Bool,
         TY_TUPLE => Ty::Tuple,
@@ -104,14 +108,19 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
     let ncols = read_u32(bytes, &mut pos)? as usize;
     let mut columns = Vec::with_capacity(ncols);
     for _ in 0..ncols {
-        let tag = *bytes.get(pos).ok_or_else(|| Error::Codec("unexpected end (ty tag)".into()))?;
+        let tag = *bytes
+            .get(pos)
+            .ok_or_else(|| Error::Codec("unexpected end (ty tag)".into()))?;
         pos += 1;
         let ty = ty_from_tag(tag)?;
         let len = read_u32(bytes, &mut pos)? as usize;
         let end = pos + len;
-        let slice =
-            bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (column name)".into()))?;
-        let name = std::str::from_utf8(slice).map_err(|e| Error::Codec(e.to_string()))?.to_string();
+        let slice = bytes
+            .get(pos..end)
+            .ok_or_else(|| Error::Codec("unexpected end (column name)".into()))?;
+        let name = std::str::from_utf8(slice)
+            .map_err(|e| Error::Codec(e.to_string()))?
+            .to_string();
         pos = end;
         columns.push(Column { name, ty });
     }
@@ -195,6 +204,10 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) {
             out.push(TAG_INT);
             out.extend_from_slice(&i.to_be_bytes());
         }
+        Value::Float(value) => {
+            out.push(TAG_FLOAT);
+            out.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
         Value::Text(s) => {
             out.push(TAG_TEXT);
             out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -228,20 +241,32 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) {
 /// framing consumed it). The public counterpart of [`encode_value`], for
 /// framings that embed values (see that function).
 pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
-    let tag = *bytes.get(pos).ok_or_else(|| Error::Codec("unexpected end (tag)".into()))?;
+    let tag = *bytes
+        .get(pos)
+        .ok_or_else(|| Error::Codec("unexpected end (tag)".into()))?;
     pos += 1;
     match tag {
         TAG_ENT => Ok((Value::Ent(Entity(read_u64(bytes, &mut pos)?)), pos)),
         TAG_INT => Ok((Value::Int(read_u64(bytes, &mut pos)? as i64), pos)),
+        TAG_FLOAT => {
+            let bits = read_u64(bytes, &mut pos)?;
+            let value = crate::FiniteF64::from_bits(bits)
+                .ok_or_else(|| Error::Codec("non-finite float payload".into()))?;
+            Ok((Value::Float(value), pos))
+        }
         TAG_TEXT => {
             let len = read_u32(bytes, &mut pos)? as usize;
             let end = pos + len;
-            let slice = bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (text)".into()))?;
+            let slice = bytes
+                .get(pos..end)
+                .ok_or_else(|| Error::Codec("unexpected end (text)".into()))?;
             let s = std::str::from_utf8(slice).map_err(|e| Error::Codec(e.to_string()))?;
             Ok((Value::text(s), end))
         }
         TAG_BOOL => {
-            let b = *bytes.get(pos).ok_or_else(|| Error::Codec("unexpected end (bool)".into()))?;
+            let b = *bytes
+                .get(pos)
+                .ok_or_else(|| Error::Codec("unexpected end (bool)".into()))?;
             Ok((Value::Bool(b != 0), pos + 1))
         }
         TAG_TUPLE => {
@@ -257,15 +282,17 @@ pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
         TAG_BYTES => {
             let len = read_u32(bytes, &mut pos)? as usize;
             let end = pos + len;
-            let slice =
-                bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (bytes)".into()))?;
+            let slice = bytes
+                .get(pos..end)
+                .ok_or_else(|| Error::Codec("unexpected end (bytes)".into()))?;
             Ok((Value::Bytes(Arc::from(slice)), end))
         }
         TAG_CODE => {
             let len = read_u32(bytes, &mut pos)? as usize;
             let end = pos + len;
-            let slice =
-                bytes.get(pos..end).ok_or_else(|| Error::Codec("unexpected end (code)".into()))?;
+            let slice = bytes
+                .get(pos..end)
+                .ok_or_else(|| Error::Codec("unexpected end (code)".into()))?;
             Ok((Value::Code(Arc::from(slice)), end))
         }
         other => Err(Error::Codec(format!("unknown value tag {other}"))),
@@ -274,7 +301,9 @@ pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
 
 fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     let end = *pos + 4;
-    let slice = bytes.get(*pos..end).ok_or_else(|| Error::Codec("unexpected end (u32)".into()))?;
+    let slice = bytes
+        .get(*pos..end)
+        .ok_or_else(|| Error::Codec("unexpected end (u32)".into()))?;
     let mut buf = [0u8; 4];
     buf.copy_from_slice(slice);
     *pos = end;
@@ -283,7 +312,9 @@ fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
 
 fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let end = *pos + 8;
-    let slice = bytes.get(*pos..end).ok_or_else(|| Error::Codec("unexpected end (u64)".into()))?;
+    let slice = bytes
+        .get(*pos..end)
+        .ok_or_else(|| Error::Codec("unexpected end (u64)".into()))?;
     let mut buf = [0u8; 8];
     buf.copy_from_slice(slice);
     *pos = end;
@@ -300,6 +331,7 @@ mod tests {
             inbox: RelId(42),
             body: Tuple::from([
                 Value::Int(7),
+                Value::float(1.25).unwrap(),
                 Value::text("hi"),
                 Value::Bool(true),
                 Value::bytes([0u8, 1, 255, 128]),
@@ -307,7 +339,10 @@ mod tests {
             ]),
         };
         let bytes = encode_message(&m);
-        assert_eq!(bytes[0], FORMAT_VERSION, "artifact must lead with the version byte");
+        assert_eq!(
+            bytes[0], FORMAT_VERSION,
+            "artifact must lead with the version byte"
+        );
         assert_eq!(decode_message(&bytes).unwrap(), m);
     }
 
@@ -322,6 +357,45 @@ mod tests {
     }
 
     #[test]
+    fn format_version_is_the_v4_fresh_store_cutover() {
+        assert_eq!(FORMAT_VERSION, 4);
+    }
+
+    #[test]
+    fn float_roundtrips_with_canonical_bits() {
+        for value in [0.0, -0.0, 0.1 + 0.2, -10.5, f64::MAX, f64::MIN_POSITIVE] {
+            let value = Value::float(value).unwrap();
+            let mut bytes = Vec::new();
+            encode_value(&value, &mut bytes);
+            let (decoded, end) = decode_value(&bytes, 0).unwrap();
+            assert_eq!(end, bytes.len());
+            assert_eq!(decoded, value);
+        }
+
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        encode_value(&Value::float(0.0).unwrap(), &mut positive);
+        encode_value(&Value::float(-0.0).unwrap(), &mut negative);
+        assert_eq!(
+            positive, negative,
+            "signed zero must have one durable encoding"
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_non_finite_float_payloads() {
+        for bits in [
+            f64::NAN.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+        ] {
+            let mut bytes = vec![TAG_FLOAT];
+            bytes.extend_from_slice(&bits.to_be_bytes());
+            assert!(matches!(decode_value(&bytes, 0), Err(Error::Codec(_))));
+        }
+    }
+
+    #[test]
     fn read_version_rejects_empty() {
         assert!(read_version(&[]).is_err());
     }
@@ -331,6 +405,7 @@ mod tests {
         let s = Schema::new(vec![
             Column::new("thing", Ty::Ent),
             Column::new("since", Ty::Int),
+            Column::new("ratio", Ty::Float),
             Column::new("label", Ty::Text),
             Column::new("flag", Ty::Bool),
             Column::new("body", Ty::Tuple),
@@ -339,7 +414,10 @@ mod tests {
             Column::new("free", Ty::Any),
         ]);
         let bytes = encode_schema(&s);
-        assert_eq!(bytes[0], FORMAT_VERSION, "schema must lead with the version byte");
+        assert_eq!(
+            bytes[0], FORMAT_VERSION,
+            "schema must lead with the version byte"
+        );
         assert_eq!(decode_schema(&bytes).unwrap(), s);
     }
 

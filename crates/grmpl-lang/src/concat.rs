@@ -19,12 +19,9 @@
 //! Every [`Word`] declares how many stack cells it consumes and produces
 //! ([`Word::effect`]). [`check`] walks an arm composing those declared effects
 //! over an abstract stack *depth*, catching underflow and a non-empty leftover
-//! stack **before the handler ever runs** — the concatenative analogue of the
-//! P8b static effect check. This is a *declared*-effect discipline: cell counts
-//! are checked, cell *types* (Ent vs Text …) are not. Full stack-effect **type**
-//! inference is a later upgrade, not a gate on the surface landing (the ticket's
-//! "inference is an upgrade" clause) — hence a depth checker now, room for a
-//! typed one later.
+//! stack before the handler ever runs. Behavior compilation then symbolically
+//! executes those words over typed expressions, rejects mismatched scalar and
+//! relation operands, and emits canonical [`crate::BehaviorIr`].
 //!
 //! ## The reified word IR is the CBPV thunk layer
 //!
@@ -69,6 +66,29 @@ pub enum Word {
     /// `( a b -- )`
     TwoDrop,
 
+    /// Closed scalar intrinsic registry. Binary words consume `a b` and push
+    /// one result; unary words consume `a`. The compiler checks concrete types
+    /// and lowers these words to the same [`crate::BehaviorIr`] expressions as
+    /// the named surface.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Neg,
+    Min,
+    Max,
+    ToFloat,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Not,
+    And,
+    Or,
+
     /// Resolve a noun against a `view`. Pops the match key (top) and the view's
     /// parameters beneath it (deepest = first parameter), instantiates the view,
     /// selects the **least** row whose column `col` matches the key under `op`
@@ -84,7 +104,10 @@ pub enum Word {
     /// first `keyn` columns, deepest = column 0), selects the **least** matching
     /// row, and pushes that row's *full* column list. A miss aborts the arm.
     /// `( k{keyn} -- c{arity} )`
-    Find { rel: String, keyn: usize },
+    Find {
+        rel: String,
+        keyn: usize,
+    },
 
     /// Pop the relation's `arity` columns (deepest = column 0) into a
     /// precondition fact. `( c{arity} -- )`
@@ -145,6 +168,22 @@ impl Word {
             Word::Tuck => StackEffect::new(2, 3),
             Word::TwoDup => StackEffect::new(2, 4),
             Word::TwoDrop => StackEffect::new(2, 0),
+            Word::Neg | Word::ToFloat | Word::Not => StackEffect::new(1, 1),
+            Word::Add
+            | Word::Sub
+            | Word::Mul
+            | Word::Div
+            | Word::Rem
+            | Word::Min
+            | Word::Max
+            | Word::Eq
+            | Word::Ne
+            | Word::Lt
+            | Word::Le
+            | Word::Gt
+            | Word::Ge
+            | Word::And
+            | Word::Or => StackEffect::new(2, 1),
             Word::Resolve { view, .. } => {
                 let (params, yields) = schemas
                     .view_shape(view)

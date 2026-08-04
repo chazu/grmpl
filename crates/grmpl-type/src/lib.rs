@@ -119,6 +119,7 @@ pub fn value_ty(v: &Value) -> Ty {
     match v {
         Value::Ent(_) => Ty::Ent,
         Value::Int(_) => Ty::Int,
+        Value::Float(_) => Ty::Float,
         Value::Text(_) => Ty::Text,
         Value::Bool(_) => Ty::Bool,
         Value::Tuple(_) => Ty::Tuple,

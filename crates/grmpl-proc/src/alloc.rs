@@ -53,7 +53,12 @@ impl Alloc {
                 }
             }
         }
-        Alloc { rel, start, present, n: 0 }
+        Alloc {
+            rel,
+            start,
+            present,
+            n: 0,
+        }
     }
 
     /// Build from the store's current edition. If the counter row is absent,

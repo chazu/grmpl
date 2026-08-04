@@ -52,9 +52,12 @@ Everything below is syntax for producing relations, views, and behaviors.
 * **Identifiers** are `letter (letter | digit | _)*`.
 * **String literals** are `"double quoted"`.
 * **Integer literals** are bare decimals: `15`, `-3`.
+* **Float literals** contain a decimal point or exponent: `1.0`, `2.5e-2`.
+  Floats are finite binary64; NaN and infinities are not values.
 * Whitespace and newlines are insignificant except as token separators.
 
-A program is a sequence of top-level declarations: `rel`, `view`, `form`, `on`.
+A program is a sequence of top-level declarations: `package`, `entity`,
+`requires`, `authority`, `actor`, `bootstrap`, `rel`, `view`, `form`, and `on`.
 Order is free (a `view` may mention a `rel` declared later).
 
 ---
@@ -74,6 +77,7 @@ A `rel` names a relation and its ordered columns. A column is `name` or
 |---------|----------------------------------------------------|
 | `Ent`   | an entity id (an opaque handle to a "thing")       |
 | `Int`   | a 64-bit integer                                   |
+| `Float` | a finite IEEE-754 binary64 value                   |
 | `Text`  | a string                                           |
 | `Bool`  | a boolean                                          |
 | `Tuple` | a nested tuple of values                           |
@@ -86,9 +90,8 @@ boundary (arity + column types), and schemas may only *grow* (append columns) �
 never change an existing column. If you don't register schemas, the columns are
 unchecked. Either way the annotations tell a reader what a tuple means.
 
-A `rel` declares no data. Tuples enter the world through patches (`assert`) or
-are seeded by the host program — **there is no fact-literal syntax** (see
-§9).
+A `rel` declares no data by itself. Versioned packages install initial tuples
+through a `bootstrap` block; later tuples enter through patches.
 
 ---
 
@@ -225,6 +228,11 @@ while accumulating a patch and a set of bound variables:
 | `assert Rel(args)`                          | add this tuple                                                                            |
 | `retract Rel(args)`                         | remove this tuple                                                                         |
 | `emit Rel(args)`                            | enqueue a message tuple into `Rel` (an inbox)                                             |
+| `let name = expression`                     | bind one immutable typed local                                                            |
+| `if condition { ... } else { ... }`         | execute one branch; both branches are type/effect checked                                 |
+| `fresh capability as name`                  | allocate an entity through a declared host grant                                           |
+| `random capability below bound as name`     | draw an unbiased `Int` in `[0, bound)` from committed RNG state                           |
+| `schedule cap at due send Tag(args) to A`   | atomically add an absolute-time message for static actor `A`                              |
 
 `args`/`rhs` are variables, strings, or integers. The two match operators:
 
@@ -238,6 +246,13 @@ a clean no-op.
 
 Binding to the **least** matching tuple (never "whichever the scan surfaced
 first") is what keeps behaviors deterministic.
+
+Expressions support checked `+ - * / %`, unary `-`, `min`, `max`, comparisons,
+and short-circuit `! && ||`. Arithmetic operands must both be `Int` or both be
+`Float`; use `float(int)` for the only implicit-looking conversion. Integer
+overflow, zero division/remainder, and non-finite float results are behavior
+faults. A fault commits no partial patch and does not advance the process
+cursor.
 
 ### The concatenative surface (point-free)
 
@@ -261,14 +276,17 @@ The vocabulary:
 
 * **Stack shufflers**: `dup drop swap over rot nip tuck dup2 drop2`.
 * **Pushers**: `self` (your entity), string/integer literals.
+* **Scalar words**: `add sub mul div rem neg min max to_float`,
+  `eq ne lt le gt ge`, and `not and or`.
 * **Effect seam** (consumes immediate operands from the source, stack operands
   at run time): `resolve <view> <col> (=|~)`, `find <rel> <keyn>`,
   `expect <rel>`, `assert <rel>`, `retract <rel>`, `emit <rel>`.
 
 Every word has a declared **stack effect**, and the compiler rejects a body that
 under-flows the stack or leaves it non-empty. The two surfaces lower to the
-identical effect primitives, so a program written either way produces identical
-editions.
+one typed `BehaviorIr`, so a program written either way produces identical
+editions. Stored behaviors serialize this same IR rather than a second word
+interpreter.
 
 ### What a behavior *is*
 
@@ -281,7 +299,54 @@ reproduces every patch and edition exactly.
 
 ---
 
-## 7. Reactive handlers — `on watch <view>`
+## 7. Packages, bootstrap, and grants
+
+```grmpl
+package manor bootstrap 1
+entity FOYER = 10
+
+requires allocate entities(counter: entity_seq, first: 1000, last: 1999)
+requires random omens(state: rng_state, owner: FOYER, algorithm: xorshift64star_v1)
+requires schedule world_clock(clock: clock, timers: timers, sequences: inbox_seq)
+
+authority patrol_writes { write cursor write located write timers }
+actor CAT { inbox patrol_inbox cursor cursor authority patrol_writes }
+
+bootstrap {
+    entity_seq(1000)
+    rng_state(FOYER, 1)
+    named(FOYER, "Foyer")
+}
+```
+
+`Runtime::load_package` resolves relation IDs through the durable catalog,
+checks host grants, and commits the sorted bootstrap facts plus an installation
+marker as edition 1. The exact package reopens without allocating an edition;
+a mismatch or unmarked nonzero store is rejected. The shared v4 format is a
+fresh-store cutover and has no v3 migration path.
+
+Allocation counters must have exact schema `(next: Int)` and an exact bootstrap
+seed. RNG state must have `(owner: Ent, state: Int)` and a nonzero seed. Both
+state transitions are ordinary guarded writes in the behavior patch, so replay
+and optimistic contention preserve atomicity.
+
+A schedule requirement binds exact `(clock, timers, sequences)` schemas. Actor
+declarations are static: the actor name is an `entity` constant, its inbox is
+`(Ent, Int, Tuple)`, its cursor is `(Ent, Int)`, and bootstrap contains one
+non-negative actor-keyed sequence row. `authority` is a request; only matching
+stable-name scopes in the host's `RuntimePolicy` grant power.
+
+`Runtime::load_driven_package` constructs those actors. External time enters
+only through `record_sample`; `drive_to_idle` then fires due timers before
+running ready actors in canonical order. A deterministic fault leaves the
+message pending, and the default 1,024-unit fuel bound makes immediate
+self-scheduling cycles return visibly rather than monopolize the caller.
+
+See [WORLD-PACKAGES.md](WORLD-PACKAGES.md) for the complete runtime contract.
+
+---
+
+## 8. Reactive handlers — `on watch <view>`
 
 A watch turns a view into a live feed: as the view's result changes, each delta
 is delivered, **exactly once**, into an inbox.
@@ -359,13 +424,14 @@ computation into data and join against it."**
   where you consume them — that's how the MOO's "fog of identity" renders
   strangers.
 
-* **No entity allocation in a behavior.** A handler moves and relabels existing
-  entities; it cannot mint a new one. New entities come from a replay-safe
-  allocator on the host/programmatic side (world construction: `dig`, `create`).
+* **No implicit entity allocation.** A behavior can mint an entity only through
+  `fresh <capability> as <local>`, where the package declares an allocator and
+  the host grants its counter and range. The guarded counter advance commits in
+  the same patch as the new entity's facts.
 
-* **No fact literals.** A `.grmpl` file declares relations, views, and
-  behaviors; initial *data* is committed by the host. Think of the file as the
-  world's *laws* and the seed as its *initial conditions*.
+* **Fact literals are installation-only.** Initial data belongs in the
+  package's single `bootstrap` block. After installation, facts change only
+  through behavior patches; reopening never replays or reconciles bootstrap.
 
 * **No loops in a behavior.** One message produces one patch. For ongoing or
   fan-out activity, drive it with the clock: enqueue a periodic `tick` and let a
@@ -413,13 +479,14 @@ Putting it together, the MOO uses every construct:
 
 | Feature in the file                         | Language mechanism                              |
 |---------------------------------------------|-------------------------------------------------|
-| rooms, things, exits, the map               | `rel` + host-seeded data                        |
+| rooms, things, exits, the map               | `entity` + `rel` + package `bootstrap`          |
 | "what's in my room" / "my inventory"        | `view here` / `view inventory` (joins)          |
 | "coin value per room"                       | `view treasure` (a `sum` aggregate)             |
 | the command line → a verb                   | `form command`                                  |
 | `take` / `drop` / `go` / `say` / `greet`    | `on inbox parse command` (statement + concat)   |
 | the **fog of identity** (learn names)       | `rel knows` / `label`, `view folks`/`acquainted`, the `greet` handshake |
-| the wandering cat (an autonomous NPC)       | `rel patrol` + the `Tick` behavior              |
+| dynamic room and object construction        | granted `fresh` in `Dig` / `Create` behaviors   |
+| the wandering cat (an adapter-driven NPC)   | `rel patrol` + the `Tick` behavior              |
 | reactive "the world changed" feed           | `on watch world including current`              |
 | cribbage scoring                            | rule tables (`cardval`, `sum15two`, …) + the `crib_*` scoring views |
 | the Observatory (a room that is a report)   | the host rendering aggregate views live         |

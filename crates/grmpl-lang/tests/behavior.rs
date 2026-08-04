@@ -20,16 +20,14 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use grmpl_core::{
-    Authority, DomainId, Entity, NoSchemas, RelId, Scope, Tuple, Value,
-};
+use grmpl_core::{Authority, DomainId, Entity, NoSchemas, RelId, Scope, Tuple, Value};
+use grmpl_diff::Snapshot;
 use grmpl_lang::ast::MatchOp;
 use grmpl_lang::behavior::{decode_behavior, encode_behavior};
 use grmpl_lang::{
-    dispatch, implemented_behaviors, select_behavior, PredExpr, Program, RowExpr, StoredBehavior,
-    Word,
+    dispatch, implemented_behaviors, select_behavior, BehaviorIr, BehaviorOp, BoolExpr, CompareOp,
+    ExprIr, FindArg, PredExpr, Program, RowExpr, StoredBehavior, ValueExpr,
 };
-use grmpl_diff::Snapshot;
 use grmpl_proc::commit_patch;
 
 /// Deterministic, seedable xorshift64\* — the crate-wide test idiom (no external
@@ -87,40 +85,136 @@ fn rand_pred(rng: &mut Rng, ncols: usize, depth: u32) -> PredExpr {
     }
 }
 
-fn rand_word(rng: &mut Rng) -> Word {
-    let names = ["located", "held", "named", "greeted"];
-    let nm = |rng: &mut Rng| names[rng.below(names.len() as u64) as usize].to_string();
-    match rng.below(17) {
-        0 => Word::SelfEntity,
-        1 => Word::Lit(rand_value(rng)),
-        2 => Word::Dup,
-        3 => Word::Drop,
-        4 => Word::Swap,
-        5 => Word::Over,
-        6 => Word::Rot,
-        7 => Word::Nip,
-        8 => Word::Tuck,
-        9 => Word::TwoDup,
-        10 => Word::TwoDrop,
-        11 => Word::Resolve {
-            view: nm(rng),
-            col: nm(rng),
-            op: if rng.bool() { MatchOp::Exact } else { MatchOp::Word },
-        },
-        12 => Word::Find { rel: nm(rng), keyn: rng.below(4) as usize },
-        13 => Word::Expect(nm(rng)),
-        14 => Word::Assert(nm(rng)),
-        15 => Word::Retract(nm(rng)),
-        _ => Word::Emit(nm(rng)),
+fn rand_value_expr(rng: &mut Rng, depth: u32) -> ValueExpr {
+    if depth == 0 || rng.bool() {
+        if rng.bool() {
+            ValueExpr::Local(format!("v{}", rng.below(4)))
+        } else {
+            ValueExpr::Literal(rand_value(rng))
+        }
+    } else {
+        ValueExpr::Intrinsic {
+            name: ["add", "min", "float"][rng.below(3) as usize].into(),
+            arguments: (0..rng.below(3))
+                .map(|_| rand_value_expr(rng, depth - 1))
+                .collect(),
+        }
     }
+}
+
+fn rand_bool(rng: &mut Rng, depth: u32) -> BoolExpr {
+    if depth == 0 {
+        BoolExpr::Value(rand_value_expr(rng, 1))
+    } else {
+        match rng.below(5) {
+            0 => BoolExpr::Value(rand_value_expr(rng, 1)),
+            1 => BoolExpr::Compare {
+                op: [
+                    CompareOp::Eq,
+                    CompareOp::Ne,
+                    CompareOp::Lt,
+                    CompareOp::Le,
+                    CompareOp::Gt,
+                    CompareOp::Ge,
+                ][rng.below(6) as usize],
+                left: rand_value_expr(rng, 1),
+                right: rand_value_expr(rng, 1),
+            },
+            2 => BoolExpr::Not(Box::new(rand_bool(rng, depth - 1))),
+            3 => BoolExpr::And(
+                Box::new(rand_bool(rng, depth - 1)),
+                Box::new(rand_bool(rng, depth - 1)),
+            ),
+            _ => BoolExpr::Or(
+                Box::new(rand_bool(rng, depth - 1)),
+                Box::new(rand_bool(rng, depth - 1)),
+            ),
+        }
+    }
+}
+
+fn rand_expr(rng: &mut Rng) -> ExprIr {
+    if rng.bool() {
+        ExprIr::Value(rand_value_expr(rng, 2))
+    } else {
+        ExprIr::Bool(rand_bool(rng, 2))
+    }
+}
+
+fn rand_ops(rng: &mut Rng, depth: u32) -> Vec<BehaviorOp> {
+    let names = ["located", "held", "named", "greeted"];
+    let mut operations = Vec::new();
+    for _ in 0..rng.below(5) {
+        let relation = names[rng.below(names.len() as u64) as usize].to_string();
+        operations.push(match rng.below(if depth == 0 { 8 } else { 9 }) {
+            0 => BehaviorOp::Resolve {
+                view: relation,
+                arguments: vec![rand_expr(rng)],
+                column: "value".into(),
+                op: if rng.bool() {
+                    MatchOp::Exact
+                } else {
+                    MatchOp::Word
+                },
+                rhs: rand_expr(rng),
+                destinations: vec![format!("v{}", rng.below(4))],
+            },
+            1 => BehaviorOp::Find {
+                relation,
+                arguments: vec![
+                    if rng.bool() {
+                        FindArg::Match(rand_expr(rng))
+                    } else {
+                        FindArg::MatchBind {
+                            value: rand_expr(rng),
+                            local: "bound".into(),
+                        }
+                    },
+                    FindArg::Bind("other".into()),
+                ],
+            },
+            2 => BehaviorOp::Let {
+                local: "x".into(),
+                value: rand_expr(rng),
+            },
+            3 if depth > 0 => BehaviorOp::If {
+                condition: rand_bool(rng, 2),
+                then_ops: rand_ops(rng, depth - 1),
+                else_ops: rand_ops(rng, depth - 1),
+            },
+            3 => BehaviorOp::Expect {
+                relation,
+                arguments: vec![rand_expr(rng)],
+            },
+            4 => BehaviorOp::Assert {
+                relation,
+                arguments: vec![rand_expr(rng)],
+            },
+            5 => BehaviorOp::Retract {
+                relation,
+                arguments: vec![rand_expr(rng)],
+            },
+            6 => BehaviorOp::Emit {
+                relation,
+                arguments: vec![rand_expr(rng)],
+            },
+            _ => BehaviorOp::InvokeCapability {
+                capability: relation,
+                arguments: vec![rand_expr(rng)],
+                destinations: vec!["result".into()],
+            },
+        });
+    }
+    operations
 }
 
 fn rand_behavior(rng: &mut Rng) -> StoredBehavior {
     let ncols = rng.below(4) as usize;
-    let guard = rand_pred(rng, ncols, 2);
-    let nwords = rng.below(7) as usize;
-    let body = (0..nwords).map(|_| rand_word(rng)).collect();
-    StoredBehavior::new(guard, body)
+    StoredBehavior::new(
+        rand_pred(rng, ncols, 2),
+        (0..ncols).map(|index| format!("v{index}")).collect(),
+        BehaviorIr::new(rand_ops(rng, 2)),
+    )
 }
 
 // ---- Oracle 1: codec round-trip -----------------------------------------
@@ -134,9 +228,8 @@ fn behavior_codec_roundtrips_under_random_churn() {
 
             // decode ∘ encode is the identity.
             let bytes = encode_behavior(&b);
-            let back = decode_behavior(&bytes).unwrap_or_else(|e| {
-                panic!("seed {seed}: decode failed: {e:?} for {b:?}")
-            });
+            let back = decode_behavior(&bytes)
+                .unwrap_or_else(|e| panic!("seed {seed}: decode failed: {e:?} for {b:?}"));
             assert_eq!(back, b, "seed {seed}: behavior codec not round-trip");
 
             // The wrapped Value::Code survives the one shared value/tuple codec.
@@ -164,11 +257,17 @@ fn behavior_codec_roundtrips_under_random_churn() {
 
 #[test]
 fn decode_rejects_wrong_version_and_garbage() {
-    let b = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity]);
+    let b = StoredBehavior::new(PredExpr::And(vec![]), vec![], BehaviorIr::default());
     let mut bytes = encode_behavior(&b);
     bytes[0] = grmpl_core::wire::FORMAT_VERSION.wrapping_add(1);
-    assert!(decode_behavior(&bytes).is_err(), "wrong version must be rejected");
-    assert!(decode_behavior(&[]).is_err(), "empty buffer must be rejected");
+    assert!(
+        decode_behavior(&bytes).is_err(),
+        "wrong version must be rejected"
+    );
+    assert!(
+        decode_behavior(&[]).is_err(),
+        "empty buffer must be rejected"
+    );
 }
 
 // ---- Oracle 2: dispatch = the implements view over the live world -------
@@ -215,6 +314,19 @@ fn model_select(
     None
 }
 
+fn stored_assert(guard: PredExpr, parameters: usize, relation: &str) -> StoredBehavior {
+    StoredBehavior::new(
+        guard,
+        (0..parameters)
+            .map(|index| format!("message{index}"))
+            .collect(),
+        BehaviorIr::new(vec![BehaviorOp::Assert {
+            relation: relation.into(),
+            arguments: vec![ExprIr::Value(ValueExpr::Local("self".into()))],
+        }]),
+    )
+}
+
 #[test]
 fn dispatch_matches_model_under_random_churn() {
     grmpl_conformance::for_each_store(|c| {
@@ -225,17 +337,25 @@ fn dispatch_matches_model_under_random_churn() {
             let mut v: Vec<StoredBehavior> = tags
                 .iter()
                 .map(|t| {
-                    StoredBehavior::new(
+                    stored_assert(
                         PredExpr::Eq(RowExpr::Col(0), RowExpr::Lit(Value::text(*t))),
-                        vec![Word::SelfEntity, Word::Assert("greeted".into())],
+                        1,
+                        "greeted",
                     )
                 })
                 .collect();
-            v.push(StoredBehavior::new(PredExpr::And(vec![]), vec![Word::Drop]));
+            v.push(StoredBehavior::new(
+                PredExpr::And(vec![]),
+                vec!["message0".into()],
+                BehaviorIr::default(),
+            ));
             v.into_iter().map(|b| (b.clone(), b.to_value())).collect()
         };
-        let messages: Vec<Tuple> =
-            tags.iter().map(|t| Tuple::from([Value::text(*t)])).chain([Tuple::from([Value::text("z")])]).collect();
+        let messages: Vec<Tuple> = tags
+            .iter()
+            .map(|t| Tuple::from([Value::text(*t)]))
+            .chain([Tuple::from([Value::text("z")])])
+            .collect();
 
         const NE: u64 = 5;
         // Declares the relation a selected body names (`greeted`); compiled once.
@@ -262,14 +382,32 @@ fn dispatch_matches_model_under_random_churn() {
                         let e = rng.below(NE);
                         let bidx = rng.below(pool.len() as u64) as usize;
                         let row = (e, bidx);
-                        let diff = if direct.remove(&row) { -1 } else { direct.insert(row); 1 };
-                        batch.push((DIRECT, Tuple::from([Value::Ent(Entity(e)), pool[bidx].1.clone()]), diff));
+                        let diff = if direct.remove(&row) {
+                            -1
+                        } else {
+                            direct.insert(row);
+                            1
+                        };
+                        batch.push((
+                            DIRECT,
+                            Tuple::from([Value::Ent(Entity(e)), pool[bidx].1.clone()]),
+                            diff,
+                        ));
                     } else {
                         let e = rng.below(NE);
                         let p = rng.below(NE);
                         let row = (e, p);
-                        let diff = if proto.remove(&row) { -1 } else { proto.insert(row); 1 };
-                        batch.push((PROTO, Tuple::from([Value::Ent(Entity(e)), Value::Ent(Entity(p))]), diff));
+                        let diff = if proto.remove(&row) {
+                            -1
+                        } else {
+                            proto.insert(row);
+                            1
+                        };
+                        batch.push((
+                            PROTO,
+                            Tuple::from([Value::Ent(Entity(e)), Value::Ent(Entity(p))]),
+                            diff,
+                        ));
                     }
                 }
                 let ed = store.commit(&batch).unwrap();
@@ -317,40 +455,68 @@ fn live_redefinition_through_prototype() {
 
         let auth = Authority::new(
             DomainId(1),
-            vec![Scope::whole(direct), Scope::whole(proto), Scope::whole(greeted), Scope::whole(waved)],
+            vec![
+                Scope::whole(direct),
+                Scope::whole(proto),
+                Scope::whole(greeted),
+                Scope::whole(waved),
+            ],
         );
         let player = Entity(10);
         let avatar = Entity(20);
         let msg = Tuple::from([]);
 
         // A behavior that greets, and one that waves — both stored as data.
-        let greet = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("greeted".into())]);
-        let wave = StoredBehavior::new(PredExpr::And(vec![]), vec![Word::SelfEntity, Word::Assert("waved".into())]);
+        let greet = stored_assert(PredExpr::And(vec![]), 0, "greeted");
+        let wave = stored_assert(PredExpr::And(vec![]), 0, "waved");
 
         // Install: player inherits from avatar, avatar directly has `greet`.
         let install = grmpl_core::Patch::new()
-            .assert(grmpl_core::Fact::new(proto, Tuple::from([Value::Ent(player), Value::Ent(avatar)])))
-            .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])));
+            .assert(grmpl_core::Fact::new(
+                proto,
+                Tuple::from([Value::Ent(player), Value::Ent(avatar)]),
+            ))
+            .assert(grmpl_core::Fact::new(
+                direct,
+                Tuple::from([Value::Ent(avatar), greet.to_value()]),
+            ));
         commit_patch(store, &NoSchemas, &install, &auth).unwrap();
 
         // The player dispatches the *inherited* behavior via the implements view.
         let snap = Snapshot::at_current(store);
         let behaviors = implemented_behaviors(direct, proto, player, &snap).unwrap();
-        assert_eq!(behaviors, vec![greet.clone()], "player must inherit avatar's behavior");
-        let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
+        assert_eq!(
+            behaviors,
+            vec![greet.clone()],
+            "player must inherit avatar's behavior"
+        );
+        let patch = dispatch(&prog, direct, proto, player, &snap, &msg)
+            .unwrap()
+            .unwrap();
         assert_eq!(patch.asserts.len(), 1);
         assert_eq!(patch.asserts[0].rel, greeted, "inherited dispatch greets");
 
         // Redefine the prototype's behavior with an *ordinary Patch* — no new
         // mechanism. The next dispatch through the same player follows immediately.
         let redefine = grmpl_core::Patch::new()
-            .retract(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), greet.to_value()])))
-            .assert(grmpl_core::Fact::new(direct, Tuple::from([Value::Ent(avatar), wave.to_value()])));
+            .retract(grmpl_core::Fact::new(
+                direct,
+                Tuple::from([Value::Ent(avatar), greet.to_value()]),
+            ))
+            .assert(grmpl_core::Fact::new(
+                direct,
+                Tuple::from([Value::Ent(avatar), wave.to_value()]),
+            ));
         commit_patch(store, &NoSchemas, &redefine, &auth).unwrap();
 
         let snap = Snapshot::at_current(store);
-        let patch = dispatch(&prog, direct, proto, player, &snap, &msg).unwrap().unwrap();
+        let patch = dispatch(&prog, direct, proto, player, &snap, &msg)
+            .unwrap()
+            .unwrap();
         assert_eq!(patch.asserts.len(), 1);
-        assert_eq!(patch.asserts[0].rel, waved, "after redefinition, dispatch waves — live code");
+        assert_eq!(
+            patch.asserts[0].rel, waved,
+            "after redefinition, dispatch waves — live code"
+        );
     });
 }

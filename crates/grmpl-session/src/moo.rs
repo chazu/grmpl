@@ -7,12 +7,11 @@
 use std::sync::Arc;
 
 use grmpl_core::{
-    Authority, Diff, DomainId, Entity, Fact, Message, Patch, RelId, Result, Scope, Tuple, Value,
-    WorldStore,
+    Authority, DomainId, Entity, Message, Patch, RelId, Result, Scope, Tuple, Value, WorldStore,
 };
 use grmpl_diff::Snapshot;
-use grmpl_lang::Program;
-use grmpl_proc::{seed_seq, Alloc, Behavior, OnWatch, Process};
+use grmpl_lang::{GrantSet, Program};
+use grmpl_proc::{Behavior, OnWatch, Process};
 
 use crate::runtime::Runtime;
 use crate::watch::{Subscription, WatchRelations};
@@ -47,13 +46,6 @@ pub const INSTANCE_STRIDE: u64 = 1_000;
 /// Dynamic players and builder-created entities are kept above every static and
 /// instanced MOO block.
 pub const ID_BASE: i64 = 1_000_000;
-
-const PATROL: [(Entity, Entity); 4] = [
-    (FOYER, LIBRARY),
-    (LIBRARY, GARDEN),
-    (GARDEN, MARKET),
-    (MARKET, FOYER),
-];
 
 /// Durable relation ids resolved from the world program's catalog.
 #[derive(Clone, Copy, Debug)]
@@ -167,11 +159,11 @@ impl MooRuntime {
         store: Arc<dyn WorldStore>,
         source: &str,
     ) -> std::result::Result<Arc<MooRuntime>, String> {
-        let runtime = Runtime::compile(store, source, 1)?;
+        let grants =
+            GrantSet::new().grant_allocate("entities", "entity_seq", ID_BASE, 1_999_999)?;
+        let runtime = Runtime::load_package(store, source, 1, &grants)?;
         let rels = MooRelations::resolve(&runtime).map_err(|e| e.to_string())?;
-        let moo = Arc::new(MooRuntime { runtime, rels });
-        moo.seed().map_err(|e| e.to_string())?;
-        Ok(moo)
+        Ok(Arc::new(MooRuntime { runtime, rels }))
     }
 
     pub fn runtime(&self) -> &Arc<Runtime> {
@@ -251,7 +243,12 @@ impl MooRuntime {
             authority: self.patrol_authority(),
             inbox: self.rels.inbox,
             cursor_rel: self.rels.cursor,
-            behavior: Program::behavior(self.program(), "inbox", entity)?,
+            behavior: Program::behavior_with_grants(
+                self.program(),
+                "inbox",
+                entity,
+                self.runtime.shared_grants(),
+            )?,
         })
     }
 
@@ -287,17 +284,13 @@ impl MooRuntime {
         ))
     }
 
-    fn seed(&self) -> Result<()> {
-        seed_world(self.store(), self.rels)?;
-        seed_rules(self.store(), self.rels)?;
-        seed_entity_counter(self.store(), self.rels)?;
-        seed_seq(self.store(), self.rels.inbox_seq, PLAYER)?;
-        seed_seq(self.store(), self.rels.inbox_seq, CAT)?;
-        Ok(())
-    }
-
     fn player_behavior(&self, player: Entity) -> std::result::Result<Behavior, String> {
-        let language = Program::behavior(self.program(), "inbox", player)?;
+        let language = Program::behavior_with_grants(
+            self.program(),
+            "inbox",
+            player,
+            self.runtime.shared_grants(),
+        )?;
         let rels = self.rels;
         Ok(Box::new(move |snap, body| {
             let verb = body.as_slice().first().and_then(|v| match v {
@@ -306,10 +299,27 @@ impl MooRuntime {
             });
             match verb {
                 Some("look") => native_look(snap, rels, player),
-                Some("create") => native_create(snap, rels, player, body),
-                Some("dig") => native_dig(snap, rels, player, body),
                 _ => {
-                    let patch = language(snap, body)?;
+                    let mut patch = language(snap, body)?;
+                    if !patch_is_empty(&patch) {
+                        if let Some(prefix) = match verb {
+                            Some("create") => Some("Created"),
+                            Some("dig") => Some("Dug"),
+                            _ => None,
+                        } {
+                            let name = text_of(&noun(body, "thing"));
+                            for message in &mut patch.emits {
+                                if message.inbox == rels.tell
+                                    && message.body.as_slice().first() == Some(&Value::Ent(player))
+                                {
+                                    message.body = Tuple::from([
+                                        Value::Ent(player),
+                                        Value::text(format!("{prefix} {name}.")),
+                                    ]);
+                                }
+                            }
+                        }
+                    }
                     if patch_is_empty(&patch) {
                         let text = match verb {
                             Some("take") => "You don't see that here.",
@@ -374,61 +384,6 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-fn native_create(
-    snap: &Snapshot,
-    rels: MooRelations,
-    player: Entity,
-    body: &Tuple,
-) -> Result<Patch> {
-    let Some(room) = room_of(snap, rels, player)? else {
-        return Ok(Patch::new().emit(tell(rels, player, "You are nowhere.")));
-    };
-    let name = noun(body, "thing");
-    let mut alloc = Alloc::from_snapshot(snap, rels.entity_seq, ID_BASE)?;
-    let entity = alloc.fresh();
-    Ok(alloc.seal(
-        Patch::new()
-            .assert(Fact::new(
-                rels.named,
-                Tuple::from([Value::Ent(entity), name.clone()]),
-            ))
-            .assert(Fact::new(
-                rels.located,
-                Tuple::from([Value::Ent(entity), Value::Ent(room)]),
-            ))
-            .emit(tell(rels, player, format!("Created {}.", text_of(&name)))),
-    ))
-}
-
-fn native_dig(snap: &Snapshot, rels: MooRelations, player: Entity, body: &Tuple) -> Result<Patch> {
-    let Some(room) = room_of(snap, rels, player)? else {
-        return Ok(Patch::new().emit(tell(rels, player, "You are nowhere.")));
-    };
-    let name = noun(body, "room");
-    let mut alloc = Alloc::from_snapshot(snap, rels.entity_seq, ID_BASE)?;
-    let destination = alloc.fresh();
-    Ok(alloc.seal(
-        Patch::new()
-            .assert(Fact::new(
-                rels.named,
-                Tuple::from([Value::Ent(destination), name.clone()]),
-            ))
-            .assert(Fact::new(
-                rels.exits,
-                Tuple::from([Value::Ent(room), name.clone(), Value::Ent(destination)]),
-            ))
-            .assert(Fact::new(
-                rels.exits,
-                Tuple::from([
-                    Value::Ent(destination),
-                    Value::text("back"),
-                    Value::Ent(room),
-                ]),
-            ))
-            .emit(tell(rels, player, format!("Dug {}.", text_of(&name)))),
-    ))
-}
-
 fn native_look(snap: &Snapshot, rels: MooRelations, player: Entity) -> Result<Patch> {
     let Some(room) = room_of(snap, rels, player)? else {
         return Ok(Patch::new().emit(tell(rels, player, "You are nowhere.")));
@@ -480,150 +435,4 @@ fn native_look(snap: &Snapshot, rels: MooRelations, player: Entity) -> Result<Pa
     Ok(Patch::new()
         .emit(tell(rels, player, things))
         .emit(tell(rels, player, exits)))
-}
-
-fn seed_world(store: &dyn WorldStore, r: MooRelations) -> Result<()> {
-    let at = store.current();
-    let seeded = store
-        .read_at(r.named, at)?
-        .into_iter()
-        .any(|(t, d)| d > 0 && t.as_slice().first() == Some(&Value::Ent(PLAYER)));
-    if seeded {
-        return Ok(());
-    }
-    let e = Value::Ent;
-    let t = Value::text;
-    let mut facts: Vec<(RelId, Tuple, Diff)> = Vec::new();
-    let located = |who: Entity, room: Entity, facts: &mut Vec<_>| {
-        facts.push((r.located, Tuple::from([e(who), e(room)]), 1));
-    };
-    for (who, room) in [
-        (PLAYER, FOYER),
-        (LAMP, FOYER),
-        (KEY, FOYER),
-        (BOOK, LIBRARY),
-        (ROSE, GARDEN),
-        (COIN, MARKET),
-        (CAKE, KITCHEN),
-        (CAT, FOYER),
-        (MERCHANT, MARKET),
-    ] {
-        located(who, room, &mut facts);
-    }
-    for (who, name) in [
-        (PLAYER, "you"),
-        (FOYER, "Foyer"),
-        (LIBRARY, "Library"),
-        (GARDEN, "Garden"),
-        (MARKET, "Market"),
-        (OBSERVATORY, "Observatory"),
-        (KITCHEN, "Kitchen"),
-        (LAMP, "brass lamp"),
-        (KEY, "iron key"),
-        (BOOK, "old book"),
-        (ROSE, "red rose"),
-        (COIN, "gold coin"),
-        (CAKE, "iced cake"),
-        (CAT, "Whiskers"),
-        (MERCHANT, "Bartleby"),
-    ] {
-        facts.push((r.named, Tuple::from([e(who), t(name)]), 1));
-    }
-    facts.push((r.players, Tuple::from([e(PLAYER), t("you")]), 1));
-    for (who, label) in [(CAT, "a cat"), (MERCHANT, "a merchant")] {
-        facts.push((r.person, Tuple::from([e(who)]), 1));
-        facts.push((r.label, Tuple::from([e(who), t(label)]), 1));
-    }
-    facts.push((r.knows, Tuple::from([e(PLAYER), e(PLAYER)]), 1));
-    for (obj, coins) in [
-        (LAMP, 10),
-        (KEY, 1),
-        (BOOK, 3),
-        (ROSE, 5),
-        (COIN, 20),
-        (CAKE, 2),
-    ] {
-        facts.push((r.value, Tuple::from([e(obj), Value::Int(coins)]), 1));
-    }
-    for (from, way, to) in [
-        (FOYER, "north", LIBRARY),
-        (LIBRARY, "south", FOYER),
-        (FOYER, "east", GARDEN),
-        (GARDEN, "west", FOYER),
-        (FOYER, "west", KITCHEN),
-        (KITCHEN, "east", FOYER),
-        (FOYER, "up", OBSERVATORY),
-        (OBSERVATORY, "down", FOYER),
-        (GARDEN, "south", MARKET),
-        (MARKET, "north", GARDEN),
-    ] {
-        facts.push((r.exits, Tuple::from([e(from), t(way), e(to)]), 1));
-    }
-    for (from, to) in PATROL {
-        facts.push((r.patrol, Tuple::from([e(from), e(to)]), 1));
-    }
-    located(VAULT_TORCH, VAULT_ANTE, &mut facts);
-    located(VAULT_GEM, VAULT_INNER, &mut facts);
-    for (who, name) in [
-        (VAULT_ANTE, "Vault Antechamber"),
-        (VAULT_INNER, "Inner Vault"),
-        (VAULT_TORCH, "a guttering torch"),
-        (VAULT_GEM, "a great gemstone"),
-    ] {
-        facts.push((r.named, Tuple::from([e(who), t(name)]), 1));
-    }
-    for (from, way, to) in [
-        (VAULT_ANTE, "north", VAULT_INNER),
-        (VAULT_INNER, "south", VAULT_ANTE),
-    ] {
-        facts.push((r.exits, Tuple::from([e(from), t(way), e(to)]), 1));
-    }
-    store.commit(&facts)?;
-    Ok(())
-}
-
-fn seed_entity_counter(store: &dyn WorldStore, r: MooRelations) -> Result<()> {
-    if store.read_at(r.entity_seq, store.current())?.is_empty() {
-        store.commit(&[(r.entity_seq, Tuple::from([Value::Int(ID_BASE)]), 1)])?;
-    }
-    Ok(())
-}
-
-fn seed_rules(store: &dyn WorldStore, r: MooRelations) -> Result<()> {
-    if !store.read_at(r.cardval, store.current())?.is_empty() {
-        return Ok(());
-    }
-    let i = Value::Int;
-    let mut facts = Vec::new();
-    for code in 0..52i64 {
-        let rank = code % 13;
-        facts.push((r.cardval, Tuple::from([i(code), i((rank + 1).min(10))]), 1));
-        facts.push((r.cardrank, Tuple::from([i(code), i(rank)]), 1));
-    }
-    for a in 0..5i64 {
-        for b in (a + 1)..5 {
-            facts.push((r.slotpair, Tuple::from([i(a), i(b)]), 1));
-        }
-    }
-    for a in 0..5i64 {
-        for b in (a + 1)..5 {
-            for c in (b + 1)..5 {
-                facts.push((r.slottrio, Tuple::from([i(a), i(b), i(c)]), 1));
-            }
-        }
-    }
-    for a in 1..=10i64 {
-        for b in 1..=10i64 {
-            if a + b == 15 {
-                facts.push((r.sum15two, Tuple::from([i(a), i(b)]), 1));
-            }
-            for c in 1..=10i64 {
-                if a + b + c == 15 {
-                    facts.push((r.sum15three, Tuple::from([i(a), i(b), i(c)]), 1));
-                }
-            }
-        }
-    }
-    store.commit(&facts)?;
-    Ok(())
 }

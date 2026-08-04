@@ -20,9 +20,9 @@ use grmpl_core::{
     Authority, DomainId, Entity, Error, KeyRange, NoSchemas, Patch, RelId, Scope, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
-use grmpl_lang::Program;
-use grmpl_proc::{commit_patch, CommitOutcome};
 use grmpl_ent::EntStore;
+use grmpl_lang::{CompiledPackage, GrantSet, Program};
+use grmpl_proc::{commit_patch, CommitOutcome};
 use grmpl_type::{
     check_authority, check_handler_authority, infer_handler_effects, EffectError, EffectRow,
 };
@@ -45,7 +45,7 @@ const SRC: &str = r#"
     on inbox parse cmd {
         match Wa()  { assert a(self) }
         match Wb()  { assert b(self) }
-        match Wc()  { retract c(self)  emit d(self) }
+        match Wc()  { retract c(self)  emit d(self, 0, "message") }
         match Wab() { assert a(self)  retract b(self) }
     }
 "#;
@@ -113,6 +113,44 @@ fn effect_row_collects_writes_and_sends() {
     assert!(!row.is_empty());
 }
 
+#[test]
+fn capability_effects_include_symbols_and_durable_state_writes() {
+    let source = r#"
+        package effects bootstrap 1
+        entity OWNER = 1
+        rel counter(next: Int)
+        rel rng(owner: Ent, state: Int)
+        rel inbox(process: Ent, seq: Int, body: Tuple)
+        rel made(thing: Ent, roll: Int)
+        requires allocate entities(counter: counter, first: 100, last: 110)
+        requires random rolls(state: rng, owner: OWNER, algorithm: xorshift64star_v1)
+        form cmd { "go" -> Go() }
+        on inbox parse cmd {
+            match Go() {
+                fresh entities as thing
+                random rolls below 10 as roll
+                assert made(thing, roll)
+            }
+        }
+        bootstrap { counter(100) rng(OWNER, 1) }
+    "#;
+    let (store, _dir) = store();
+    let package = CompiledPackage::compile_with_catalog(source, &store, 20).unwrap();
+    let row = infer_handler_effects(&package.program, "inbox").unwrap();
+    assert_eq!(
+        row.capabilities().collect::<Vec<_>>(),
+        vec!["entities", "rolls"]
+    );
+    assert_eq!(
+        row.writes().collect::<Vec<_>>(),
+        vec![
+            package.program.rel_id("counter").unwrap(),
+            package.program.rel_id("rng").unwrap(),
+            package.program.rel_id("made").unwrap(),
+        ]
+    );
+}
+
 /// The effect row must over-approximate every reachable patch's writes exactly:
 /// each command's actual writes ⊆ the row, and the row's union == all commands'
 /// writes. This is the soundness of the inference itself.
@@ -139,7 +177,10 @@ fn effect_row_matches_the_behavior_it_summarizes() {
     }
     seen.sort();
     seen.dedup();
-    assert_eq!(seen, row_writes, "row is exactly the union of reachable writes");
+    assert_eq!(
+        seen, row_writes,
+        "row is exactly the union of reachable writes"
+    );
 }
 
 #[test]
@@ -196,7 +237,9 @@ fn a_written_relation_outside_the_domain_is_rejected() {
     ]);
     assert_eq!(
         check_handler_authority(&prog, "inbox", &auth),
-        Err(EffectError::Unauthorized { rel: rid(&prog, "c") })
+        Err(EffectError::Unauthorized {
+            rel: rid(&prog, "c")
+        })
     );
 }
 
@@ -211,7 +254,14 @@ fn relation_level_owns_a_slice_but_commit_still_checks_the_range() {
     let a = rid(&prog, "a");
 
     // A slice of `a` on col 0 covering ids 1000..=2000 — SELF (id 1) is outside.
-    let auth = domain(vec![Scope::slice(a, KeyRange { col: 0, lo: 1000, hi: 2000 })]);
+    let auth = domain(vec![Scope::slice(
+        a,
+        KeyRange {
+            col: 0,
+            lo: 1000,
+            hi: 2000,
+        },
+    )]);
 
     // Relation-level: the write to `a` is authorized statically (we own a slice
     // of `a`), so inference + check pass.
@@ -227,7 +277,10 @@ fn relation_level_owns_a_slice_but_commit_still_checks_the_range() {
     // at the boundary by the *range* check — exactly what P8b defers to commit.
     let patch = run_cmd(&prog, &store, "wa");
     let outcome = commit_patch(&store, &NoSchemas, &patch, &auth);
-    assert!(matches!(outcome, Err(Error::Authority(_))), "range still checked at commit");
+    assert!(
+        matches!(outcome, Err(Error::Authority(_))),
+        "range still checked at commit"
+    );
 }
 
 /// An effect row containing exactly one write relation, for isolating a single
@@ -318,7 +371,10 @@ fn static_authority_matches_commit_boundary_under_random_domains() {
                 );
                 // And a static pass means every written relation is owned.
                 for r in row.writes() {
-                    assert!(owned.contains(&r), "seed {seed}: passed but {r:?} not owned");
+                    assert!(
+                        owned.contains(&r),
+                        "seed {seed}: passed but {r:?} not owned"
+                    );
                 }
             }
             Err(EffectError::Unauthorized { rel }) => {
@@ -328,7 +384,10 @@ fn static_authority_matches_commit_boundary_under_random_domains() {
                     "seed {seed}: static rejected {rel:?} but no commit tripped Authority \
                      (owned={owned:?})"
                 );
-                assert!(!owned.contains(&rel), "seed {seed}: rejected an owned {rel:?}");
+                assert!(
+                    !owned.contains(&rel),
+                    "seed {seed}: rejected an owned {rel:?}"
+                );
             }
             Err(other) => panic!("seed {seed}: unexpected effect error {other:?}"),
         }
@@ -373,12 +432,61 @@ fn concatenative_and_statement_arms_infer_the_same_effects() {
     let row_concat = infer_handler_effects(&concat, "inbox").unwrap();
 
     // Relation ids line up (same declaration order), so the rows are equal.
-    assert_eq!(row_stmt.writes().collect::<Vec<_>>(), row_concat.writes().collect::<Vec<_>>());
-    assert_eq!(row_stmt.sends().collect::<Vec<_>>(), row_concat.sends().collect::<Vec<_>>());
+    assert_eq!(
+        row_stmt.writes().collect::<Vec<_>>(),
+        row_concat.writes().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        row_stmt.sends().collect::<Vec<_>>(),
+        row_concat.sends().collect::<Vec<_>>()
+    );
     // Concretely: writes = {a, b}, sends = {d}.
     assert_eq!(
         row_concat.writes().collect::<Vec<_>>(),
         vec![rid(&concat, "a"), rid(&concat, "b")]
     );
-    assert_eq!(row_concat.sends().collect::<Vec<_>>(), vec![rid(&concat, "d")]);
+    assert_eq!(
+        row_concat.sends().collect::<Vec<_>>(),
+        vec![rid(&concat, "d")]
+    );
+}
+
+#[test]
+fn schedule_effects_include_the_capability_and_timer_write() {
+    let source = r#"
+        package schedule_effect bootstrap 1
+        entity ACTOR = 7
+        rel clock(seq: Int, wall_ms: Int, random: Int)
+        rel timers(due: Int, inbox: Int, target: Ent, body: Tuple)
+        rel inbox(process: Ent, seq: Int, body: Tuple)
+        rel inbox_seq(process: Ent, next: Int)
+        rel cursor(process: Ent, pos: Int)
+        requires schedule world_clock(clock: clock, timers: timers, sequences: inbox_seq)
+        authority writes { write cursor write timers }
+        actor ACTOR { inbox inbox cursor cursor authority writes }
+        form command { "start" -> Start() "tick" -> Tick() }
+        on inbox parse command {
+            match Start() { schedule world_clock at 1 send Tick() to ACTOR }
+            match Tick() { }
+        }
+        bootstrap { inbox(ACTOR, 0, ("start")) inbox_seq(ACTOR, 1) }
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    let store = EntStore::open(dir.path()).unwrap();
+    let package = CompiledPackage::compile_with_catalog(source, &store, 100).unwrap();
+    let effects = infer_handler_effects(&package.program, "inbox").unwrap();
+    assert_eq!(
+        effects.capabilities().collect::<Vec<_>>(),
+        vec!["world_clock"]
+    );
+    assert_eq!(
+        effects.writes().collect::<Vec<_>>(),
+        vec![package.program.rel_id("timers").unwrap()]
+    );
+
+    let grants = GrantSet::new()
+        .grant_schedule("world_clock", "clock", "timers", "inbox_seq", ["ACTOR"])
+        .unwrap();
+    let resolved = package.resolve_grants(&grants).unwrap();
+    assert!(resolved.get("world_clock").is_some());
 }

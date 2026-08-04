@@ -19,6 +19,9 @@ pub enum Error {
     /// `Reduce` (an aggregate) placed inside a recursive `Iterate`, whose
     /// fixpoint requires a monotone, linear step (grmpl-diff P2).
     Query(String),
+    /// Deterministic behavior evaluation failure. Retrying the same
+    /// snapshot/message cannot repair it.
+    Behavior(String),
     /// A physical (de)serialization failure below the line.
     Codec(String),
 }
@@ -31,6 +34,7 @@ impl fmt::Display for Error {
             Error::Schema(s) => write!(f, "schema violation: {s}"),
             Error::PreconditionFailed => write!(f, "precondition failed"),
             Error::Query(s) => write!(f, "invalid query: {s}"),
+            Error::Behavior(s) => write!(f, "behavior fault: {s}"),
             Error::Codec(s) => write!(f, "codec error: {s}"),
         }
     }

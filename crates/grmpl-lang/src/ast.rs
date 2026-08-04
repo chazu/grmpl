@@ -11,12 +11,35 @@ pub struct ColDecl {
     pub ty: Option<String>,
 }
 
+use grmpl_core::{FiniteF64, Value};
+
 /// An argument to a view atom: a variable, or a literal.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Arg {
     Var(String),
     Str(String),
     Int(i64),
+    Float(FiniteF64),
+    Bool(bool),
+}
+
+/// A literal admitted by a package bootstrap block.
+#[derive(Clone, PartialEq, Debug)]
+pub enum BootstrapValue {
+    /// An entity constant name, resolved during package compilation.
+    Entity(String),
+    Int(i64),
+    Float(FiniteF64),
+    Text(String),
+    Bool(bool),
+    Tuple(Vec<BootstrapValue>),
+}
+
+/// One relation fact in a package bootstrap block.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BootstrapFact {
+    pub rel: String,
+    pub values: Vec<BootstrapValue>,
 }
 
 /// A body atom of a `view`: `rel(arg, arg, ...)`.
@@ -70,10 +93,59 @@ pub enum SArg {
     Var(String),
     Str(String),
     Int(i64),
+    Float(FiniteF64),
+    Bool(bool),
+}
+
+/// Unary expression operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+/// Binary expression operator, ordered here only for structural equality; the
+/// parser supplies conventional precedence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+/// A bounded behavior expression. Calls are resolved against the closed
+/// intrinsic registry during behavior-IR lowering.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Expr {
+    Var(String),
+    Lit(Value),
+    Unary {
+        op: UnaryOp,
+        value: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// How a `resolve` matches a column: exact (`=`) or word-membership (`~`).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchOp {
     Exact,
     Word,
@@ -82,14 +154,63 @@ pub enum MatchOp {
 /// A statement in an `on` handler arm.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Stmt {
+    Let {
+        name: String,
+        value: Expr,
+    },
+    If {
+        condition: Expr,
+        then_stmts: Vec<Stmt>,
+        else_stmts: Vec<Stmt>,
+    },
+    /// Allocate one entity through a declared/granted bounded allocator.
+    Fresh {
+        capability: String,
+        local: String,
+    },
+    /// Draw one unbiased integer in `[0, bound)` from a declared/granted stream.
+    Random {
+        capability: String,
+        bound: Expr,
+        local: String,
+    },
+    /// Schedule a constructor-shaped message through a declared capability.
+    Schedule {
+        capability: String,
+        due: Expr,
+        tag: String,
+        arguments: Vec<Expr>,
+        target: String,
+    },
     /// Run a view, match a yielded column, bind all yielded columns as vars.
-    Resolve { view: String, args: Vec<SArg>, col: String, op: MatchOp, rhs: SArg },
+    Resolve {
+        view: String,
+        args: Vec<SArg>,
+        col: String,
+        op: MatchOp,
+        rhs: SArg,
+    },
     /// Look a tuple up in a base relation; bind its unbound variable columns.
-    Find { rel: String, args: Vec<SArg> },
-    Expect { rel: String, args: Vec<SArg> },
-    Assert { rel: String, args: Vec<SArg> },
-    Retract { rel: String, args: Vec<SArg> },
-    Emit { rel: String, args: Vec<SArg> },
+    Find {
+        rel: String,
+        args: Vec<SArg>,
+    },
+    Expect {
+        rel: String,
+        args: Vec<SArg>,
+    },
+    Assert {
+        rel: String,
+        args: Vec<SArg>,
+    },
+    Retract {
+        rel: String,
+        args: Vec<SArg>,
+    },
+    Emit {
+        rel: String,
+        args: Vec<SArg>,
+    },
 }
 
 /// One arm of an `on` handler: `match Tag(v..) { stmt* }`.
@@ -103,7 +224,58 @@ pub struct Arm {
 /// A top-level declaration.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Decl {
-    Rel { name: String, cols: Vec<ColDecl> },
+    /// Exactly one is required by `CompiledPackage`; legacy `Program` sources
+    /// may omit it.
+    Package {
+        id: String,
+        bootstrap_version: u32,
+    },
+    /// A compile-time entity constant.
+    Entity {
+        name: String,
+        id: i64,
+    },
+    /// A host-granted unary entity allocator requirement.
+    RequireAllocate {
+        name: String,
+        counter: String,
+        first: i64,
+        last: i64,
+    },
+    /// A host-granted deterministic scalar RNG requirement.
+    RequireRandom {
+        name: String,
+        state: String,
+        owner: String,
+        algorithm: String,
+    },
+    /// A host-granted durable clock/timer/sequence bundle.
+    RequireSchedule {
+        name: String,
+        clock: String,
+        timers: String,
+        sequences: String,
+    },
+    /// Relations a named actor requests authority to write.
+    Authority {
+        name: String,
+        writes: Vec<String>,
+    },
+    /// A statically declared actor bound to an entity, inbox, and cursor.
+    Actor {
+        entity: String,
+        inbox: String,
+        cursor: String,
+        authority: String,
+    },
+    /// Initial world facts installed atomically with the package marker.
+    Bootstrap {
+        facts: Vec<BootstrapFact>,
+    },
+    Rel {
+        name: String,
+        cols: Vec<ColDecl>,
+    },
     /// A `view`. `yields` are the plain grouping/projection columns of the
     /// `yield` clause; `agg` is the optional single aggregate (`sum(pts)`,
     /// `count()`). With `agg == None` the view lowers to a projection (v1
@@ -116,7 +288,10 @@ pub enum Decl {
         yields: Vec<String>,
         agg: Option<AggYield>,
     },
-    Form { name: String, rules: Vec<FormRule> },
+    Form {
+        name: String,
+        rules: Vec<FormRule>,
+    },
     /// An `on` handler binding executable behavior to an inbox. Its arms may be
     /// written in either surface and freely mixed: `stmt_arms` are the v1
     /// statement bodies (`match Tag(v) { stmt* }`), `word_arms` are the

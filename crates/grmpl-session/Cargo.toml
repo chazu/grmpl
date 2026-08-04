@@ -12,6 +12,7 @@ grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }
 grmpl-pattern = { path = "../grmpl-pattern" }
 grmpl-proc = { path = "../grmpl-proc" }
+grmpl-type = { path = "../grmpl-type" }
 
 [dev-dependencies]
 grmpl-conformance = { path = "../grmpl-conformance" }

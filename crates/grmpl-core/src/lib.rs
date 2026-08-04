@@ -11,6 +11,7 @@ pub mod authority;
 pub mod behavior;
 pub mod error;
 pub mod fact;
+pub mod hash;
 pub mod patch;
 pub mod schema;
 pub mod store;
@@ -23,11 +24,12 @@ pub use authority::{Authority, KeyRange, Scope};
 pub use behavior::{BehaviorChecker, NoBehaviorCheck};
 pub use error::{Error, Result};
 pub use fact::Fact;
+pub use hash::{sha256, Sha256Digest};
 pub use patch::{CursorMove, Message, Patch, Scheduled};
 pub use schema::{Column, Schema, Ty};
 pub use store::{
     Catalog, EditionReader, EditionStore, NoSchemas, SchemaCatalog, TraceStore, WorldStore,
 };
-pub use transport::Transport;
 pub use time::{Diff, Edition, Time, Update};
-pub use value::{DomainId, Entity, RelId, Tuple, Value};
+pub use transport::Transport;
+pub use value::{DomainId, Entity, FiniteF64, RelId, Tuple, Value};

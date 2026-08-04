@@ -67,7 +67,13 @@ pub trait TraceStore: EditionStore {
     /// scanning the relation — the substrate-level fast path the language's join
     /// pushdown ([`grmpl_diff`]'s `RangeRel`) rides on. Naming a tuple range is a
     /// pure value-level contract; the trait still names no storage technology.
-    fn read_range(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+    fn read_range(
+        &self,
+        rel: RelId,
+        at: Edition,
+        lo: &Tuple,
+        hi: &Tuple,
+    ) -> Result<Vec<(Tuple, Diff)>> {
         Ok(self
             .read_at(rel, at)?
             .into_iter()
@@ -292,7 +298,11 @@ pub trait EditionReader: Send + Sync {
     /// [`read`](Self::read) restricted to the tuple-key half-open range
     /// `[lo, hi)`.
     fn read_range(&self, rel: RelId, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
-        Ok(self.read(rel)?.into_iter().filter(|(t, _)| lo <= t && t < hi).collect())
+        Ok(self
+            .read(rel)?
+            .into_iter()
+            .filter(|(t, _)| lo <= t && t < hi)
+            .collect())
     }
 
     /// [`read`](Self::read) restricted to rows whose column `col` lies in
@@ -418,7 +428,9 @@ pub struct NoSchemas;
 
 impl SchemaCatalog for NoSchemas {
     fn put_schema(&self, _rel: RelId, _schema: &Schema, _at: Edition) -> Result<()> {
-        Err(crate::error::Error::Store("no schema registry available".into()))
+        Err(crate::error::Error::Store(
+            "no schema registry available".into(),
+        ))
     }
     fn schema(&self, _rel: RelId) -> Result<Option<Schema>> {
         Ok(None)

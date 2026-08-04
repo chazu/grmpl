@@ -55,6 +55,7 @@ fn check(q: &QueryIr, cat: &MemSchemas) -> std::result::Result<RowTy, TypeError>
 fn value_ty_maps_each_ground_case() {
     assert_eq!(value_ty(&Value::Ent(Entity(1))), Ty::Ent);
     assert_eq!(value_ty(&Value::Int(3)), Ty::Int);
+    assert_eq!(value_ty(&Value::float(1.25).unwrap()), Ty::Float);
     assert_eq!(value_ty(&Value::text("x")), Ty::Text);
     assert_eq!(value_ty(&Value::Bool(true)), Ty::Bool);
     assert_eq!(
@@ -464,7 +465,7 @@ fn iterate_widens_to_the_full_fixpoint_not_one_kleene_step() {
 // synthesizer to the runtime (catching typer/runtime layout drift) and is what
 // would have caught the single-Kleene-step `Iterate` unsoundness above.
 
-use grmpl_core::{EditionStore, Tuple, TraceStore};
+use grmpl_core::{EditionStore, TraceStore, Tuple};
 use grmpl_diff::eval_snapshot;
 use grmpl_ent::EntStore;
 

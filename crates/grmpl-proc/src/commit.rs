@@ -9,7 +9,7 @@
 //! retries against the new edition.
 
 use grmpl_core::{
-    Authority, BehaviorChecker, Diff, Edition, Error, Fact, NoBehaviorCheck, Patch, Result, RelId,
+    Authority, BehaviorChecker, Diff, Edition, Error, Fact, NoBehaviorCheck, Patch, RelId, Result,
     SchemaCatalog, TraceStore, Tuple,
 };
 
@@ -24,9 +24,9 @@ pub fn check_schema<'a>(
 ) -> Result<()> {
     for f in facts {
         if let Some(schema) = schemas.schema(f.rel)? {
-            schema.check(&f.tuple).map_err(|e| {
-                Error::Schema(format!("write to relation {}: {e}", f.rel.0))
-            })?;
+            schema
+                .check(&f.tuple)
+                .map_err(|e| Error::Schema(format!("write to relation {}: {e}", f.rel.0)))?;
         }
     }
     Ok(())
@@ -86,7 +86,12 @@ pub fn commit_patch_checked(
         .collect();
 
     // Authority law: every asserted/retracted world fact must be owned.
-    for f in patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()) {
+    for f in patch
+        .asserts
+        .iter()
+        .chain(patch.retracts.iter())
+        .chain(sched.iter())
+    {
         if !authority.permits(f) {
             return Err(Error::Authority(format!(
                 "write to relation {:?} outside authority domain {:?}",
@@ -100,7 +105,11 @@ pub fn commit_patch_checked(
     // check so no world write bypasses either.
     check_schema(
         schemas,
-        patch.asserts.iter().chain(patch.retracts.iter()).chain(sched.iter()),
+        patch
+            .asserts
+            .iter()
+            .chain(patch.retracts.iter())
+            .chain(sched.iter()),
     )?;
 
     // P12 code law: any behavior this patch installs (a `Value::Code` cell in an

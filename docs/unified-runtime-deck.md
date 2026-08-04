@@ -135,9 +135,9 @@ The semantic crates remain separate because those boundaries improve testing and
 | Defined in `worlds/moo.grmpl` | Native Rust capability—for now |
 |---|---|
 | Typed world relations and schemas | Open the durable store and compile a package |
-| Relational views and aggregates | Seed initial manor and rule-table facts |
-| Command grammar | Allocate fresh player, room, and object IDs |
-| `take`, `drop`, `go`, `say`, `greet` | `dig`, `create`, and formatted `look` |
+| Relational views and aggregates | Open the store and grant package capabilities |
+| Command grammar | Provision durable player/login identity |
+| `take`, `drop`, `go`, `say`, `greet`, `dig`, `create` | Formatted `look` and other presentation |
 | NPC patrol behavior | Drive processes and retry contested commits |
 | Reactive world watch | Terminal/TCP I/O, card RNG, DSP vault instances |
 
@@ -158,22 +158,20 @@ The goal is not “all Rust” or “all language.” It is a clear rule:
 <li>Concurrent allocation and one-winner races</li>
 <li>Durable reconnect and reactive resume</li>
 <li>Deterministic replay and fork checkpoints</li>
-<li>Exact clean commit: <code>1294349</code></li>
+<li>Atomic package bootstrap, float, allocation, RNG, and stored-code laws</li>
+<li>Durable static actors, canonical timer driving, and restart-safe combat</li>
 </ul>
 </div>
 <div class="card warm">
-<h3>What grmpl needs next</h3>
+<h3>Phases 1–2 landed; next</h3>
 <ol>
-<li>Arithmetic, comparisons, and control flow</li>
-<li>Committed entity allocation and RNG primitives</li>
-<li>Declarative world bootstrap facts</li>
 <li>Authority-scoped DSP and fork effects</li>
-<li>Durable actor scheduling</li>
+<li>Deterministic collection/shuffle support</li>
 <li>Richer presentation values</li>
 </ol>
 </div>
 </div>
 
-Shotengai was intentionally excluded from this migration. These additions would let it become **another world package on the same runtime**, not another binary or engine.
+Manor and Shotengai now install through the same v4 package path. Shotengai's patrol and combat continuation use package actors; its remaining native seams are phase-3 structural, collection, and presentation work—not another bootstrap path or engine.
 
-<p class="small">Detailed capability report: docs/RUNTIME-CAPABILITIES.md</p>
+<p class="small">Capability report: docs/RUNTIME-CAPABILITIES.md · Remaining-work design: docs/WORLD-PACKAGE-REMAINING-WORK.md</p>

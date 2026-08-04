@@ -49,10 +49,10 @@ pub use crate::hash::ContentKey;
 /// The width of a [`ContentKey`] on the wire.
 const CK_LEN: usize = 32;
 
-/// The node-frame format version. Bump on any change to the frame layout, the
-/// content hash, or the tag set — a decoder must reject an evolved layout
-/// loudly rather than misread it (`CLAUDE.md`, "one serialization, versioned").
-const NODE_FORMAT_VERSION: u8 = 1;
+/// Node frames ride the one workspace format version. The v4 Float/behavior-IR
+/// cutover is deliberately fresh-store-only, so a v4 binary rejects every v3
+/// (and older) persisted node before attempting to interpret its payload.
+const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// A type that can be (de)serialized into a node frame. Payloads reuse the one
 /// `grmpl_core::wire` codec, so "one serialization" holds.
@@ -188,8 +188,12 @@ impl Granfilade {
     /// Open (or create) a granfilade rooted at `path`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Granfilade> {
         let db = Database::builder(path.as_ref()).open().map_err(store_err)?;
-        let nodes = db.keyspace("nodes", KeyspaceCreateOptions::default).map_err(store_err)?;
-        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).map_err(store_err)?;
+        let nodes = db
+            .keyspace("nodes", KeyspaceCreateOptions::default)
+            .map_err(store_err)?;
+        let meta = db
+            .keyspace("meta", KeyspaceCreateOptions::default)
+            .map_err(store_err)?;
         Ok(Granfilade {
             db,
             nodes,
@@ -223,7 +227,11 @@ impl Granfilade {
 
     /// One atomic write of node frames + meta entries (nodes and the roots that
     /// reference them land together — the Patch–edition law for the store).
-    pub fn write(&self, nodes: Vec<(ContentKey, Vec<u8>)>, meta: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    pub fn write(
+        &self,
+        nodes: Vec<(ContentKey, Vec<u8>)>,
+        meta: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
         self.write_full(nodes, meta, Vec::new())
     }
 
@@ -236,7 +244,11 @@ impl Granfilade {
         meta: Vec<(Vec<u8>, Vec<u8>)>,
         drop_meta: Vec<Vec<u8>>,
     ) -> Result<()> {
-        self.write_group(vec![StagedWrite { nodes, meta, drop_meta }])
+        self.write_group(vec![StagedWrite {
+            nodes,
+            meta,
+            drop_meta,
+        }])
     }
 
     /// **Group commit (the durability half).** Apply several already-encoded
@@ -284,7 +296,11 @@ impl Granfilade {
 
     /// A meta value.
     pub fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.meta.get(key).map_err(store_err)?.map(|s| s.as_ref().to_vec()))
+        Ok(self
+            .meta
+            .get(key)
+            .map_err(store_err)?
+            .map(|s| s.as_ref().to_vec()))
     }
 
     /// All meta `(key, value)` pairs whose key starts with `prefix`.
@@ -469,7 +485,13 @@ fn children_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
 fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
     match frame.first() {
         Some(&NODE_FORMAT_VERSION) => {}
-        Some(v) => return Err(Error::Codec(format!("granfilade: node format version {v}"))),
+        Some(v) => {
+            return Err(Error::Codec(format!(
+                "granfilade: unsupported node format version {v} (expected {}; \
+                 v4 requires a fresh store and has no migrator)",
+                NODE_FORMAT_VERSION
+            )))
+        }
         None => return Err(trunc("node version")),
     }
     let tag = *frame.get(1).ok_or_else(|| trunc("node tag"))?;
@@ -538,8 +560,10 @@ where
             }
         }
         NodeRef::Internal(keys, children) => {
-            let cks: Vec<ContentKey> =
-                children.iter().filter_map(|c| collect_nodes(c, out, present)).collect();
+            let cks: Vec<ContentKey> = children
+                .iter()
+                .filter_map(|c| collect_nodes(c, out, present))
+                .collect();
             encode_header(&mut bytes, TAG_INTERNAL, &cks);
             bytes.extend_from_slice(&(keys.len() as u32).to_be_bytes());
             for k in keys {
@@ -600,5 +624,14 @@ mod tests {
             "no structural sharing: added {added} nodes for a {}-node tree",
             v1.len()
         );
+    }
+
+    #[test]
+    fn pre_v4_node_is_rejected_with_fresh_store_guidance() {
+        let old = [3, TAG_LEAF, 0, 0, 0, 0];
+        let err = decode_header(&old).unwrap_err().to_string();
+        assert!(err.contains("unsupported node format version 3"));
+        assert!(err.contains("fresh store"));
+        assert!(err.contains("no migrator"));
     }
 }

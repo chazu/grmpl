@@ -64,12 +64,16 @@ survives, by one monster counterattack. A defeated monster awards job points
 exactly once. Player defeat returns the player to the sento with job progress
 intact.
 
-The grmpl language deliberately has no arithmetic or comparison surface, so
-damage and advancement use host-seeded relational tables rather than hidden
-ad-hoc formulas:
+The player patch schedules an immediate `CombatStep()` for the static combat
+actor. Counterattack, the guarded one-shot reward claim, job/ability
+advancement, boss passage unlock, and defeat signaling are durable actor work;
+closing between schedule, timer fire, and actor attention loses nothing.
+
+Tranche 1 added checked arithmetic and comparison expressions. Player damage
+and HP outcomes are language-defined formulas; genuinely data-driven job and
+ability progression remains relational data:
 
 ```text
-attack_result(power, defense, old_hp, new_hp, outcome)
 job_progression(job, old_rank, old_points, reward,
                 new_rank, new_points, ability,
                 old_ability_rank, new_ability_rank)
@@ -111,17 +115,16 @@ retirement before allowing unlimited activations.
 
 ## Architecture
 
-All setting rules, relation declarations, views, parsers, and patch-producing
-behaviors live in `worlds/shotengai.grmpl`. Initial conditions and finite rule
-tables are seeded by the edge host because the language intentionally has no
-fact-literal or entity-allocation syntax.
+All setting rules, relation declarations, views, parsers, patch-producing
+behaviors, initial conditions, and finite rule tables live in
+`worlds/shotengai.grmpl` and install atomically as a v4 package.
 
-`grmpl-cli` gains a `shotengai [STORE_DIR]` command. Its host is responsible only
-for edge concerns that the language cannot express: terminal rendering, entity
-allocation/instancing, card dealing, deterministic combat coordination,
-whole-store forking, and durable branch routing. Ordinary movement, object
-handling, greeting, job changes, and player attacks remain compiled grmpl
-behaviors.
+`grmpl-cli` provides a `shotengai [STORE_DIR]` command. Its remaining native
+responsibilities are terminal rendering, committed-time sampling/actor driving,
+card dealing, entity instancing, whole-store forking, and durable branch
+routing. Ordinary movement, object handling, greeting, job changes, player
+attacks, patrol, combat continuation, bootstrap, and scalar omen draws are
+compiled grmpl behavior/data.
 
 Relation IDs are resolved through the durable catalog, schemas are declared at
 the commit boundary, and inbox sequence numbers are allocated from durable
@@ -130,12 +133,13 @@ sequence relations rather than process-local counters.
 ## Delivery slices
 
 1. **Contract and command:** add this document, the CLI command, the world file,
-   durable catalog compilation, schemas, and an idempotent seed.
+   durable catalog compilation, schemas, and an idempotent package bootstrap.
 2. **Surface parity:** implement the shotengai map, residents, identity fog,
    patrol, inventory, aggregate, rooftop report, card table, and reactive watch.
 3. **RPG tracer bullet:** implement one complete job/ability/monster/victory
    path, including counterattack and advancement.
-4. **Full job table:** seed all five jobs and three progression ranks.
+4. **Full job table:** declare all five jobs and three progression ranks in
+   package bootstrap.
 5. **Dungeon:** instance the complete basement template, cleanly leave it, and
    make monster/loot state instance-local.
 6. **Artifact:** fork the complete active world, route into the child, persist
@@ -161,16 +165,17 @@ sequence relations rather than process-local counters.
 
 ## Implementation status
 
-Implemented on 2026-08-02:
+Implemented initially on 2026-08-02; package tranche updated on 2026-08-04:
 
 - `worlds/shotengai.grmpl` contains the relations, views, command grammar, and
   guarded behaviors.
 - `grmpl shotengai [STORE_DIR]` runs the durable game and defaults to
   `.grmpl/shotengai`.
-- The edge runtime registers every declared schema, uses durable inbox and RNG
-  state, instances and cleans the basement, consumes one-shot monster reward
-  claims, and persists the active branch route in the root control branch.
-- Eight game tests cover language compilation, manor feature parity, job and
+- Package bootstrap now owns the initial world and rule tables. Player combat
+  arithmetic and a scalar `omen` RNG path execute through typed `BehaviorIr`;
+  the edge runtime grants RNG, drives actors, instances and cleans the basement,
+  consumes one-shot monster reward claims, and persists the active branch route.
+- Nine game tests cover package reopen, language compilation, manor feature parity, job and
   ability progression, deterministic replay, stale combat races, player defeat,
   dungeon isolation, recursive mirror forks, parent/child divergence, and route
   recovery after reopen.

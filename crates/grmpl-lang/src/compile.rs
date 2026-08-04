@@ -22,20 +22,24 @@
 //!   "`lamp.location` compiles to a relational query" (DESIGN.md §3).
 //! * `form` → a `grmpl_pattern::Form`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use grmpl_core::{
-    Authority, Catalog, Column, Edition, Entity, Error, Fact, Message, Patch, RelId,
-    Result as CoreResult, Schema, SchemaCatalog, Tuple, TraceStore, Ty, Value,
+    Authority, Catalog, Column, Edition, Entity, Patch, RelId, Result as CoreResult, Schema,
+    SchemaCatalog, TraceStore, Tuple, Ty, Value,
 };
 use grmpl_diff::{Agg, Query, Snapshot};
 use grmpl_pattern::{Form, Pattern, VarId};
 use grmpl_proc::{Behavior, CommitOutcome, OnWatch};
 
-use crate::ast::{AggFunc, AggYield, Arg, Arm, Decl, MatchOp, PAtom, SArg, Stmt};
+use crate::ast::{
+    AggFunc, AggYield, Arg, Arm, BinaryOp, Decl, Expr, MatchOp, PAtom, SArg, Stmt, UnaryOp,
+};
+use crate::behavior_ir::{BehaviorIr, BehaviorOp, BoolExpr, CompareOp, ExprIr, FindArg, ValueExpr};
 use crate::concat::{ConcatArm, Schemas, Word};
 use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
+use crate::package::ResolvedGrantSet;
 use crate::parser::parse;
 
 /// An aggregate named by *column* — the P1 named-column surface for
@@ -93,6 +97,24 @@ struct WatchDef {
     including_current: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CapabilityKind {
+    Allocate,
+    Random,
+    Schedule,
+}
+
+#[derive(Clone, Copy)]
+struct CapabilityDef {
+    kind: CapabilityKind,
+    state_relation: RelId,
+}
+
+#[derive(Clone)]
+struct ActorDef {
+    inbox: String,
+}
+
 /// A compiled program: relation schemas, views, forms, and on-handlers.
 pub struct Program {
     rels: HashMap<String, RelInfo>,
@@ -101,6 +123,10 @@ pub struct Program {
     ons: HashMap<String, OnDef>,
     /// `on watch` reactive handlers, keyed by watched view name.
     watches: HashMap<String, WatchDef>,
+    /// Package compile-time entity constants. Legacy programs leave this empty.
+    entities: BTreeMap<String, Entity>,
+    capabilities: BTreeMap<String, CapabilityDef>,
+    actors: BTreeMap<String, ActorDef>,
 }
 
 /// How a `compile` run assigns a [`RelId`] to each declared relation. The two
@@ -223,9 +249,29 @@ impl Program {
         let mut forms = HashMap::new();
         let mut ons = HashMap::new();
         let mut watches = HashMap::new();
+        let mut capabilities = Vec::new();
+        let mut actors = BTreeMap::new();
 
         for decl in decls {
             match decl {
+                Decl::Package { .. }
+                | Decl::Entity { .. }
+                | Decl::Authority { .. }
+                | Decl::Bootstrap { .. } => {}
+                Decl::RequireAllocate { name, counter, .. } => {
+                    capabilities.push((name, counter, CapabilityKind::Allocate));
+                }
+                Decl::RequireRandom { name, state, .. } => {
+                    capabilities.push((name, state, CapabilityKind::Random));
+                }
+                Decl::RequireSchedule { name, timers, .. } => {
+                    capabilities.push((name, timers, CapabilityKind::Schedule));
+                }
+                Decl::Actor { entity, inbox, .. } => {
+                    if actors.insert(entity.clone(), ActorDef { inbox }).is_some() {
+                        return Err(format!("actor `{entity}` is declared twice"));
+                    }
+                }
                 Decl::Rel { name, cols } => {
                     if rels.contains_key(&name) {
                         return Err(format!("relation `{name}` declared twice"));
@@ -310,13 +356,22 @@ impl Program {
                 }
             }
         }
-        let prog = Program {
+        let mut prog = Program {
             rels,
             views,
             forms,
             ons,
             watches,
+            entities: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
+            actors,
         };
+        for (name, relation, kind) in capabilities {
+            let relation_id = prog.rel_id(&relation).ok_or_else(|| {
+                format!("capability `{name}` names undeclared relation `{relation}`")
+            })?;
+            prog.insert_capability(name, kind, relation_id)?;
+        }
         // "Declared stack effects first": statically check every concatenative
         // arm's cell arithmetic now, so a malformed point-free body fails at
         // compile time rather than mid-commit.
@@ -352,6 +407,98 @@ impl Program {
     /// The `RelId` assigned to a declared relation.
     pub fn rel_id(&self, name: &str) -> Option<RelId> {
         self.rels.get(name).map(|r| r.id)
+    }
+
+    /// Resolve a package entity constant.
+    pub fn entity(&self, name: &str) -> Option<Entity> {
+        self.entities.get(name).copied()
+    }
+
+    pub(crate) fn set_entities(&mut self, entities: BTreeMap<String, Entity>) {
+        self.entities = entities;
+    }
+
+    pub(crate) fn insert_capability(
+        &mut self,
+        name: String,
+        kind: CapabilityKind,
+        state_relation: RelId,
+    ) -> Result<(), String> {
+        if self
+            .capabilities
+            .insert(
+                name.clone(),
+                CapabilityDef {
+                    kind,
+                    state_relation,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("capability `{name}` is declared twice"));
+        }
+        Ok(())
+    }
+
+    pub fn capability(&self, name: &str) -> Option<(CapabilityKind, RelId)> {
+        self.capabilities
+            .get(name)
+            .map(|definition| (definition.kind, definition.state_relation))
+    }
+
+    pub(crate) fn validate_entity_namespace(
+        &self,
+        entities: &BTreeMap<String, Entity>,
+    ) -> Result<(), String> {
+        if entities.contains_key("self") {
+            return Err("entity constant `self` is reserved by behaviors".into());
+        }
+        for (view_name, view) in &self.views {
+            for name in view.params.iter().chain(view.yields.iter()) {
+                if entities.contains_key(name) {
+                    return Err(format!(
+                        "view `{view_name}` binds `{name}`, which is an entity constant"
+                    ));
+                }
+            }
+        }
+        for (inbox, on) in &self.ons {
+            for arm in &on.arms {
+                for name in &arm.vars {
+                    if entities.contains_key(name) {
+                        return Err(format!(
+                            "handler `{inbox}` binds `{name}`, which is an entity constant"
+                        ));
+                    }
+                }
+            }
+            for arm in &on.concat_arms {
+                for name in &arm.vars {
+                    if entities.contains_key(name) {
+                        return Err(format!(
+                            "handler `{inbox}` binds `{name}`, which is an entity constant"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_reserved_relation(
+        &mut self,
+        name: String,
+        id: RelId,
+        columns: Vec<Column>,
+    ) -> Result<(), String> {
+        if self
+            .rels
+            .insert(name.clone(), RelInfo { id, columns })
+            .is_some()
+        {
+            return Err(format!("reserved relation `{name}` collides with source"));
+        }
+        Ok(())
     }
 
     /// The declared, named, typed columns of a relation, in order.
@@ -469,7 +616,26 @@ impl Program {
                     Arg::Int(n) => {
                         preds.push(PredExpr::Eq(RowExpr::Col(i), RowExpr::Lit(Value::Int(*n))));
                     }
+                    Arg::Float(n) => {
+                        preds.push(PredExpr::Eq(
+                            RowExpr::Col(i),
+                            RowExpr::Lit(Value::Float(*n)),
+                        ));
+                    }
+                    Arg::Bool(value) => {
+                        preds.push(PredExpr::Eq(
+                            RowExpr::Col(i),
+                            RowExpr::Lit(Value::Bool(*value)),
+                        ));
+                    }
                     Arg::Var(vn) => {
+                        if let Some(entity) = self.entity(vn) {
+                            preds.push(PredExpr::Eq(
+                                RowExpr::Col(i),
+                                RowExpr::Lit(Value::Ent(entity)),
+                            ));
+                            continue;
+                        }
                         if let Some(val) = params.get(vn.as_str()) {
                             preds.push(PredExpr::Eq(RowExpr::Col(i), RowExpr::Lit(val.clone())));
                         }
@@ -723,8 +889,9 @@ impl Program {
             .get(view)
             .ok_or_else(|| format!("no `on watch` over view `{view}`"))?;
         let rel = |name: &str, role: &str| -> Result<RelId, String> {
-            self.rel_id(name)
-                .ok_or_else(|| format!("`on watch {view}` names undeclared {role} relation `{name}`"))
+            self.rel_id(name).ok_or_else(|| {
+                format!("`on watch {view}` names undeclared {role} relation `{name}`")
+            })
         };
         Ok(OnWatch {
             view: self.view(view, args)?,
@@ -775,6 +942,781 @@ impl Program {
         Ok(Comp::Parse(self.form_ir(name)?))
     }
 
+    fn view_output_types(&self, name: &str) -> Result<Vec<Ty>, String> {
+        let view = self
+            .views
+            .get(name)
+            .ok_or_else(|| format!("no view `{name}`"))?;
+        let mut variables: HashMap<String, Ty> = HashMap::new();
+        for atom in &view.atoms {
+            let relation = self
+                .rels
+                .get(&atom.rel)
+                .ok_or_else(|| format!("view `{name}` uses undeclared relation `{}`", atom.rel))?;
+            for (argument, column) in atom.args.iter().zip(&relation.columns) {
+                if let Arg::Var(variable) = argument {
+                    if self.entity(variable).is_none() {
+                        variables.entry(variable.clone()).or_insert(column.ty);
+                    }
+                }
+            }
+        }
+        view.yields
+            .iter()
+            .map(|yielded| {
+                variables
+                    .get(yielded)
+                    .copied()
+                    .ok_or_else(|| format!("view `{name}` yields unbound `{yielded}`"))
+            })
+            .collect()
+    }
+
+    fn lower_stmt_arm(&self, arm: &Arm) -> Result<BehaviorIr, String> {
+        let mut locals = BTreeMap::new();
+        locals.insert("self".into(), Ty::Ent);
+        for variable in &arm.vars {
+            bind_type(self, &mut locals, variable, Ty::Text)?;
+        }
+        Ok(BehaviorIr::new(self.lower_stmts(&arm.stmts, &mut locals)?))
+    }
+
+    fn lower_concat_arm(&self, arm: &ConcatArm) -> Result<BehaviorIr, String> {
+        self.lower_words(
+            &arm.words,
+            arm.vars
+                .iter()
+                .cloned()
+                .map(|name| (name, Ty::Text))
+                .collect(),
+        )
+    }
+
+    /// Type-check and lower a concatenative body to the sole executable
+    /// behavior IR. `initial` names the values present on the stack from bottom
+    /// to top. Stored behaviors use this entry point with generated message
+    /// column names; inline arms use their form variables.
+    pub fn lower_words(
+        &self,
+        words: &[Word],
+        initial: Vec<(String, Ty)>,
+    ) -> Result<BehaviorIr, String> {
+        let mut locals = BTreeMap::new();
+        locals.insert("self".into(), Ty::Ent);
+        let mut stack = Vec::with_capacity(initial.len());
+        for (name, ty) in initial {
+            bind_type(self, &mut locals, &name, ty)?;
+            stack.push(TypedExpr::value(ValueExpr::Local(name), ty));
+        }
+        let mut operations = Vec::new();
+        let mut temporary = 0usize;
+
+        for word in words {
+            match word {
+                Word::SelfEntity => {
+                    stack.push(TypedExpr::value(ValueExpr::Local("self".into()), Ty::Ent))
+                }
+                Word::Lit(value) => stack.push(TypedExpr::literal(value.clone())),
+                Word::Dup => stack.push(stack_top(&stack)?.clone()),
+                Word::Drop => {
+                    stack_pop(&mut stack)?;
+                }
+                Word::Swap => {
+                    let b = stack_pop(&mut stack)?;
+                    let a = stack_pop(&mut stack)?;
+                    stack.extend([b, a]);
+                }
+                Word::Over => {
+                    let b = stack_pop(&mut stack)?;
+                    let a = stack_pop(&mut stack)?;
+                    stack.extend([a.clone(), b, a]);
+                }
+                Word::Rot => {
+                    let c = stack_pop(&mut stack)?;
+                    let b = stack_pop(&mut stack)?;
+                    let a = stack_pop(&mut stack)?;
+                    stack.extend([b, c, a]);
+                }
+                Word::Nip => {
+                    let b = stack_pop(&mut stack)?;
+                    stack_pop(&mut stack)?;
+                    stack.push(b);
+                }
+                Word::Tuck => {
+                    let b = stack_pop(&mut stack)?;
+                    let a = stack_pop(&mut stack)?;
+                    stack.extend([b.clone(), a, b]);
+                }
+                Word::TwoDup => {
+                    let b = stack_pop(&mut stack)?;
+                    let a = stack_pop(&mut stack)?;
+                    stack.extend([a.clone(), b.clone(), a, b]);
+                }
+                Word::TwoDrop => {
+                    stack_pop(&mut stack)?;
+                    stack_pop(&mut stack)?;
+                }
+                Word::Neg | Word::ToFloat | Word::Not => {
+                    let value = stack_pop(&mut stack)?;
+                    let lowered = match word {
+                        Word::Neg if matches!(value.ty, Ty::Int | Ty::Float) => {
+                            let ty = value.ty;
+                            TypedExpr::value(
+                                ValueExpr::Intrinsic {
+                                    name: "neg".into(),
+                                    arguments: vec![value.into_value("neg")?],
+                                },
+                                ty,
+                            )
+                        }
+                        Word::ToFloat if value.ty == Ty::Int => TypedExpr::value(
+                            ValueExpr::Intrinsic {
+                                name: "float".into(),
+                                arguments: vec![value.into_value("to_float")?],
+                            },
+                            Ty::Float,
+                        ),
+                        Word::Not if value.ty == Ty::Bool => {
+                            TypedExpr::boolean(BoolExpr::Not(Box::new(value.into_bool("not")?)))
+                        }
+                        Word::Neg => return Err("word `neg` requires Int or Float".into()),
+                        Word::ToFloat => return Err("word `to_float` requires Int".into()),
+                        Word::Not => return Err("word `not` requires Bool".into()),
+                        _ => unreachable!(),
+                    };
+                    stack.push(lowered);
+                }
+                Word::Add
+                | Word::Sub
+                | Word::Mul
+                | Word::Div
+                | Word::Rem
+                | Word::Min
+                | Word::Max
+                | Word::Eq
+                | Word::Ne
+                | Word::Lt
+                | Word::Le
+                | Word::Gt
+                | Word::Ge
+                | Word::And
+                | Word::Or => {
+                    let right = stack_pop(&mut stack)?;
+                    let left = stack_pop(&mut stack)?;
+                    let lowered = match word {
+                        Word::Add => self.lower_binary(BinaryOp::Add, left, right)?,
+                        Word::Sub => self.lower_binary(BinaryOp::Sub, left, right)?,
+                        Word::Mul => self.lower_binary(BinaryOp::Mul, left, right)?,
+                        Word::Div => self.lower_binary(BinaryOp::Div, left, right)?,
+                        Word::Rem => self.lower_binary(BinaryOp::Rem, left, right)?,
+                        Word::Eq => self.lower_binary(BinaryOp::Eq, left, right)?,
+                        Word::Ne => self.lower_binary(BinaryOp::Ne, left, right)?,
+                        Word::Lt => self.lower_binary(BinaryOp::Lt, left, right)?,
+                        Word::Le => self.lower_binary(BinaryOp::Le, left, right)?,
+                        Word::Gt => self.lower_binary(BinaryOp::Gt, left, right)?,
+                        Word::Ge => self.lower_binary(BinaryOp::Ge, left, right)?,
+                        Word::And | Word::Or => {
+                            let left = left.into_bool("boolean word")?;
+                            let right = right.into_bool("boolean word")?;
+                            TypedExpr::boolean(if matches!(word, Word::And) {
+                                BoolExpr::And(Box::new(left), Box::new(right))
+                            } else {
+                                BoolExpr::Or(Box::new(left), Box::new(right))
+                            })
+                        }
+                        Word::Min | Word::Max => {
+                            if left.ty != right.ty || !matches!(left.ty, Ty::Int | Ty::Float) {
+                                return Err(
+                                    "words `min` and `max` require matching Int or Float operands"
+                                        .into(),
+                                );
+                            }
+                            let ty = left.ty;
+                            TypedExpr::value(
+                                ValueExpr::Intrinsic {
+                                    name: if matches!(word, Word::Min) {
+                                        "min".into()
+                                    } else {
+                                        "max".into()
+                                    },
+                                    arguments: vec![
+                                        left.into_value("min/max")?,
+                                        right.into_value("min/max")?,
+                                    ],
+                                },
+                                ty,
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+                    stack.push(lowered);
+                }
+                Word::Resolve { view, col, op } => {
+                    let definition = self
+                        .views
+                        .get(view)
+                        .ok_or_else(|| format!("word `resolve` names undeclared view `{view}`"))?;
+                    let key = stack_pop(&mut stack)?;
+                    let arguments = stack_pop_n(&mut stack, definition.params.len())?;
+                    let destinations = definition.yields.clone();
+                    let types = self.view_output_types(view)?;
+                    let column_index = destinations
+                        .iter()
+                        .position(|name| name == col)
+                        .ok_or_else(|| format!("view `{view}` has no column `{col}`"))?;
+                    require_assignable(types[column_index], key.ty, "resolve match key")?;
+                    if *op == MatchOp::Word && key.ty != Ty::Text {
+                        return Err("word-match resolve requires a Text column and key".into());
+                    }
+                    let mut generated = Vec::with_capacity(destinations.len());
+                    for ty in types {
+                        let name = fresh_ir_local(&mut temporary);
+                        bind_type(self, &mut locals, &name, ty)?;
+                        generated.push(name.clone());
+                        stack.push(TypedExpr::value(ValueExpr::Local(name), ty));
+                    }
+                    operations.push(BehaviorOp::Resolve {
+                        view: view.clone(),
+                        arguments: arguments.into_iter().map(|value| value.ir).collect(),
+                        column: col.clone(),
+                        op: *op,
+                        rhs: key.ir,
+                        destinations: generated,
+                    });
+                }
+                Word::Find { rel, keyn } => {
+                    let schema = self
+                        .schema(rel)
+                        .ok_or_else(|| format!("word `find` names undeclared relation `{rel}`"))?;
+                    if *keyn > schema.arity() {
+                        return Err(format!(
+                            "word `find {rel} {keyn}` exceeds relation arity {}",
+                            schema.arity()
+                        ));
+                    }
+                    let keys = stack_pop_n(&mut stack, *keyn)?;
+                    let columns = schema.columns.clone();
+                    let mut arguments = Vec::with_capacity(columns.len());
+                    for (index, column) in columns.iter().enumerate() {
+                        let local = fresh_ir_local(&mut temporary);
+                        bind_type(self, &mut locals, &local, column.ty)?;
+                        if let Some(key) = keys.get(index) {
+                            require_assignable(column.ty, key.ty, &format!("find `{rel}` key"))?;
+                            arguments.push(FindArg::MatchBind {
+                                value: key.ir.clone(),
+                                local: local.clone(),
+                            });
+                        } else {
+                            arguments.push(FindArg::Bind(local.clone()));
+                        }
+                        stack.push(TypedExpr::value(ValueExpr::Local(local), column.ty));
+                    }
+                    operations.push(BehaviorOp::Find {
+                        relation: rel.clone(),
+                        arguments,
+                    });
+                }
+                Word::Expect(rel) | Word::Assert(rel) | Word::Retract(rel) | Word::Emit(rel) => {
+                    let schema = self
+                        .schema(rel)
+                        .ok_or_else(|| format!("word names undeclared relation `{rel}`"))?;
+                    let values = stack_pop_n(&mut stack, schema.arity())?;
+                    for (value, column) in values.iter().zip(&schema.columns) {
+                        require_assignable(column.ty, value.ty, &format!("operation on `{rel}`"))?;
+                    }
+                    let arguments = values.into_iter().map(|value| value.ir).collect();
+                    operations.push(match word {
+                        Word::Expect(_) => BehaviorOp::Expect {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Word::Assert(_) => BehaviorOp::Assert {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Word::Retract(_) => BehaviorOp::Retract {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Word::Emit(_) => BehaviorOp::Emit {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        _ => unreachable!(),
+                    });
+                }
+            }
+        }
+        if !stack.is_empty() {
+            return Err(format!(
+                "concatenative body leaves {} value(s) on the stack",
+                stack.len()
+            ));
+        }
+        Ok(BehaviorIr::new(operations))
+    }
+
+    fn lower_stmts(
+        &self,
+        statements: &[Stmt],
+        locals: &mut BTreeMap<String, Ty>,
+    ) -> Result<Vec<BehaviorOp>, String> {
+        let mut operations = Vec::new();
+        for statement in statements {
+            match statement {
+                Stmt::Let { name, value } => {
+                    let value = self.lower_expr(value, locals)?;
+                    bind_type(self, locals, name, value.ty)?;
+                    operations.push(BehaviorOp::Let {
+                        local: name.clone(),
+                        value: value.ir,
+                    });
+                }
+                Stmt::If {
+                    condition,
+                    then_stmts,
+                    else_stmts,
+                } => {
+                    let condition = self.lower_expr(condition, locals)?;
+                    let condition = condition.into_bool("if condition")?;
+                    let mut then_locals = locals.clone();
+                    let mut else_locals = locals.clone();
+                    operations.push(BehaviorOp::If {
+                        condition,
+                        then_ops: self.lower_stmts(then_stmts, &mut then_locals)?,
+                        else_ops: self.lower_stmts(else_stmts, &mut else_locals)?,
+                    });
+                }
+                Stmt::Fresh { capability, local } => {
+                    let Some((kind, _)) = self.capability(capability) else {
+                        return Err(format!("fresh names undeclared capability `{capability}`"));
+                    };
+                    if kind != CapabilityKind::Allocate {
+                        return Err(format!("capability `{capability}` is not an allocator"));
+                    }
+                    bind_type(self, locals, local, Ty::Ent)?;
+                    operations.push(BehaviorOp::InvokeCapability {
+                        capability: capability.clone(),
+                        arguments: vec![],
+                        destinations: vec![local.clone()],
+                    });
+                }
+                Stmt::Random {
+                    capability,
+                    bound,
+                    local,
+                } => {
+                    let Some((kind, _)) = self.capability(capability) else {
+                        return Err(format!("random names undeclared capability `{capability}`"));
+                    };
+                    if kind != CapabilityKind::Random {
+                        return Err(format!("capability `{capability}` is not a random stream"));
+                    }
+                    let bound = self.lower_expr(bound, locals)?;
+                    require_assignable(Ty::Int, bound.ty, "random bound")?;
+                    bind_type(self, locals, local, Ty::Int)?;
+                    operations.push(BehaviorOp::InvokeCapability {
+                        capability: capability.clone(),
+                        arguments: vec![bound.ir],
+                        destinations: vec![local.clone()],
+                    });
+                }
+                Stmt::Schedule {
+                    capability,
+                    due,
+                    tag,
+                    arguments,
+                    target,
+                } => {
+                    let Some((kind, _)) = self.capability(capability) else {
+                        return Err(format!(
+                            "schedule names undeclared capability `{capability}`"
+                        ));
+                    };
+                    if kind != CapabilityKind::Schedule {
+                        return Err(format!("capability `{capability}` is not a scheduler"));
+                    }
+                    let due = self.lower_expr(due, locals)?;
+                    require_assignable(Ty::Int, due.ty, "schedule due")?;
+                    let body = self.render_actor_message(target, tag, arguments, locals)?;
+                    let mut invocation = vec![
+                        ExprIr::Value(ValueExpr::Literal(Value::text(target))),
+                        due.ir,
+                    ];
+                    invocation.extend(body);
+                    operations.push(BehaviorOp::InvokeCapability {
+                        capability: capability.clone(),
+                        arguments: invocation,
+                        destinations: vec![],
+                    });
+                }
+                Stmt::Resolve {
+                    view,
+                    args,
+                    col,
+                    op,
+                    rhs,
+                } => {
+                    let arguments = args
+                        .iter()
+                        .map(|argument| self.lower_sarg(argument, locals).map(|typed| typed.ir))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let rhs = self.lower_sarg(rhs, locals)?.ir;
+                    let destinations = self
+                        .views
+                        .get(view)
+                        .ok_or_else(|| format!("no view `{view}`"))?
+                        .yields
+                        .clone();
+                    let types = self.view_output_types(view)?;
+                    for (destination, ty) in destinations.iter().zip(types) {
+                        bind_type(self, locals, destination, ty)?;
+                    }
+                    operations.push(BehaviorOp::Resolve {
+                        view: view.clone(),
+                        arguments,
+                        column: col.clone(),
+                        op: *op,
+                        rhs,
+                        destinations,
+                    });
+                }
+                Stmt::Find { rel, args } => {
+                    let schema = self
+                        .schema(rel)
+                        .ok_or_else(|| format!("find names undeclared relation `{rel}`"))?;
+                    if args.len() != schema.arity() {
+                        return Err(format!(
+                            "find `{rel}` expects {} arguments, got {}",
+                            schema.arity(),
+                            args.len()
+                        ));
+                    }
+                    let mut arguments = Vec::new();
+                    for (argument, column) in args.iter().zip(&schema.columns) {
+                        if let SArg::Var(name) = argument {
+                            if !locals.contains_key(name) && self.entity(name).is_none() {
+                                bind_type(self, locals, name, column.ty)?;
+                                arguments.push(FindArg::Bind(name.clone()));
+                                continue;
+                            }
+                        }
+                        let typed = self.lower_sarg(argument, locals)?;
+                        require_assignable(column.ty, typed.ty, &format!("find `{rel}`"))?;
+                        arguments.push(FindArg::Match(typed.ir));
+                    }
+                    operations.push(BehaviorOp::Find {
+                        relation: rel.clone(),
+                        arguments,
+                    });
+                }
+                Stmt::Expect { rel, args }
+                | Stmt::Assert { rel, args }
+                | Stmt::Retract { rel, args }
+                | Stmt::Emit { rel, args } => {
+                    let arguments = self.lower_relation_args(rel, args, locals)?;
+                    let operation = match statement {
+                        Stmt::Expect { .. } => BehaviorOp::Expect {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Stmt::Assert { .. } => BehaviorOp::Assert {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Stmt::Retract { .. } => BehaviorOp::Retract {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        Stmt::Emit { .. } => BehaviorOp::Emit {
+                            relation: rel.clone(),
+                            arguments,
+                        },
+                        _ => unreachable!(),
+                    };
+                    operations.push(operation);
+                }
+            }
+        }
+        Ok(operations)
+    }
+
+    fn render_actor_message(
+        &self,
+        target: &str,
+        tag: &str,
+        arguments: &[Expr],
+        locals: &BTreeMap<String, Ty>,
+    ) -> Result<Vec<ExprIr>, String> {
+        let actor = self
+            .actors
+            .get(target)
+            .ok_or_else(|| format!("schedule targets undeclared actor `{target}`"))?;
+        let handler = self
+            .ons
+            .get(&actor.inbox)
+            .ok_or_else(|| format!("actor `{target}` inbox has no on-handler"))?;
+        let rules = self
+            .forms
+            .get(&handler.form)
+            .ok_or_else(|| format!("actor `{target}` handler names no form"))?;
+
+        let mut rendered = Vec::new();
+        for rule in rules
+            .iter()
+            .filter(|rule| rule.tag == tag && rule.ctor_args.len() == arguments.len())
+        {
+            let unique: BTreeSet<_> = rule.ctor_args.iter().collect();
+            if unique.len() != rule.ctor_args.len() {
+                continue;
+            }
+            let mut values = BTreeMap::new();
+            let mut valid = true;
+            for (name, expression) in rule.ctor_args.iter().zip(arguments) {
+                let typed = self.lower_expr(expression, locals)?;
+                require_assignable(Ty::Text, typed.ty, "scheduled constructor argument")?;
+                values.insert(name.as_str(), typed.ir);
+            }
+            let mut body = Vec::new();
+            for atom in &rule.seq {
+                match atom {
+                    PAtom::Lit(value) => {
+                        body.push(ExprIr::Value(ValueExpr::Literal(Value::text(value))))
+                    }
+                    PAtom::Bind(name) => match values.get(name.as_str()) {
+                        Some(value) => body.push(value.clone()),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            if valid {
+                rendered.push(body);
+            }
+        }
+        match rendered.len() {
+            1 => Ok(rendered.pop().unwrap()),
+            0 => Err(format!(
+                "actor `{target}` form has no invertible `{tag}` constructor with {} Text argument(s)",
+                arguments.len()
+            )),
+            _ => Err(format!(
+                "actor `{target}` form has ambiguous `{tag}` constructors"
+            )),
+        }
+    }
+
+    fn lower_relation_args(
+        &self,
+        relation: &str,
+        arguments: &[SArg],
+        locals: &BTreeMap<String, Ty>,
+    ) -> Result<Vec<ExprIr>, String> {
+        let schema = self
+            .schema(relation)
+            .ok_or_else(|| format!("operation names undeclared relation `{relation}`"))?;
+        if arguments.len() != schema.arity() {
+            return Err(format!(
+                "operation on `{relation}` expects {} arguments, got {}",
+                schema.arity(),
+                arguments.len()
+            ));
+        }
+        arguments
+            .iter()
+            .zip(&schema.columns)
+            .map(|(argument, column)| {
+                let typed = self.lower_sarg(argument, locals)?;
+                require_assignable(column.ty, typed.ty, &format!("operation on `{relation}`"))?;
+                Ok(typed.ir)
+            })
+            .collect()
+    }
+
+    fn lower_sarg(
+        &self,
+        argument: &SArg,
+        locals: &BTreeMap<String, Ty>,
+    ) -> Result<TypedExpr, String> {
+        match argument {
+            SArg::Var(name) => {
+                if let Some(entity) = self.entity(name) {
+                    return Ok(TypedExpr::value(
+                        ValueExpr::Literal(Value::Ent(entity)),
+                        Ty::Ent,
+                    ));
+                }
+                let ty = locals
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("unbound local `{name}`"))?;
+                Ok(TypedExpr::value(ValueExpr::Local(name.clone()), ty))
+            }
+            SArg::Str(value) => Ok(TypedExpr::literal(Value::text(value))),
+            SArg::Int(value) => Ok(TypedExpr::literal(Value::Int(*value))),
+            SArg::Float(value) => Ok(TypedExpr::literal(Value::Float(*value))),
+            SArg::Bool(value) => Ok(TypedExpr::literal(Value::Bool(*value))),
+        }
+    }
+
+    fn lower_expr(
+        &self,
+        expression: &Expr,
+        locals: &BTreeMap<String, Ty>,
+    ) -> Result<TypedExpr, String> {
+        match expression {
+            Expr::Var(name) => {
+                if let Some(entity) = self.entity(name) {
+                    return Ok(TypedExpr::literal(Value::Ent(entity)));
+                }
+                let ty = locals
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("unbound local `{name}`"))?;
+                Ok(TypedExpr::value(ValueExpr::Local(name.clone()), ty))
+            }
+            Expr::Lit(value) => Ok(TypedExpr::literal(value.clone())),
+            Expr::Unary { op, value } => {
+                let value = self.lower_expr(value, locals)?;
+                match op {
+                    UnaryOp::Neg if matches!(value.ty, Ty::Int | Ty::Float) => {
+                        let ty = value.ty;
+                        Ok(TypedExpr::value(
+                            ValueExpr::Intrinsic {
+                                name: "neg".into(),
+                                arguments: vec![value.into_value("unary -")?],
+                            },
+                            ty,
+                        ))
+                    }
+                    UnaryOp::Not if value.ty == Ty::Bool => Ok(TypedExpr::boolean(BoolExpr::Not(
+                        Box::new(value.into_bool("unary !")?),
+                    ))),
+                    UnaryOp::Neg => Err("unary `-` requires Int or Float".into()),
+                    UnaryOp::Not => Err("unary `!` requires Bool".into()),
+                }
+            }
+            Expr::Binary { op, left, right } => {
+                let left = self.lower_expr(left, locals)?;
+                match op {
+                    BinaryOp::And | BinaryOp::Or => {
+                        let left = left.into_bool("boolean operator")?;
+                        let right = self
+                            .lower_expr(right, locals)?
+                            .into_bool("boolean operator")?;
+                        Ok(TypedExpr::boolean(match op {
+                            BinaryOp::And => BoolExpr::And(Box::new(left), Box::new(right)),
+                            BinaryOp::Or => BoolExpr::Or(Box::new(left), Box::new(right)),
+                            _ => unreachable!(),
+                        }))
+                    }
+                    _ => {
+                        let right = self.lower_expr(right, locals)?;
+                        self.lower_binary(*op, left, right)
+                    }
+                }
+            }
+            Expr::Call { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|argument| self.lower_expr(argument, locals))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match (name.as_str(), args.as_slice()) {
+                    ("float", [value]) if value.ty == Ty::Int => Ok(TypedExpr::value(
+                        ValueExpr::Intrinsic {
+                            name: "float".into(),
+                            arguments: vec![value.clone().into_value("float")?],
+                        },
+                        Ty::Float,
+                    )),
+                    (intrinsic @ ("min" | "max"), [left, right])
+                        if left.ty == right.ty && matches!(left.ty, Ty::Int | Ty::Float) =>
+                    {
+                        Ok(TypedExpr::value(
+                            ValueExpr::Intrinsic {
+                                name: intrinsic.into(),
+                                arguments: vec![
+                                    left.clone().into_value(intrinsic)?,
+                                    right.clone().into_value(intrinsic)?,
+                                ],
+                            },
+                            left.ty,
+                        ))
+                    }
+                    _ => Err(format!("unknown or ill-typed intrinsic call `{name}`")),
+                }
+            }
+        }
+    }
+
+    fn lower_binary(
+        &self,
+        operator: BinaryOp,
+        left: TypedExpr,
+        right: TypedExpr,
+    ) -> Result<TypedExpr, String> {
+        match operator {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                if left.ty != right.ty || !matches!(left.ty, Ty::Int | Ty::Float) {
+                    return Err("arithmetic operands must be the same Int or Float type".into());
+                }
+                let ty = left.ty;
+                let name = match operator {
+                    BinaryOp::Add => "add",
+                    BinaryOp::Sub => "sub",
+                    BinaryOp::Mul => "mul",
+                    BinaryOp::Div => "div",
+                    BinaryOp::Rem => "rem",
+                    _ => unreachable!(),
+                };
+                Ok(TypedExpr::value(
+                    ValueExpr::Intrinsic {
+                        name: name.into(),
+                        arguments: vec![
+                            left.into_value("arithmetic")?,
+                            right.into_value("arithmetic")?,
+                        ],
+                    },
+                    ty,
+                ))
+            }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => {
+                if left.ty != right.ty || left.ty == Ty::Any {
+                    return Err("comparison operands must have the same concrete type".into());
+                }
+                if matches!(
+                    operator,
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) && !matches!(left.ty, Ty::Int | Ty::Float)
+                {
+                    return Err("ordered comparison requires Int or Float".into());
+                }
+                let op = match operator {
+                    BinaryOp::Eq => CompareOp::Eq,
+                    BinaryOp::Ne => CompareOp::Ne,
+                    BinaryOp::Lt => CompareOp::Lt,
+                    BinaryOp::Le => CompareOp::Le,
+                    BinaryOp::Gt => CompareOp::Gt,
+                    BinaryOp::Ge => CompareOp::Ge,
+                    _ => unreachable!(),
+                };
+                Ok(TypedExpr::boolean(BoolExpr::Compare {
+                    op,
+                    left: left.into_value("comparison")?,
+                    right: right.into_value("comparison")?,
+                }))
+            }
+            BinaryOp::And | BinaryOp::Or => unreachable!("handled for short-circuit lowering"),
+        }
+    }
+
     /// Compile an `on` handler into a runnable [`Behavior`], bound to the process
     /// entity `self_entity`. The behavior parses each incoming message with the
     /// handler's `form`, dispatches to the matching arm, runs its statements
@@ -786,32 +1728,255 @@ impl Program {
         inbox: &str,
         self_entity: Entity,
     ) -> Result<Behavior, String> {
+        Self::behavior_internal(prog, inbox, self_entity, None)
+    }
+
+    pub fn behavior_with_grants(
+        prog: &Arc<Program>,
+        inbox: &str,
+        self_entity: Entity,
+        grants: Arc<ResolvedGrantSet>,
+    ) -> Result<Behavior, String> {
+        Self::behavior_internal(prog, inbox, self_entity, Some(grants))
+    }
+
+    fn behavior_internal(
+        prog: &Arc<Program>,
+        inbox: &str,
+        self_entity: Entity,
+        grants: Option<Arc<ResolvedGrantSet>>,
+    ) -> Result<Behavior, String> {
         let on = prog
             .ons
             .get(inbox)
             .ok_or_else(|| format!("no on-handler for `{inbox}`"))?;
         let form = prog.form(&on.form)?;
-        let arms = on.arms.clone();
-        let concat_arms = on.concat_arms.clone();
+        let arms = on
+            .arms
+            .iter()
+            .map(|arm| {
+                Ok(CompiledArm {
+                    tag: arm.tag.clone(),
+                    vars: arm.vars.clone(),
+                    ir: prog.lower_stmt_arm(arm)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut arms = arms;
+        arms.extend(
+            on.concat_arms
+                .iter()
+                .map(|arm| {
+                    Ok(CompiledArm {
+                        tag: arm.tag.clone(),
+                        vars: arm.vars.clone(),
+                        ir: prog.lower_concat_arm(arm)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
         let prog = Arc::clone(prog);
         Ok(Box::new(
             move |snap: &Snapshot, body: &Tuple| -> CoreResult<Patch> {
-                run_behavior(&prog, &form, &arms, &concat_arms, self_entity, snap, body)
+                run_behavior(
+                    &prog,
+                    grants.as_deref(),
+                    &form,
+                    &arms,
+                    self_entity,
+                    snap,
+                    body,
+                )
             },
         ))
     }
+
+    /// Lower every surface arm for `inbox` to the sole executable IR. This is
+    /// used by effect inference so authority analysis cannot diverge from the
+    /// plan that execution runs.
+    pub fn handler_irs(&self, inbox: &str) -> Result<Vec<BehaviorIr>, String> {
+        let on = self
+            .ons
+            .get(inbox)
+            .ok_or_else(|| format!("no on-handler for `{inbox}`"))?;
+        on.arms
+            .iter()
+            .map(|arm| self.lower_stmt_arm(arm))
+            .chain(on.concat_arms.iter().map(|arm| self.lower_concat_arm(arm)))
+            .collect()
+    }
+
+    pub(crate) fn validate_behaviors(&self) -> Result<(), String> {
+        let mut inboxes: Vec<_> = self.ons.keys().cloned().collect();
+        inboxes.sort();
+        for inbox in inboxes {
+            self.handler_irs(&inbox)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn schedule_targets(&self, capability: &str) -> Result<BTreeSet<String>, String> {
+        fn collect(operations: &[BehaviorOp], capability: &str, targets: &mut BTreeSet<String>) {
+            for operation in operations {
+                match operation {
+                    BehaviorOp::InvokeCapability {
+                        capability: invoked,
+                        arguments,
+                        ..
+                    } if invoked == capability => {
+                        if let Some(ExprIr::Value(ValueExpr::Literal(Value::Text(target)))) =
+                            arguments.first()
+                        {
+                            targets.insert(target.to_string());
+                        }
+                    }
+                    BehaviorOp::If {
+                        then_ops, else_ops, ..
+                    } => {
+                        collect(then_ops, capability, targets);
+                        collect(else_ops, capability, targets);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut targets = BTreeSet::new();
+        for inbox in self.ons.keys() {
+            for behavior in self.handler_irs(inbox)? {
+                collect(&behavior.operations, capability, &mut targets);
+            }
+        }
+        Ok(targets)
+    }
 }
 
-fn rt_err(s: impl Into<String>) -> Error {
-    Error::Codec(s.into())
+#[derive(Clone)]
+struct CompiledArm {
+    tag: String,
+    vars: Vec<String>,
+    ir: BehaviorIr,
+}
+
+#[derive(Clone)]
+struct TypedExpr {
+    ir: ExprIr,
+    ty: Ty,
+}
+
+impl TypedExpr {
+    fn value(value: ValueExpr, ty: Ty) -> Self {
+        Self {
+            ir: ExprIr::Value(value),
+            ty,
+        }
+    }
+
+    fn boolean(value: BoolExpr) -> Self {
+        Self {
+            ir: ExprIr::Bool(value),
+            ty: Ty::Bool,
+        }
+    }
+
+    fn literal(value: Value) -> Self {
+        let ty = value_type(&value);
+        Self::value(ValueExpr::Literal(value), ty)
+    }
+
+    fn into_value(self, context: &str) -> Result<ValueExpr, String> {
+        match self.ir {
+            ExprIr::Value(value) => Ok(value),
+            ExprIr::Bool(_) => Err(format!("{context} requires a scalar value")),
+        }
+    }
+
+    fn into_bool(self, context: &str) -> Result<BoolExpr, String> {
+        if self.ty != Ty::Bool {
+            return Err(format!("{context} requires Bool, found {}", self.ty.name()));
+        }
+        Ok(match self.ir {
+            ExprIr::Bool(value) => value,
+            ExprIr::Value(value) => BoolExpr::Value(value),
+        })
+    }
+}
+
+fn value_type(value: &Value) -> Ty {
+    match value {
+        Value::Ent(_) => Ty::Ent,
+        Value::Int(_) => Ty::Int,
+        Value::Float(_) => Ty::Float,
+        Value::Text(_) => Ty::Text,
+        Value::Bool(_) => Ty::Bool,
+        Value::Tuple(_) => Ty::Tuple,
+        Value::Bytes(_) => Ty::Bytes,
+        Value::Code(_) => Ty::Code,
+    }
+}
+
+fn stack_top(stack: &[TypedExpr]) -> Result<&TypedExpr, String> {
+    stack
+        .last()
+        .ok_or_else(|| "concatenative stack underflow".into())
+}
+
+fn stack_pop(stack: &mut Vec<TypedExpr>) -> Result<TypedExpr, String> {
+    stack
+        .pop()
+        .ok_or_else(|| "concatenative stack underflow".into())
+}
+
+fn stack_pop_n(stack: &mut Vec<TypedExpr>, count: usize) -> Result<Vec<TypedExpr>, String> {
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(stack_pop(stack)?);
+    }
+    values.reverse();
+    Ok(values)
+}
+
+fn fresh_ir_local(next: &mut usize) -> String {
+    let local = format!("#stack{}", *next);
+    *next += 1;
+    local
+}
+
+fn bind_type(
+    program: &Program,
+    locals: &mut BTreeMap<String, Ty>,
+    name: &str,
+    ty: Ty,
+) -> Result<(), String> {
+    if program.entity(name).is_some() {
+        return Err(format!("local `{name}` shadows an entity constant"));
+    }
+    if locals.insert(name.to_owned(), ty).is_some() {
+        return Err(format!(
+            "local `{name}` is bound more than once in one scope"
+        ));
+    }
+    Ok(())
+}
+
+fn require_assignable(expected: Ty, actual: Ty, context: &str) -> Result<(), String> {
+    if expected == Ty::Any || expected == actual {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} expects {}, found {}",
+            expected.name(),
+            actual.name()
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_behavior(
     prog: &Program,
+    grants: Option<&ResolvedGrantSet>,
     form: &Form,
-    arms: &[Arm],
-    concat_arms: &[ConcatArm],
+    arms: &[CompiledArm],
     self_entity: Entity,
     snap: &Snapshot,
     body: &Tuple,
@@ -832,235 +1997,22 @@ fn run_behavior(
 
     for arm in arms {
         if arm.tag == tag && parts.len() == arm.vars.len() + 1 {
-            let mut env: HashMap<String, Value> = HashMap::new();
-            env.insert("self".into(), Value::Ent(self_entity));
-            for (i, v) in arm.vars.iter().enumerate() {
-                env.insert(v.clone(), parts[i + 1].clone());
-            }
-            return Ok(exec_stmts(prog, &arm.stmts, &mut env, snap)?.unwrap_or_default());
-        }
-    }
-    // A concatenative arm handles the same tags, over the same primitives; the
-    // two surfaces coexist in one handler.
-    for arm in concat_arms {
-        if arm.tag == tag && parts.len() == arm.vars.len() + 1 {
-            return Ok(run_concat(prog, arm, self_entity, snap, &parts)?.unwrap_or_default());
+            let initial = arm
+                .vars
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (name.clone(), parts[index + 1].clone()));
+            let patch = match grants {
+                Some(grants) => {
+                    arm.ir
+                        .execute_with_grants(prog, grants, self_entity, snap, initial)?
+                }
+                None => arm.ir.execute(prog, self_entity, snap, initial)?,
+            };
+            return Ok(patch.unwrap_or_default());
         }
     }
     Ok(Patch::new())
-}
-
-/// Run a concatenative arm point-free: seed the value stack with the
-/// constructor arguments, apply each word, and return the accumulated patch.
-///
-/// The seam words reuse the **exact** primitives of [`exec_stmts`] — view
-/// instantiation, least-tuple selection, `snap.read`, and the `Patch` builder —
-/// so a word arm and the equivalent statement arm build an identical patch and
-/// thus commit identical editions. As in v1, a `resolve`/`find` that matches
-/// nothing yields `None` (the arm makes no change).
-///
-/// `parts` is the parsed command `[Tag, arg0, …]`; `parts[1..]` are the initial
-/// stack. [`ConcatArm::check`] has already proved the body never underflows and
-/// consumes its stack, so a pop here is infallible in practice; the guarded
-/// [`pop`] returns a codec error rather than panicking if that ever fails.
-fn run_concat(
-    prog: &Program,
-    arm: &ConcatArm,
-    self_entity: Entity,
-    snap: &Snapshot,
-    parts: &[Value],
-) -> CoreResult<Option<Patch>> {
-    // Seed the stack with the constructor arguments (`parts[0]` is the tag) and
-    // run the shared word executor — the same one a stored behavior runs, so a
-    // concat arm and an equivalent stored behavior build an identical patch.
-    exec_words(prog, &arm.words, self_entity, snap, parts[1..].to_vec())
-}
-
-/// Execute a point-free [`Word`] body over an initial value `stack`, building a
-/// patch. This is the sole word interpreter: [`run_concat`] seeds it with a
-/// handler arm's constructor arguments, and P12 stored-behavior dispatch
-/// (`crate::behavior`) seeds it with a message's columns. `Ok(None)` means a
-/// `resolve`/`find` matched nothing — the body makes no change.
-///
-/// The `match` over [`Word`] is exhaustive (no wildcard): a new word variant
-/// forces this interpreter — and the effect/authority walk that must agree with
-/// it — to be revisited rather than silently mis-run.
-pub(crate) fn exec_words(
-    prog: &Program,
-    words: &[Word],
-    self_entity: Entity,
-    snap: &Snapshot,
-    mut stack: Vec<Value>,
-) -> CoreResult<Option<Patch>> {
-    let mut patch = Patch::new();
-
-    for word in words {
-        match word {
-            Word::SelfEntity => stack.push(Value::Ent(self_entity)),
-            Word::Lit(v) => stack.push(v.clone()),
-            Word::Dup => {
-                let a = top(&stack)?.clone();
-                stack.push(a);
-            }
-            Word::Drop => {
-                pop(&mut stack)?;
-            }
-            Word::Swap => {
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                stack.push(b);
-                stack.push(a);
-            }
-            Word::Over => {
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                stack.push(a.clone());
-                stack.push(b);
-                stack.push(a);
-            }
-            Word::Rot => {
-                let c = pop(&mut stack)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                stack.push(b);
-                stack.push(c);
-                stack.push(a);
-            }
-            Word::Nip => {
-                let b = pop(&mut stack)?;
-                pop(&mut stack)?;
-                stack.push(b);
-            }
-            Word::Tuck => {
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                stack.push(b.clone());
-                stack.push(a);
-                stack.push(b);
-            }
-            Word::TwoDup => {
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                stack.push(a.clone());
-                stack.push(b.clone());
-                stack.push(a);
-                stack.push(b);
-            }
-            Word::TwoDrop => {
-                pop(&mut stack)?;
-                pop(&mut stack)?;
-            }
-            Word::Resolve { view, col, op } => {
-                let params = prog
-                    .views
-                    .get(view)
-                    .map(|v| v.params.len())
-                    .ok_or_else(|| rt_err(format!("no view `{view}`")))?;
-                let key = pop(&mut stack)?;
-                let args = pop_n(&mut stack, params)?; // param0..paramN (reversed by pop_n)
-                let q = prog.view(view, &args).map_err(rt_err)?;
-                let yields = prog
-                    .view_yields(view)
-                    .ok_or_else(|| rt_err(format!("no view `{view}`")))?
-                    .to_vec();
-                let ci = yields
-                    .iter()
-                    .position(|y| y == col)
-                    .ok_or_else(|| rt_err(format!("view `{view}` has no column `{col}`")))?;
-                let rows = q.find(snap)?;
-                // Deterministic choice: the *least* matching tuple, exactly as
-                // `Stmt::Resolve` chooses.
-                let picked = rows
-                    .into_iter()
-                    .filter(|(t, _)| col_match(*op, &t.as_slice()[ci], &key))
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match picked {
-                    Some((t, _)) => {
-                        for i in 0..yields.len() {
-                            stack.push(t.as_slice()[i].clone());
-                        }
-                    }
-                    None => return Ok(None),
-                }
-            }
-            Word::Find { rel, keyn } => {
-                let rid = prog
-                    .rel_id(rel)
-                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-                let keys = pop_n(&mut stack, *keyn)?; // col0..col{keyn-1}
-                let rows = snap.read(rid)?;
-                let picked = rows
-                    .into_iter()
-                    .filter(|(t, _)| {
-                        keys.iter()
-                            .enumerate()
-                            .all(|(i, k)| t.as_slice().get(i) == Some(k))
-                    })
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match picked {
-                    Some((t, _)) => {
-                        for v in t.as_slice() {
-                            stack.push(v.clone());
-                        }
-                    }
-                    None => return Ok(None),
-                }
-            }
-            Word::Expect(rel) => {
-                let f = pop_fact(prog, rel, &mut stack)?;
-                patch = patch.expect(f);
-            }
-            Word::Assert(rel) => {
-                let f = pop_fact(prog, rel, &mut stack)?;
-                patch = patch.assert(f);
-            }
-            Word::Retract(rel) => {
-                let f = pop_fact(prog, rel, &mut stack)?;
-                patch = patch.retract(f);
-            }
-            Word::Emit(rel) => {
-                let rid = prog
-                    .rel_id(rel)
-                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-                let arity = prog.rel_columns(rel).map(|c| c.len()).unwrap_or(0);
-                let cols = pop_n(&mut stack, arity)?;
-                patch = patch.emit(Message {
-                    inbox: rid,
-                    body: Tuple::new(cols),
-                });
-            }
-        }
-    }
-    Ok(Some(patch))
-}
-
-fn top(stack: &[Value]) -> CoreResult<&Value> {
-    stack.last().ok_or_else(|| rt_err("concatenative stack underflow"))
-}
-
-fn pop(stack: &mut Vec<Value>) -> CoreResult<Value> {
-    stack.pop().ok_or_else(|| rt_err("concatenative stack underflow"))
-}
-
-/// Pop `n` cells and return them in **column order** (deepest popped = index 0),
-/// undoing the stack's last-in-first-out order.
-fn pop_n(stack: &mut Vec<Value>, n: usize) -> CoreResult<Vec<Value>> {
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push(pop(stack)?);
-    }
-    out.reverse();
-    Ok(out)
-}
-
-/// Pop a relation's `arity` columns (in column order) into a [`Fact`].
-fn pop_fact(prog: &Program, rel: &str, stack: &mut Vec<Value>) -> CoreResult<Fact> {
-    let rid = prog
-        .rel_id(rel)
-        .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-    let arity = prog.rel_columns(rel).map(|c| c.len()).unwrap_or(0);
-    let cols = pop_n(stack, arity)?;
-    Ok(Fact::new(rid, Tuple::new(cols)))
 }
 
 impl Schemas for Program {
@@ -1076,144 +2028,4 @@ impl Schemas for Program {
     fn rel_arity(&self, rel: &str) -> Option<usize> {
         self.rels.get(rel).map(|r| r.arity())
     }
-}
-
-/// Run an arm's statements, building a patch. `Ok(None)` means a `resolve`/`find`
-/// found nothing — the arm makes no change.
-fn exec_stmts(
-    prog: &Program,
-    stmts: &[Stmt],
-    env: &mut HashMap<String, Value>,
-    snap: &Snapshot,
-) -> CoreResult<Option<Patch>> {
-    let mut patch = Patch::new();
-    for stmt in stmts {
-        match stmt {
-            Stmt::Resolve {
-                view,
-                args,
-                col,
-                op,
-                rhs,
-            } => {
-                let argvals = sargs(args, env)?;
-                let q = prog.view(view, &argvals).map_err(rt_err)?;
-                let yields = prog
-                    .view_yields(view)
-                    .ok_or_else(|| rt_err(format!("no view `{view}`")))?
-                    .to_vec();
-                let ci = yields
-                    .iter()
-                    .position(|y| y == col)
-                    .ok_or_else(|| rt_err(format!("view `{view}` has no column `{col}`")))?;
-                let want = sarg(rhs, env)?;
-                let rows = q.find(snap)?;
-                // Deterministic choice: bind to the *least* matching tuple, not
-                // whichever the scan happened to surface first.
-                let picked = rows
-                    .into_iter()
-                    .filter(|(t, _)| col_match(*op, &t.as_slice()[ci], &want))
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match picked {
-                    Some((t, _)) => {
-                        for (i, y) in yields.iter().enumerate() {
-                            env.insert(y.clone(), t.as_slice()[i].clone());
-                        }
-                    }
-                    None => return Ok(None),
-                }
-            }
-            Stmt::Find { rel, args } => {
-                let rid = prog
-                    .rel_id(rel)
-                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-                let rows = snap.read(rid)?;
-                let bound: Vec<(usize, Value)> = args
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, a)| sarg_opt(a, env).map(|v| (i, v)))
-                    .collect();
-                // Deterministic choice: bind to the *least* matching tuple.
-                let picked = rows
-                    .into_iter()
-                    .filter(|(t, _)| bound.iter().all(|(i, v)| t.as_slice().get(*i) == Some(v)))
-                    .min_by(|(a, _), (b, _)| a.cmp(b));
-                match picked {
-                    Some((t, _)) => {
-                        for (i, a) in args.iter().enumerate() {
-                            if let SArg::Var(name) = a {
-                                if !env.contains_key(name) {
-                                    if let Some(v) = t.as_slice().get(i) {
-                                        env.insert(name.clone(), v.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => return Ok(None),
-                }
-            }
-            Stmt::Expect { rel, args } => patch = patch.expect(fact(prog, rel, args, env)?),
-            Stmt::Assert { rel, args } => patch = patch.assert(fact(prog, rel, args, env)?),
-            Stmt::Retract { rel, args } => patch = patch.retract(fact(prog, rel, args, env)?),
-            Stmt::Emit { rel, args } => {
-                let rid = prog
-                    .rel_id(rel)
-                    .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-                patch = patch.emit(Message {
-                    inbox: rid,
-                    body: tuple(args, env)?,
-                });
-            }
-        }
-    }
-    Ok(Some(patch))
-}
-
-fn col_match(op: MatchOp, have: &Value, want: &Value) -> bool {
-    match (op, have, want) {
-        (MatchOp::Word, Value::Text(h), Value::Text(w)) => {
-            h.as_ref() == w.as_ref() || h.split_whitespace().any(|word| word == w.as_ref())
-        }
-        _ => have == want,
-    }
-}
-
-fn sarg(a: &SArg, env: &HashMap<String, Value>) -> CoreResult<Value> {
-    match a {
-        SArg::Var(name) => env
-            .get(name)
-            .cloned()
-            .ok_or_else(|| rt_err(format!("unbound variable `{name}`"))),
-        SArg::Str(s) => Ok(Value::text(s)),
-        SArg::Int(n) => Ok(Value::Int(*n)),
-    }
-}
-
-fn sarg_opt(a: &SArg, env: &HashMap<String, Value>) -> Option<Value> {
-    match a {
-        SArg::Var(name) => env.get(name).cloned(),
-        SArg::Str(s) => Some(Value::text(s)),
-        SArg::Int(n) => Some(Value::Int(*n)),
-    }
-}
-
-fn sargs(args: &[SArg], env: &HashMap<String, Value>) -> CoreResult<Vec<Value>> {
-    args.iter().map(|a| sarg(a, env)).collect()
-}
-
-fn tuple(args: &[SArg], env: &HashMap<String, Value>) -> CoreResult<Tuple> {
-    Ok(Tuple::new(sargs(args, env)?))
-}
-
-fn fact(
-    prog: &Program,
-    rel: &str,
-    args: &[SArg],
-    env: &HashMap<String, Value>,
-) -> CoreResult<Fact> {
-    let rid = prog
-        .rel_id(rel)
-        .ok_or_else(|| rt_err(format!("no relation `{rel}`")))?;
-    Ok(Fact::new(rid, tuple(args, env)?))
 }

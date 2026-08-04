@@ -39,7 +39,10 @@ impl Scope {
         Scope { rel, range: None }
     }
     pub fn slice(rel: RelId, range: KeyRange) -> Scope {
-        Scope { rel, range: Some(range) }
+        Scope {
+            rel,
+            range: Some(range),
+        }
     }
 }
 
@@ -57,8 +60,8 @@ impl Authority {
 
     /// Does this authority permit writing `fact`?
     pub fn permits(&self, fact: &Fact) -> bool {
-        self.owns.iter().any(|s| {
-            s.rel == fact.rel && s.range.as_ref().is_none_or(|r| r.contains(&fact.tuple))
-        })
+        self.owns
+            .iter()
+            .any(|s| s.rel == fact.rel && s.range.as_ref().is_none_or(|r| r.contains(&fact.tuple)))
     }
 }

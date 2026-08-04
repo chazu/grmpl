@@ -21,6 +21,8 @@ pub enum Ty {
     Ent,
     /// A signed 64-bit integer ([`Value::Int`]).
     Int,
+    /// A finite canonical IEEE-754 binary64 scalar ([`Value::Float`]).
+    Float,
     /// Interned text ([`Value::Text`]).
     Text,
     /// A boolean ([`Value::Bool`]).
@@ -44,6 +46,7 @@ impl Ty {
             Ty::Any => true,
             Ty::Ent => matches!(v, Value::Ent(_)),
             Ty::Int => matches!(v, Value::Int(_)),
+            Ty::Float => matches!(v, Value::Float(_)),
             Ty::Text => matches!(v, Value::Text(_)),
             Ty::Bool => matches!(v, Value::Bool(_)),
             Ty::Tuple => matches!(v, Value::Tuple(_)),
@@ -57,6 +60,7 @@ impl Ty {
         match self {
             Ty::Ent => "Ent",
             Ty::Int => "Int",
+            Ty::Float => "Float",
             Ty::Text => "Text",
             Ty::Bool => "Bool",
             Ty::Tuple => "Tuple",
@@ -72,6 +76,7 @@ impl Ty {
         Some(match name {
             "Ent" => Ty::Ent,
             "Int" => Ty::Int,
+            "Float" => Ty::Float,
             "Text" => Ty::Text,
             "Bool" => Ty::Bool,
             "Tuple" => Ty::Tuple,
@@ -92,7 +97,10 @@ pub struct Column {
 
 impl Column {
     pub fn new(name: impl Into<String>, ty: Ty) -> Column {
-        Column { name: name.into(), ty }
+        Column {
+            name: name.into(),
+            ty,
+        }
     }
 }
 
@@ -174,10 +182,17 @@ mod tests {
         assert!(Ty::Ent.admits(&Value::Ent(Entity(1))));
         assert!(!Ty::Ent.admits(&Value::Int(1)));
         assert!(Ty::Int.admits(&Value::Int(-4)));
+        assert!(Ty::Float.admits(&Value::float(1.25).unwrap()));
+        assert!(!Ty::Float.admits(&Value::Int(1)));
         assert!(Ty::Text.admits(&Value::text("x")));
         assert!(Ty::Bool.admits(&Value::Bool(true)));
         // Any is the top type.
-        for v in [Value::Ent(Entity(9)), Value::Int(0), Value::text(""), Value::Bool(false)] {
+        for v in [
+            Value::Ent(Entity(9)),
+            Value::Int(0),
+            Value::text(""),
+            Value::Bool(false),
+        ] {
             assert!(Ty::Any.admits(&v));
         }
     }
@@ -185,17 +200,23 @@ mod tests {
     #[test]
     fn check_enforces_arity_then_types() {
         let s = schema(&[("thing", Ty::Ent), ("place", Ty::Ent)]);
-        assert!(s.check(&Tuple::from([Value::Ent(Entity(1)), Value::Ent(Entity(2))])).is_ok());
+        assert!(s
+            .check(&Tuple::from([Value::Ent(Entity(1)), Value::Ent(Entity(2))]))
+            .is_ok());
         // wrong arity
         assert!(s.check(&Tuple::from([Value::Ent(Entity(1))])).is_err());
         // right arity, wrong type
-        assert!(s.check(&Tuple::from([Value::Ent(Entity(1)), Value::Int(2)])).is_err());
+        assert!(s
+            .check(&Tuple::from([Value::Ent(Entity(1)), Value::Int(2)]))
+            .is_err());
     }
 
     #[test]
     fn any_column_admits_anything_of_right_arity() {
         let s = schema(&[("a", Ty::Any), ("b", Ty::Any)]);
-        assert!(s.check(&Tuple::from([Value::Int(1), Value::text("z")])).is_ok());
+        assert!(s
+            .check(&Tuple::from([Value::Int(1), Value::text("z")]))
+            .is_ok());
         assert!(s.check(&Tuple::from([Value::Int(1)])).is_err()); // arity still enforced
     }
 

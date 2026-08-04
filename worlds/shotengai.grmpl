@@ -1,3 +1,52 @@
+package kasumi_shotengai bootstrap 1
+
+entity PLAYER = 1
+entity WORLD = 2
+entity EAST_GATE = 10
+entity ARCADE = 11
+entity KISSATEN = 12
+entity REPAIR_SHOP = 13
+entity SENTO = 14
+entity COOPERATIVE = 15
+entity SHRINE_ALLEY = 16
+entity CINEMA = 17
+entity ROOFTOP = 18
+entity RED_UMBRELLA = 20
+entity BRASS_TOKEN = 21
+entity OLD_RADIO = 22
+entity TEA_TIN = 23
+entity CAT = 30
+entity PROPRIETOR = 31
+entity REPAIRER = 32
+entity CARETAKER = 33
+entity COMBAT = 34
+entity COURIER = 100
+entity COOK = 101
+entity REPAIRER_JOB = 102
+entity SHRINE_ATTENDANT = 103
+entity NIGHT_WATCH = 104
+entity QUICK_STEP = 200
+entity SEARING_PAN = 201
+entity LIVE_WIRE = 202
+entity PAPER_WARD = 203
+entity LANTERN_WALL = 204
+entity DUNGEON_ENTRY = 1000
+entity FLOODED_STORE = 1001
+entity FORGOTTEN_ARCADE = 1002
+entity LEDGER_VAULT = 1003
+entity MIRROR_CHAMBER = 1004
+entity MANNEQUIN_STOCKROOM = 1005
+entity RECEIPT_MOTH = 1010
+entity SHUTTER_MAW = 1011
+entity LAST_CUSTOMER = 1012
+entity MANNEQUIN_SHELL = 1013
+entity DUNGEON_COIN = 1020
+entity RED_THREAD = 1021
+entity COPYING_MIRROR = 1022
+
+requires random omens(state: rng_state, owner: WORLD, algorithm: xorshift64star_v1)
+requires schedule world_clock(clock: clock, timers: timers, sequences: inbox_seq)
+
 // ============================================================================
 // Kasumi Shotengai — a larger MOO world whose rules live on grmpl's relational
 // surface. Initial places, people, finite combat tables, and dungeon templates
@@ -39,15 +88,20 @@ rel defense(thing: Ent, guard: Int)
 rel monster_power(thing: Ent, power: Int)
 rel monster_reward(thing: Ent, points: Int)
 rel defeated(thing: Ent)
-rel attack_result(power: Int, guard: Int, old_hp: Int, new_hp: Int, outcome: Text)
 rel combat_event(player: Ent, monster: Ent, outcome: Text)
+rel combat_claimed(monster: Ent, claimed: Bool)
+rel player_defeat(player: Ent)
+rel boss_unlock(monster: Ent, boss: Bool, vault: Ent, chamber: Ent)
 
 // ---- durable edge/runtime state --------------------------------------------
 rel session_branch(player: Ent, branch: Int)
 rel echo_depth(world: Ent, depth: Int)
 rel instance_state(player: Ent, shift: Int, home: Ent)
 rel instance_counter(player: Ent, next: Int)
-rel rng_state(world: Ent, state: Int)
+rel rng_state(owner: Ent, state: Int)
+rel clock(seq: Int, wall_ms: Int, random: Int)
+rel timers(due: Int, inbox: Int, target: Ent, body: Tuple)
+rel patrol_due(actor: Ent, due: Int)
 
 // ---- card table: arithmetic and combinations are relations -----------------
 rel card(holder: Ent, slot: Int, code: Int)
@@ -61,8 +115,49 @@ rel sum15three(a: Int, b: Int, c: Int)
 // ---- process and watch plumbing --------------------------------------------
 rel tell(player: Ent, text: Text)
 rel inbox(process: Ent, seq: Int, body: Tuple)
+rel patrol_inbox(process: Ent, seq: Int, body: Tuple)
+rel combat_inbox(process: Ent, seq: Int, body: Tuple)
 rel inbox_seq(process: Ent, next: Int)
 rel cursor(process: Ent, pos: Int)
+
+authority player_writes {
+    write active_job
+    write combat_event
+    write cursor
+    write held
+    write hp
+    write knows
+    write located
+    write rng_state
+    write tell
+    write timers
+}
+
+authority patrol_writes {
+    write cursor
+    write located
+    write patrol_due
+    write timers
+}
+
+authority combat_writes {
+    write ability_rank
+    write combat_claimed
+    write combat_event
+    write cursor
+    write defeated
+    write exits
+    write hp
+    write job_points
+    write job_rank
+    write monster_reward
+    write player_defeat
+    write tell
+}
+
+actor PLAYER { inbox inbox cursor cursor authority player_writes }
+actor CAT { inbox patrol_inbox cursor cursor authority patrol_writes }
+actor COMBAT { inbox combat_inbox cursor cursor authority combat_writes }
 rel wmail(who: Ent, seq: Int, body: Tuple)
 rel wcursor(watch: Ent, edition: Int)
 rel wseq(inbox: Int, target: Ent, n: Int)
@@ -215,8 +310,11 @@ form command {
     "change" job  -> Change(job)
     "attack" who  -> Attack(who)
     "use" skill   -> Use(skill)
-    "tick"         -> Tick()
+    "omen"         -> Omen()
 }
+
+form patrol_command { "start-patrol" -> StartPatrol() "tick" -> Tick() }
+form combat_command { "combat-step" -> CombatStep() }
 
 // ---- behaviors: guarded patches over the relations above -------------------
 on inbox parse command {
@@ -279,11 +377,21 @@ on inbox parse command {
         find job_stats(job, rank, power, player_guard, max_hp)
         find hp(enemy, old_hp)
         find defense(enemy, enemy_guard)
-        find attack_result(power, enemy_guard, old_hp, new_hp, outcome)
-        expect hp(enemy, old_hp)
-        retract hp(enemy, old_hp)
-        assert hp(enemy, new_hp)
-        assert combat_event(self, enemy, outcome)
+        let damage = max(1, power - enemy_guard / 2)
+        let new_hp = max(0, old_hp - damage)
+        if new_hp == 0 {
+            expect hp(enemy, old_hp)
+            retract hp(enemy, old_hp)
+            assert hp(enemy, new_hp)
+            assert combat_event(self, enemy, "defeated")
+            schedule world_clock at 0 send CombatStep() to COMBAT
+        } else {
+            expect hp(enemy, old_hp)
+            retract hp(enemy, old_hp)
+            assert hp(enemy, new_hp)
+            assert combat_event(self, enemy, "standing")
+            schedule world_clock at 0 send CombatStep() to COMBAT
+        }
         emit tell(self, "You strike.")
     }
 
@@ -291,21 +399,570 @@ on inbox parse command {
         resolve ability_targets(self) where name ~ wanted
         find hp(enemy, old_hp)
         find defense(enemy, enemy_guard)
-        find attack_result(power, enemy_guard, old_hp, new_hp, outcome)
-        expect hp(enemy, old_hp)
-        retract hp(enemy, old_hp)
-        assert hp(enemy, new_hp)
-        assert combat_event(self, enemy, outcome)
+        let damage = max(1, power - enemy_guard / 2)
+        let new_hp = max(0, old_hp - damage)
+        if new_hp == 0 {
+            expect hp(enemy, old_hp)
+            retract hp(enemy, old_hp)
+            assert hp(enemy, new_hp)
+            assert combat_event(self, enemy, "defeated")
+            schedule world_clock at 0 send CombatStep() to COMBAT
+        } else {
+            expect hp(enemy, old_hp)
+            retract hp(enemy, old_hp)
+            assert hp(enemy, new_hp)
+            assert combat_event(self, enemy, "standing")
+            schedule world_clock at 0 send CombatStep() to COMBAT
+        }
         emit tell(self, "Ability used.")
+    }
+
+    match Omen() {
+        random omens below 100 as roll
+        if roll < 15 {
+            emit tell(self, "The arcade lights flicker in warning.")
+        } else {
+            emit tell(self, "The arcade hums steadily.")
+        }
+    }
+
+}
+
+on patrol_inbox parse patrol_command {
+    match StartPatrol() {
+        find patrol_due(self, due)
+        schedule world_clock at due send Tick() to CAT
     }
 
     match Tick() {
         find located(self, room)
         find patrol(room, destination)
+        find patrol_due(self, due)
+        let next_due = due + 1000
         expect located(self, room)
+        expect patrol_due(self, due)
         retract located(self, room)
+        retract patrol_due(self, due)
         assert located(self, destination)
+        assert patrol_due(self, next_due)
+        schedule world_clock at next_due send Tick() to CAT
+    }
+
+}
+
+on combat_inbox parse combat_command {
+    match CombatStep() {
+        find combat_event(player, enemy, outcome)
+        expect combat_event(player, enemy, outcome)
+        retract combat_event(player, enemy, outcome)
+        find combat_claimed(enemy, claimed)
+        if claimed {
+            emit tell(player, "That victory was already resolved.")
+        } else {
+          if outcome == "defeated" {
+            find monster_reward(enemy, reward)
+            find active_job(player, job)
+            find job_rank(player, job, rank)
+            find job_points(player, job, points)
+            find job_progression(job, rank, points, reward, new_rank, new_points, ability, old_ability_rank, new_ability_rank)
+            find ability_rank(player, ability, old_ability_rank)
+            find boss_unlock(enemy, boss, vault, chamber)
+            expect monster_reward(enemy, reward)
+            expect combat_claimed(enemy, false)
+            expect job_rank(player, job, rank)
+            expect job_points(player, job, points)
+            expect ability_rank(player, ability, old_ability_rank)
+            retract monster_reward(enemy, reward)
+            retract combat_claimed(enemy, false)
+            retract job_rank(player, job, rank)
+            retract job_points(player, job, points)
+            retract ability_rank(player, ability, old_ability_rank)
+            assert job_rank(player, job, new_rank)
+            assert job_points(player, job, new_points)
+            assert ability_rank(player, ability, new_ability_rank)
+            assert defeated(enemy)
+            assert combat_claimed(enemy, true)
+            if boss {
+                assert exits(vault, "east", chamber)
+                assert exits(chamber, "west", vault)
+            }
+            emit tell(player, "Victory resolved.")
+        } else {
+            find monster_power(enemy, power)
+            find active_job(player, job)
+            find job_rank(player, job, rank)
+            find job_stats(job, rank, player_power, guard, max_hp)
+            find hp(player, old_hp)
+            let damage = max(1, power - guard / 2)
+            let new_hp = max(0, old_hp - damage)
+            expect hp(player, old_hp)
+            retract hp(player, old_hp)
+            assert hp(player, new_hp)
+            if new_hp == 0 {
+                assert player_defeat(player)
+            }
+            emit tell(player, "The monster strikes back.")
+          }
+        }
     }
 }
 
 on watch world including current { inbox wmail cursor wcursor seqs wseq }
+bootstrap {
+    located(PLAYER, EAST_GATE)
+    located(RED_UMBRELLA, EAST_GATE)
+    located(BRASS_TOKEN, ARCADE)
+    located(OLD_RADIO, REPAIR_SHOP)
+    located(TEA_TIN, KISSATEN)
+    located(CAT, EAST_GATE)
+    located(PROPRIETOR, KISSATEN)
+    located(REPAIRER, REPAIR_SHOP)
+    located(CARETAKER, COOPERATIVE)
+    located(RECEIPT_MOTH, FLOODED_STORE)
+    located(SHUTTER_MAW, FORGOTTEN_ARCADE)
+    located(LAST_CUSTOMER, LEDGER_VAULT)
+    located(MANNEQUIN_SHELL, MANNEQUIN_STOCKROOM)
+    located(DUNGEON_COIN, FLOODED_STORE)
+    located(RED_THREAD, FORGOTTEN_ARCADE)
+    located(COPYING_MIRROR, MIRROR_CHAMBER)
+    named(PLAYER, "you")
+    named(EAST_GATE, "East Gate")
+    named(ARCADE, "Central Arcade")
+    named(KISSATEN, "Tsukikage Kissaten")
+    named(REPAIR_SHOP, "Hoshino Repair")
+    named(SENTO, "Kasumi Sento")
+    named(COOPERATIVE, "Cooperative Office")
+    named(SHRINE_ALLEY, "Shrine Alley")
+    named(CINEMA, "Shuttered Cinema")
+    named(ROOFTOP, "Rooftop PA Room")
+    named(RED_UMBRELLA, "red umbrella")
+    named(BRASS_TOKEN, "brass token")
+    named(OLD_RADIO, "old radio")
+    named(TEA_TIN, "tea tin")
+    named(CAT, "Mugi")
+    named(PROPRIETOR, "Sachiko")
+    named(REPAIRER, "Daichi")
+    named(CARETAKER, "Reiko")
+    named(COURIER, "Courier")
+    named(COOK, "Cook")
+    named(REPAIRER_JOB, "Repairer")
+    named(SHRINE_ATTENDANT, "Shrine Attendant")
+    named(NIGHT_WATCH, "Night Watch")
+    named(QUICK_STEP, "quick step")
+    named(SEARING_PAN, "searing pan")
+    named(LIVE_WIRE, "live wire")
+    named(PAPER_WARD, "paper ward")
+    named(LANTERN_WALL, "lantern wall")
+    named(DUNGEON_ENTRY, "Basement Landing")
+    named(FLOODED_STORE, "Flooded Storage")
+    named(FORGOTTEN_ARCADE, "Forgotten Arcade")
+    named(LEDGER_VAULT, "Ledger Vault")
+    named(MIRROR_CHAMBER, "Mirror Chamber")
+    named(MANNEQUIN_STOCKROOM, "Mannequin Stockroom")
+    named(RECEIPT_MOTH, "receipt moth")
+    named(SHUTTER_MAW, "shutter maw")
+    named(LAST_CUSTOMER, "last customer")
+    named(MANNEQUIN_SHELL, "mannequin shell")
+    named(DUNGEON_COIN, "square coin")
+    named(RED_THREAD, "red thread")
+    named(COPYING_MIRROR, "copying mirror")
+    described(PLAYER, "Your reflection seems half a beat late.")
+    described(EAST_GATE, "A rusted arch announces Kasumi Shotengai beneath a roof of cloudy panels.")
+    described(ARCADE, "Most shutters are down, but warm rectangles of light survive between them.")
+    described(KISSATEN, "Dark wood, cooling coffee, and a card table polished by decades of hands.")
+    described(REPAIR_SHOP, "Radios, fans, and clocks wait in careful rows for one more life.")
+    described(SENTO, "Steam rolls through the tiled entryway. The bath restores exhausted wanderers.")
+    described(COOPERATIVE, "Ledgers fill the walls. An old time clock offers work that feels like fate.")
+    described(SHRINE_ALLEY, "A narrow lane bends around a pocket shrine and disappears under red lanterns.")
+    described(CINEMA, "Film posters bleach behind glass. A freight lift waits behind the ticket booth.")
+    described(ROOFTOP, "Dusty speakers and a switchboard listen to every change below.")
+    described(RED_UMBRELLA, "Its paper is dry although rain ticks against the roof.")
+    described(BRASS_TOKEN, "A shopping-street token stamped with a shop that no longer exists.")
+    described(OLD_RADIO, "The dial glows at a station between stations.")
+    described(TEA_TIN, "A dented tin fragrant with roasted tea.")
+    described(CAT, "A patched calico cat who knows every unlocked door.")
+    described(PROPRIETOR, "The kissaten proprietor watches the arcade through rising steam.")
+    described(REPAIRER, "A repairer with a pencil behind one ear and burn marks on both hands.")
+    described(CARETAKER, "The cooperative caretaker keeps keys whose locks have been forgotten.")
+    described(DUNGEON_ENTRY, "The lift doors close on a corridor much longer than the cinema above.")
+    described(FLOODED_STORE, "Black water reflects price cards hanging from a ceiling that cannot be seen.")
+    described(FORGOTTEN_ARCADE, "Shop fronts repeat into darkness, stocked with memories instead of goods.")
+    described(LEDGER_VAULT, "Every purchase the shotengai forgot is written in books chained to the floor.")
+    described(MIRROR_CHAMBER, "A standing mirror contains the arcade in impossible, perfect detail.")
+    described(MANNEQUIN_STOCKROOM, "Headless figures turn a fraction toward you whenever the lights flicker.")
+    described(RECEIPT_MOTH, "A moth folded from thermal paper, trailing itemized dust.")
+    described(SHUTTER_MAW, "A corrugated shop shutter that opens only to reveal teeth.")
+    described(LAST_CUSTOMER, "A mannequin carrying every bag and wearing no face.")
+    described(MANNEQUIN_SHELL, "A hollow display figure animated by the scrape of coat hangers.")
+    described(DUNGEON_COIN, "A coin with four edges and five shadows.")
+    described(RED_THREAD, "It pulls gently toward another version of your hand.")
+    described(COPYING_MIRROR, "Its reflection continues even when you stand still.")
+    exits(EAST_GATE, "north", ARCADE)
+    exits(ARCADE, "east", KISSATEN)
+    exits(ARCADE, "north", COOPERATIVE)
+    exits(ARCADE, "south", EAST_GATE)
+    exits(ARCADE, "west", REPAIR_SHOP)
+    exits(KISSATEN, "up", ROOFTOP)
+    exits(KISSATEN, "west", ARCADE)
+    exits(REPAIR_SHOP, "east", ARCADE)
+    exits(REPAIR_SHOP, "west", SENTO)
+    exits(SENTO, "east", REPAIR_SHOP)
+    exits(COOPERATIVE, "east", SHRINE_ALLEY)
+    exits(COOPERATIVE, "south", ARCADE)
+    exits(COOPERATIVE, "west", CINEMA)
+    exits(SHRINE_ALLEY, "west", COOPERATIVE)
+    exits(CINEMA, "east", COOPERATIVE)
+    exits(ROOFTOP, "down", KISSATEN)
+    exits(DUNGEON_ENTRY, "north", FLOODED_STORE)
+    exits(FLOODED_STORE, "north", FORGOTTEN_ARCADE)
+    exits(FLOODED_STORE, "south", DUNGEON_ENTRY)
+    exits(FORGOTTEN_ARCADE, "north", MANNEQUIN_STOCKROOM)
+    exits(FORGOTTEN_ARCADE, "south", FLOODED_STORE)
+    exits(LEDGER_VAULT, "south", MANNEQUIN_STOCKROOM)
+    exits(MANNEQUIN_STOCKROOM, "north", LEDGER_VAULT)
+    exits(MANNEQUIN_STOCKROOM, "south", FORGOTTEN_ARCADE)
+    players(PLAYER, "you")
+    value(RED_UMBRELLA, 6)
+    value(BRASS_TOKEN, 10)
+    value(OLD_RADIO, 18)
+    value(TEA_TIN, 4)
+    value(DUNGEON_COIN, 25)
+    value(RED_THREAD, 12)
+    person(CAT)
+    person(PROPRIETOR)
+    person(REPAIRER)
+    person(CARETAKER)
+    label(CAT, "a calico cat")
+    label(PROPRIETOR, "the kissaten proprietor")
+    label(REPAIRER, "a radio repairer")
+    label(CARETAKER, "the cooperative caretaker")
+    knows(PLAYER, PLAYER)
+    patrol(EAST_GATE, ARCADE)
+    patrol(ARCADE, KISSATEN)
+    patrol(KISSATEN, SHRINE_ALLEY)
+    patrol(COOPERATIVE, EAST_GATE)
+    patrol(SHRINE_ALLEY, COOPERATIVE)
+    job_clock(COOPERATIVE)
+    job(COURIER, "courier")
+    job(COOK, "cook")
+    job(REPAIRER_JOB, "repairer")
+    job(SHRINE_ATTENDANT, "shrine attendant")
+    job(NIGHT_WATCH, "night watch")
+    active_job(PLAYER, COURIER)
+    job_rank(PLAYER, COURIER, 1)
+    job_rank(PLAYER, COOK, 1)
+    job_rank(PLAYER, REPAIRER_JOB, 1)
+    job_rank(PLAYER, SHRINE_ATTENDANT, 1)
+    job_rank(PLAYER, NIGHT_WATCH, 1)
+    job_points(PLAYER, COURIER, 0)
+    job_points(PLAYER, COOK, 0)
+    job_points(PLAYER, REPAIRER_JOB, 0)
+    job_points(PLAYER, SHRINE_ATTENDANT, 0)
+    job_points(PLAYER, NIGHT_WATCH, 0)
+    job_stats(COURIER, 1, 4, 2, 20)
+    job_stats(COURIER, 2, 5, 3, 22)
+    job_stats(COURIER, 3, 6, 4, 24)
+    job_stats(COOK, 1, 3, 3, 24)
+    job_stats(COOK, 2, 4, 4, 26)
+    job_stats(COOK, 3, 5, 5, 28)
+    job_stats(REPAIRER_JOB, 1, 3, 5, 28)
+    job_stats(REPAIRER_JOB, 2, 4, 6, 30)
+    job_stats(REPAIRER_JOB, 3, 5, 7, 32)
+    job_stats(SHRINE_ATTENDANT, 1, 5, 1, 18)
+    job_stats(SHRINE_ATTENDANT, 2, 6, 2, 20)
+    job_stats(SHRINE_ATTENDANT, 3, 7, 3, 22)
+    job_stats(NIGHT_WATCH, 1, 2, 6, 30)
+    job_stats(NIGHT_WATCH, 2, 3, 7, 32)
+    job_stats(NIGHT_WATCH, 3, 4, 8, 34)
+    job_progression(COURIER, 1, 0, 1, 1, 1, QUICK_STEP, 1, 1)
+    job_progression(COURIER, 1, 1, 1, 2, 0, QUICK_STEP, 1, 2)
+    job_progression(COURIER, 2, 0, 1, 2, 1, QUICK_STEP, 2, 2)
+    job_progression(COURIER, 2, 1, 1, 3, 0, QUICK_STEP, 2, 3)
+    job_progression(COURIER, 3, 0, 1, 3, 0, QUICK_STEP, 3, 3)
+    job_progression(COOK, 1, 0, 1, 1, 1, SEARING_PAN, 1, 1)
+    job_progression(COOK, 1, 1, 1, 2, 0, SEARING_PAN, 1, 2)
+    job_progression(COOK, 2, 0, 1, 2, 1, SEARING_PAN, 2, 2)
+    job_progression(COOK, 2, 1, 1, 3, 0, SEARING_PAN, 2, 3)
+    job_progression(COOK, 3, 0, 1, 3, 0, SEARING_PAN, 3, 3)
+    job_progression(REPAIRER_JOB, 1, 0, 1, 1, 1, LIVE_WIRE, 1, 1)
+    job_progression(REPAIRER_JOB, 1, 1, 1, 2, 0, LIVE_WIRE, 1, 2)
+    job_progression(REPAIRER_JOB, 2, 0, 1, 2, 1, LIVE_WIRE, 2, 2)
+    job_progression(REPAIRER_JOB, 2, 1, 1, 3, 0, LIVE_WIRE, 2, 3)
+    job_progression(REPAIRER_JOB, 3, 0, 1, 3, 0, LIVE_WIRE, 3, 3)
+    job_progression(SHRINE_ATTENDANT, 1, 0, 1, 1, 1, PAPER_WARD, 1, 1)
+    job_progression(SHRINE_ATTENDANT, 1, 1, 1, 2, 0, PAPER_WARD, 1, 2)
+    job_progression(SHRINE_ATTENDANT, 2, 0, 1, 2, 1, PAPER_WARD, 2, 2)
+    job_progression(SHRINE_ATTENDANT, 2, 1, 1, 3, 0, PAPER_WARD, 2, 3)
+    job_progression(SHRINE_ATTENDANT, 3, 0, 1, 3, 0, PAPER_WARD, 3, 3)
+    job_progression(NIGHT_WATCH, 1, 0, 1, 1, 1, LANTERN_WALL, 1, 1)
+    job_progression(NIGHT_WATCH, 1, 1, 1, 2, 0, LANTERN_WALL, 1, 2)
+    job_progression(NIGHT_WATCH, 2, 0, 1, 2, 1, LANTERN_WALL, 2, 2)
+    job_progression(NIGHT_WATCH, 2, 1, 1, 3, 0, LANTERN_WALL, 2, 3)
+    job_progression(NIGHT_WATCH, 3, 0, 1, 3, 0, LANTERN_WALL, 3, 3)
+    ability(QUICK_STEP, "quick step")
+    ability(SEARING_PAN, "searing pan")
+    ability(LIVE_WIRE, "live wire")
+    ability(PAPER_WARD, "paper ward")
+    ability(LANTERN_WALL, "lantern wall")
+    ability_rank(PLAYER, QUICK_STEP, 1)
+    ability_rank(PLAYER, SEARING_PAN, 1)
+    ability_rank(PLAYER, LIVE_WIRE, 1)
+    ability_rank(PLAYER, PAPER_WARD, 1)
+    ability_rank(PLAYER, LANTERN_WALL, 1)
+    ability_power(QUICK_STEP, 1, 6)
+    ability_power(QUICK_STEP, 2, 8)
+    ability_power(QUICK_STEP, 3, 10)
+    ability_power(SEARING_PAN, 1, 5)
+    ability_power(SEARING_PAN, 2, 9)
+    ability_power(SEARING_PAN, 3, 12)
+    ability_power(LIVE_WIRE, 1, 7)
+    ability_power(LIVE_WIRE, 2, 10)
+    ability_power(LIVE_WIRE, 3, 13)
+    ability_power(PAPER_WARD, 1, 6)
+    ability_power(PAPER_WARD, 2, 10)
+    ability_power(PAPER_WARD, 3, 14)
+    ability_power(LANTERN_WALL, 1, 5)
+    ability_power(LANTERN_WALL, 2, 8)
+    ability_power(LANTERN_WALL, 3, 11)
+    monster(RECEIPT_MOTH)
+    monster(SHUTTER_MAW)
+    monster(LAST_CUSTOMER)
+    monster(MANNEQUIN_SHELL)
+    hp(PLAYER, 20)
+    hp(RECEIPT_MOTH, 8)
+    hp(SHUTTER_MAW, 13)
+    hp(LAST_CUSTOMER, 22)
+    hp(MANNEQUIN_SHELL, 16)
+    defense(RECEIPT_MOTH, 1)
+    defense(SHUTTER_MAW, 3)
+    defense(LAST_CUSTOMER, 5)
+    defense(MANNEQUIN_SHELL, 4)
+    monster_power(RECEIPT_MOTH, 3)
+    monster_power(SHUTTER_MAW, 5)
+    monster_power(LAST_CUSTOMER, 7)
+    monster_power(MANNEQUIN_SHELL, 6)
+    monster_reward(RECEIPT_MOTH, 1)
+    monster_reward(SHUTTER_MAW, 1)
+    monster_reward(LAST_CUSTOMER, 1)
+    monster_reward(MANNEQUIN_SHELL, 1)
+    combat_claimed(RECEIPT_MOTH, false)
+    combat_claimed(SHUTTER_MAW, false)
+    combat_claimed(LAST_CUSTOMER, false)
+    combat_claimed(MANNEQUIN_SHELL, false)
+    boss_unlock(RECEIPT_MOTH, false, LEDGER_VAULT, MIRROR_CHAMBER)
+    boss_unlock(SHUTTER_MAW, false, LEDGER_VAULT, MIRROR_CHAMBER)
+    boss_unlock(LAST_CUSTOMER, true, LEDGER_VAULT, MIRROR_CHAMBER)
+    boss_unlock(MANNEQUIN_SHELL, false, LEDGER_VAULT, MIRROR_CHAMBER)
+    session_branch(PLAYER, 0)
+    echo_depth(WORLD, 0)
+    instance_counter(PLAYER, 0)
+    rng_state(WORLD, 4886718345)
+    cardval(0, 1)
+    cardval(1, 2)
+    cardval(2, 3)
+    cardval(3, 4)
+    cardval(4, 5)
+    cardval(5, 6)
+    cardval(6, 7)
+    cardval(7, 8)
+    cardval(8, 9)
+    cardval(9, 10)
+    cardval(10, 10)
+    cardval(11, 10)
+    cardval(12, 10)
+    cardval(13, 1)
+    cardval(14, 2)
+    cardval(15, 3)
+    cardval(16, 4)
+    cardval(17, 5)
+    cardval(18, 6)
+    cardval(19, 7)
+    cardval(20, 8)
+    cardval(21, 9)
+    cardval(22, 10)
+    cardval(23, 10)
+    cardval(24, 10)
+    cardval(25, 10)
+    cardval(26, 1)
+    cardval(27, 2)
+    cardval(28, 3)
+    cardval(29, 4)
+    cardval(30, 5)
+    cardval(31, 6)
+    cardval(32, 7)
+    cardval(33, 8)
+    cardval(34, 9)
+    cardval(35, 10)
+    cardval(36, 10)
+    cardval(37, 10)
+    cardval(38, 10)
+    cardval(39, 1)
+    cardval(40, 2)
+    cardval(41, 3)
+    cardval(42, 4)
+    cardval(43, 5)
+    cardval(44, 6)
+    cardval(45, 7)
+    cardval(46, 8)
+    cardval(47, 9)
+    cardval(48, 10)
+    cardval(49, 10)
+    cardval(50, 10)
+    cardval(51, 10)
+    cardrank(0, 0)
+    cardrank(1, 1)
+    cardrank(2, 2)
+    cardrank(3, 3)
+    cardrank(4, 4)
+    cardrank(5, 5)
+    cardrank(6, 6)
+    cardrank(7, 7)
+    cardrank(8, 8)
+    cardrank(9, 9)
+    cardrank(10, 10)
+    cardrank(11, 11)
+    cardrank(12, 12)
+    cardrank(13, 0)
+    cardrank(14, 1)
+    cardrank(15, 2)
+    cardrank(16, 3)
+    cardrank(17, 4)
+    cardrank(18, 5)
+    cardrank(19, 6)
+    cardrank(20, 7)
+    cardrank(21, 8)
+    cardrank(22, 9)
+    cardrank(23, 10)
+    cardrank(24, 11)
+    cardrank(25, 12)
+    cardrank(26, 0)
+    cardrank(27, 1)
+    cardrank(28, 2)
+    cardrank(29, 3)
+    cardrank(30, 4)
+    cardrank(31, 5)
+    cardrank(32, 6)
+    cardrank(33, 7)
+    cardrank(34, 8)
+    cardrank(35, 9)
+    cardrank(36, 10)
+    cardrank(37, 11)
+    cardrank(38, 12)
+    cardrank(39, 0)
+    cardrank(40, 1)
+    cardrank(41, 2)
+    cardrank(42, 3)
+    cardrank(43, 4)
+    cardrank(44, 5)
+    cardrank(45, 6)
+    cardrank(46, 7)
+    cardrank(47, 8)
+    cardrank(48, 9)
+    cardrank(49, 10)
+    cardrank(50, 11)
+    cardrank(51, 12)
+    slotpair(0, 1)
+    slotpair(0, 2)
+    slotpair(0, 3)
+    slotpair(0, 4)
+    slotpair(1, 2)
+    slotpair(1, 3)
+    slotpair(1, 4)
+    slotpair(2, 3)
+    slotpair(2, 4)
+    slotpair(3, 4)
+    slottrio(0, 1, 2)
+    slottrio(0, 1, 3)
+    slottrio(0, 1, 4)
+    slottrio(0, 2, 3)
+    slottrio(0, 2, 4)
+    slottrio(0, 3, 4)
+    slottrio(1, 2, 3)
+    slottrio(1, 2, 4)
+    slottrio(1, 3, 4)
+    slottrio(2, 3, 4)
+    sum15two(5, 10)
+    sum15two(6, 9)
+    sum15two(7, 8)
+    sum15two(8, 7)
+    sum15two(9, 6)
+    sum15two(10, 5)
+    sum15three(1, 4, 10)
+    sum15three(1, 5, 9)
+    sum15three(1, 6, 8)
+    sum15three(1, 7, 7)
+    sum15three(1, 8, 6)
+    sum15three(1, 9, 5)
+    sum15three(1, 10, 4)
+    sum15three(2, 3, 10)
+    sum15three(2, 4, 9)
+    sum15three(2, 5, 8)
+    sum15three(2, 6, 7)
+    sum15three(2, 7, 6)
+    sum15three(2, 8, 5)
+    sum15three(2, 9, 4)
+    sum15three(2, 10, 3)
+    sum15three(3, 2, 10)
+    sum15three(3, 3, 9)
+    sum15three(3, 4, 8)
+    sum15three(3, 5, 7)
+    sum15three(3, 6, 6)
+    sum15three(3, 7, 5)
+    sum15three(3, 8, 4)
+    sum15three(3, 9, 3)
+    sum15three(3, 10, 2)
+    sum15three(4, 1, 10)
+    sum15three(4, 2, 9)
+    sum15three(4, 3, 8)
+    sum15three(4, 4, 7)
+    sum15three(4, 5, 6)
+    sum15three(4, 6, 5)
+    sum15three(4, 7, 4)
+    sum15three(4, 8, 3)
+    sum15three(4, 9, 2)
+    sum15three(4, 10, 1)
+    sum15three(5, 1, 9)
+    sum15three(5, 2, 8)
+    sum15three(5, 3, 7)
+    sum15three(5, 4, 6)
+    sum15three(5, 5, 5)
+    sum15three(5, 6, 4)
+    sum15three(5, 7, 3)
+    sum15three(5, 8, 2)
+    sum15three(5, 9, 1)
+    sum15three(6, 1, 8)
+    sum15three(6, 2, 7)
+    sum15three(6, 3, 6)
+    sum15three(6, 4, 5)
+    sum15three(6, 5, 4)
+    sum15three(6, 6, 3)
+    sum15three(6, 7, 2)
+    sum15three(6, 8, 1)
+    sum15three(7, 1, 7)
+    sum15three(7, 2, 6)
+    sum15three(7, 3, 5)
+    sum15three(7, 4, 4)
+    sum15three(7, 5, 3)
+    sum15three(7, 6, 2)
+    sum15three(7, 7, 1)
+    sum15three(8, 1, 6)
+    sum15three(8, 2, 5)
+    sum15three(8, 3, 4)
+    sum15three(8, 4, 3)
+    sum15three(8, 5, 2)
+    sum15three(8, 6, 1)
+    sum15three(9, 1, 5)
+    sum15three(9, 2, 4)
+    sum15three(9, 3, 3)
+    sum15three(9, 4, 2)
+    sum15three(9, 5, 1)
+    sum15three(10, 1, 4)
+    sum15three(10, 2, 3)
+    sum15three(10, 3, 2)
+    sum15three(10, 4, 1)
+    patrol_due(CAT, 1000)
+    patrol_inbox(CAT, 0, ("start-patrol"))
+    inbox_seq(PLAYER, 0)
+    inbox_seq(CAT, 1)
+    inbox_seq(COMBAT, 0)
+}

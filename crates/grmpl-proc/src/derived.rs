@@ -32,8 +32,8 @@
 //! ones it has.
 
 use grmpl_core::{
-    Authority, CursorMove, Diff, Edition, Entity, Fact, Patch, RelId, Result,
-    SchemaCatalog, TraceStore, Tuple, Value,
+    Authority, CursorMove, Diff, Edition, Entity, Fact, Patch, RelId, Result, SchemaCatalog,
+    TraceStore, Tuple, Value,
 };
 use grmpl_diff::{eval_delta, multiset, Query};
 
@@ -86,7 +86,8 @@ impl Materialized {
         store: &dyn TraceStore,
         schemas: &dyn SchemaCatalog,
     ) -> Result<CommitOutcome> {
-        let patch = Patch::new().assert(Fact::new(self.cursor_rel, self.cursor_tuple(Edition::ZERO)));
+        let patch =
+            Patch::new().assert(Fact::new(self.cursor_rel, self.cursor_tuple(Edition::ZERO)));
         commit_patch(store, schemas, &patch, &self.authority)
     }
 
@@ -130,13 +131,11 @@ impl Materialized {
             }
 
             let cursor_from = Fact::new(self.cursor_rel, self.cursor_tuple(from));
-            let mut patch = Patch::new()
-                .expect(cursor_from)
-                .advance_cursor(CursorMove {
-                    rel: self.cursor_rel,
-                    retract: Some(self.cursor_tuple(from)),
-                    assert: self.cursor_tuple(to),
-                });
+            let mut patch = Patch::new().expect(cursor_from).advance_cursor(CursorMove {
+                rel: self.cursor_rel,
+                retract: Some(self.cursor_tuple(from)),
+                assert: self.cursor_tuple(to),
+            });
             for (row, diff) in &rows {
                 // A `Patch` carries assert/retract, not weights, so a delta of
                 // magnitude k lands as k of them. Consolidated view deltas are

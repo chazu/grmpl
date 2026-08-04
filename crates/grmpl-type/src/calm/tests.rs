@@ -24,8 +24,8 @@ use grmpl_core::{
     Value,
 };
 use grmpl_diff::{eval_snapshot, Agg};
-use grmpl_lang::{MapExpr, PredExpr, QueryIr, RowExpr};
 use grmpl_ent::EntStore;
+use grmpl_lang::{MapExpr, PredExpr, QueryIr, RowExpr};
 
 use super::{classify, Blocker, Monotonicity};
 use crate::{check_query, RowTy};
@@ -430,8 +430,7 @@ fn monotone_plans_never_retract_under_insertion() {
             for (id, row_ty) in &rels {
                 let m = 1 + rng.below(3); // 1..=3 new rows per relation per round
                 for _ in 0..m {
-                    let vals: Vec<Value> =
-                        row_ty.cols().iter().map(|&ty| rng.value(ty)).collect();
+                    let vals: Vec<Value> = row_ty.cols().iter().map(|&ty| rng.value(ty)).collect();
                     pending.push((*id, Tuple::new(vals)));
                 }
             }
