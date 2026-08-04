@@ -11,6 +11,7 @@ pub mod domain;
 pub mod gc;
 pub mod process;
 pub mod replay;
+pub mod retry;
 pub mod schedule;
 pub mod watch;
 
@@ -21,5 +22,6 @@ pub use domain::{outbox_len, Domain};
 pub use gc::{consolidate_to, min_watch_cursor};
 pub use process::{enqueue, enqueue_seq, inbox_fact, seed_seq, Behavior, Prepared, Process};
 pub use replay::{record_run, replay_from, Step};
+pub use retry::{commit_retrying, Backoff};
 pub use schedule::{timer_row, ClockDriver, Scheduler, SeqAlloc};
 pub use watch::{activation_body, decode_activation, OnWatch};

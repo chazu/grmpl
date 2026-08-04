@@ -17,7 +17,8 @@
 //! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
 
 use grmpl_core::{
     wire, Catalog, Diff, Edition, EditionStore, Entity, Error, RelId, Result, Schema,
@@ -28,7 +29,7 @@ use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::{Dsp, DspEnf};
-use crate::granfilade::{ContentKey, Granfilade};
+use crate::granfilade::{ContentKey, Granfilade, StagedWrite};
 use crate::measure::{Count, SumDiff};
 use crate::tree::Tree;
 
@@ -109,10 +110,82 @@ fn unrotate(tuple: &Tuple, col: usize) -> Tuple {
     Tuple::new(out)
 }
 
+/// **The group-commit queue.** Editions applied in memory and encoded, waiting
+/// for the `fsync` that makes them durable.
+///
+/// The `Mutex<Inner>` above serializes *edition allocation*, which is the law
+/// (one authority domain, one commit clock). It used to serialize *durability*
+/// too, because `commit_if` held it across the ~1 ms `SyncAll`, so N committers
+/// paid N fsyncs strictly in series. This queue separates the two: a committer
+/// leaves the edition lock as soon as its work is encoded, and one member of the
+/// group performs a single batch + `SyncAll` covering every staged edition.
+///
+/// **What group commit does and does not weaken.** The patch–edition law is
+/// about *atomicity*: an edition is allocated and written as one step, or not at
+/// all — there is never a state carrying only part of an edition. `write_group`
+/// is one batch, so that holds exactly as before. What changes is *when* a write
+/// becomes durable, and the gate is on the commit call:
+///
+/// **`commit`/`commit_if` return only after the edition they return is durable.**
+///
+/// So no committer ever learns of its own edition before disk does — no player is
+/// told "Taken." for a take a crash would erase, which is the property the law is
+/// protecting.
+///
+/// **The clock is the allocated edition, not this watermark**, and that is
+/// forced rather than chosen. `commit_if` must validate preconditions against the
+/// allocated state — checking them against a lagging watermark would let two
+/// committers in one group *both* win a contested precondition, breaking
+/// exactly-one-winner. Reads must then agree with the validator, or every
+/// optimistic read-modify-write would build its patch on a stale world and be
+/// rejected forever. A guarded allocator livelocks within a dozen attempts if
+/// these two disagree; there is no version of this that reports the watermark as
+/// the clock and still works.
+///
+/// The residual window is therefore precise and small: between a peer's `stage`
+/// and its group's fsync, a *third party* can read an edition that is not yet on
+/// disk. It cannot externalize that read through the store, because the queue is
+/// FIFO in edition order and a group's fsync covers every edition staged before
+/// it — so any commit built on edition `E` is itself durable only once `E` is.
+/// A reader that externalizes *outside* the store (straight to a socket) and
+/// wants the on-disk frontier should ask for it: see
+/// [`EntStore::durable_edition`].
+#[derive(Default)]
+struct Durable {
+    /// Staged writes in **edition order** — the order they must reach disk, and
+    /// the order the batch applies them in. Pushed under the edition lock, which
+    /// is what keeps them ordered.
+    pending: VecDeque<(u64, StagedWrite)>,
+    /// The highest edition proven durable. This is the store's public clock.
+    durable: u64,
+    /// Whether a leader is inside the batch + fsync right now.
+    writing: bool,
+    /// A failed group: the highest edition it carried, and why it failed.
+    /// Sticky, so every committer whose edition was in that group learns of it
+    /// rather than waiting forever for a flush that will never come.
+    failure: Option<(u64, String)>,
+}
+
+impl Durable {
+    /// The failure that dooms a committer waiting for `target` (or, for a
+    /// flusher, any failure at all).
+    fn doom(&self, target: Option<u64>) -> Option<String> {
+        let (through, msg) = self.failure.as_ref()?;
+        match target {
+            Some(e) if e > *through => None,
+            _ => Some(msg.clone()),
+        }
+    }
+}
+
 /// An ent store: a family of per-relation Fact + Edition enfilades behind one
 /// commit clock, optionally durable on a [`Granfilade`].
 pub struct EntStore {
     inner: Mutex<Inner>,
+    /// Editions staged but not yet fsynced (see [`Durable`]).
+    dur: Mutex<Durable>,
+    /// Signalled whenever a group lands (or fails), waking its followers.
+    flushed: Condvar,
     /// The node substrate, **shared with every fork of this store** (G-6): all
     /// branches live in one granfilade with their roots namespaced by branch, so
     /// a durable fork shares nodes with its ancestor instead of copying them.
@@ -194,6 +267,8 @@ impl EntStore {
     pub fn new() -> EntStore {
         EntStore {
             inner: Mutex::new(Inner::empty()),
+            dur: Mutex::new(Durable::default()),
+            flushed: Condvar::new(),
             gran: None,
             branch: Dag::ROOT,
             dag: Arc::new(Mutex::new(Dag::new())),
@@ -212,6 +287,8 @@ impl EntStore {
             .and_then(|b| Dag::decode(&b))
             .unwrap_or_else(Dag::new);
         Ok(EntStore {
+            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
+            flushed: Condvar::new(),
             inner: Mutex::new(inner),
             gran: Some(Arc::new(gran)),
             branch: Dag::ROOT,
@@ -299,6 +376,27 @@ impl EntStore {
         self.gran.as_ref().map_or(0, |g| g.frames_encoded())
     }
 
+    /// **The durable frontier**: the highest edition proven on disk.
+    ///
+    /// Always `<= current()`, and equal to it whenever no commit is in flight.
+    /// A commit does not return until its own edition is durable, so a caller
+    /// never needs this to trust an edition it was handed; it is for an observer
+    /// that reads the world *without* committing and externalizes what it saw
+    /// (streaming to a socket, say) and wants to send only what a crash could not
+    /// take back. Group commit is the only reason the two can differ, and they
+    /// differ only for the length of one `fsync`.
+    pub fn durable_edition(&self) -> Edition {
+        Edition(self.dur.lock().unwrap().durable)
+    }
+
+    /// `SyncAll`s issued since this store was opened — the group-commit ops
+    /// counter, surfaced so tests can assert that concurrent committers *share*
+    /// their durability cost rather than each paying it. `0` for an in-memory
+    /// store.
+    pub fn syncs(&self) -> u64 {
+        self.gran.as_ref().map_or(0, |g| g.syncs())
+    }
+
     /// Distinct nodes currently stored in the granfilade — the on-disk size of
     /// the world in nodes, for measuring how history accumulates and what GC
     /// reclaims. `0` for an in-memory store.
@@ -315,6 +413,10 @@ impl EntStore {
     /// lock). A no-op in-memory. Returns the number of nodes collected.
     pub fn gc(&self) -> Result<usize> {
         let _guard = self.inner.lock().unwrap();
+        // Reachability is computed from the roots *in meta*, so a staged commit
+        // whose roots have not landed yet must be flushed first — otherwise the
+        // sweep would be reasoning about a stale root set.
+        self.flush_pending()?;
         match &self.gran {
             Some(g) => g.gc(),
             None => Ok(0),
@@ -337,6 +439,9 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("fork_at", at.0, inner.watermark));
         }
+        // The child's roots name nodes the parent may only have staged. Land the
+        // parent's queue first so the fork is durable the moment it exists.
+        self.flush_pending()?;
         // Graft a new branch onto this store's branch at the fork edition in the
         // shared DagWood; the child carries that id and the same registry, so
         // ancestry is queryable across the whole fork family (the fulltrace).
@@ -366,6 +471,8 @@ impl EntStore {
             }
         }
         let child = EntStore {
+            dur: Mutex::new(Durable { durable: at.0, ..Durable::default() }),
+            flushed: Condvar::new(),
             inner: Mutex::new(Inner {
                 current: at.0,
                 watermark: inner.watermark,
@@ -413,6 +520,8 @@ impl EntStore {
             None => return Err(Error::Store("in-memory store has no persisted branches".into())),
         };
         Ok(EntStore {
+            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
+            flushed: Condvar::new(),
             inner: Mutex::new(inner),
             gran: self.gran.clone(),
             branch,
@@ -432,6 +541,8 @@ impl EntStore {
             .and_then(|b| Dag::decode(&b))
             .unwrap_or_else(Dag::new);
         Ok(EntStore {
+            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
+            flushed: Condvar::new(),
             inner: Mutex::new(inner),
             gran: Some(Arc::new(gran)),
             branch,
@@ -543,18 +654,46 @@ impl EntStore {
             Some(g) => g,
             None => return Ok(()),
         };
+        // A schema version is keyed by the edition it took effect, so it must not
+        // reach disk ahead of that edition's own staged write; drain first.
+        self.flush_pending()?;
         let (ck, nodes) = gran.collect_tree(&inner.ctx);
         gran.write(nodes, vec![(ctx_key(self.branch), opt_ck_bytes(ck))])
     }
 
     /// Persist the clock plus the touched relations' Edition enfilades (roots +
-    /// nodes) in one atomic granfilade write. A no-op for an in-memory store.
+    /// nodes) in one atomic granfilade write, **immediately**. A no-op for an
+    /// in-memory store.
+    ///
+    /// This is the un-grouped path, for the occasions that must land on their own:
+    /// a fork's roots, consolidation's whole-history rewrite, the context
+    /// enfilade. The commit path instead [`stage`](Self::stage)s and lets a group
+    /// share one fsync.
     fn persist(&self, inner: &Inner, touched: &[RelId], drop_below: Option<u64>) -> Result<()> {
+        match self.stage(inner, touched, drop_below)? {
+            Some(staged) => self.gran.as_ref().unwrap().write_group(vec![staged]),
+            None => Ok(()),
+        }
+    }
+
+    /// Encode this commit's durable work without writing it: the node frames for
+    /// the touched relations' enfilades, plus the meta entries naming their roots
+    /// and the clock. `None` for an in-memory store.
+    ///
+    /// Pure with respect to the store (it only reads the immutable trees), which
+    /// is what lets the commit path do this inside the edition lock and the
+    /// `fsync` outside it.
+    fn stage(
+        &self,
+        inner: &Inner,
+        touched: &[RelId],
+        drop_below: Option<u64>,
+    ) -> Result<Option<StagedWrite>> {
         // Consolidation is the only occasion that rewrites existing roots.
         let write_all_versions = drop_below.is_some();
         let gran = match &self.gran {
             Some(g) => g,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         let mut nodes = Vec::new();
         let mut meta = vec![
@@ -609,7 +748,106 @@ impl EntStore {
                 }
             }
         }
-        gran.write_full(nodes, meta, drop_meta)
+        Ok(Some(StagedWrite { nodes, meta, drop_meta }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Group commit
+    // -----------------------------------------------------------------------
+
+    /// Encode `e`'s durable work and queue it for the group. **Called under the
+    /// edition lock**, which is what keeps `pending` in edition order — a batch
+    /// applied out of order would durably record a stale clock.
+    ///
+    /// An in-memory store has nothing to make durable, so its clock advances
+    /// here and the whole group machinery is bypassed.
+    fn stage_commit(&self, inner: &Inner, touched: &[RelId], e: u64) -> Result<()> {
+        let staged = self.stage(inner, touched, None)?;
+        let mut d = self.dur.lock().unwrap();
+        match staged {
+            Some(staged) => d.pending.push_back((e, staged)),
+            None => d.durable = d.durable.max(e),
+        }
+        Ok(())
+    }
+
+    /// Wait until edition `target` is durable, joining or leading a group along
+    /// the way. **Must not be called holding the edition lock** on the commit
+    /// path — that is the serialization this exists to remove.
+    fn await_durable(&self, target: u64) -> Result<()> {
+        self.drive_durability(Some(target))
+    }
+
+    /// Drive every staged edition to disk and return once nothing is pending.
+    ///
+    /// Safe to call while holding the edition lock: the flush touches only the
+    /// granfilade and the durability queue, never `Inner`. Nothing ever takes the
+    /// edition lock while holding the durability lock, so the order is total.
+    fn flush_pending(&self) -> Result<()> {
+        self.drive_durability(None)
+    }
+
+    /// The group-commit loop. `Some(e)` waits for edition `e` to be durable;
+    /// `None` waits for the queue to drain.
+    ///
+    /// A thread either **leads** — takes everything staged so far, writes it as
+    /// one batch + one `SyncAll`, and wakes the rest — or **follows**, waiting on
+    /// the condvar for the leader's group to land. Which role it plays is
+    /// whichever is free, so there is no dedicated writer thread and no handoff
+    /// latency when there is no contention (a lone committer simply leads its own
+    /// group of one, exactly as before).
+    fn drive_durability(&self, target: Option<u64>) -> Result<()> {
+        let gran = match &self.gran {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        let mut d = self.dur.lock().unwrap();
+        loop {
+            if let Some(msg) = d.doom(target) {
+                return Err(Error::Store(msg));
+            }
+            let done = match target {
+                Some(e) => d.durable >= e,
+                None => d.pending.is_empty() && !d.writing,
+            };
+            if done {
+                return Ok(());
+            }
+            if d.writing {
+                // Someone else is inside the fsync; our edition may be in their
+                // group. Wait for it to land and re-check.
+                d = self.flushed.wait(d).unwrap();
+                continue;
+            }
+            // Lead: take the whole queue. Later stages arriving mid-write simply
+            // form the next group.
+            let group: Vec<(u64, StagedWrite)> = d.pending.drain(..).collect();
+            let Some(hi) = group.last().map(|(e, _)| *e) else {
+                return Err(Error::Store(format!(
+                    "group commit: edition {target:?} is neither pending nor durable \
+                     (durable={})",
+                    d.durable
+                )));
+            };
+            d.writing = true;
+            drop(d);
+
+            let res = gran.write_group(group.into_iter().map(|(_, s)| s).collect());
+
+            d = self.dur.lock().unwrap();
+            d.writing = false;
+            match res {
+                Ok(()) => d.durable = d.durable.max(hi),
+                Err(err) => {
+                    // The group is gone from `pending` and never reached disk.
+                    // Record it so its members error instead of waiting forever.
+                    d.failure = Some((hi, format!("{err:?}")));
+                    self.flushed.notify_all();
+                    return Err(err);
+                }
+            }
+            self.flushed.notify_all();
+        }
     }
 }
 
@@ -721,6 +959,12 @@ impl Inner {
 }
 
 impl EditionStore for EntStore {
+    /// The world's clock: the **allocated** edition.
+    ///
+    /// This is the state `commit_if` validates preconditions against, so it must
+    /// also be the state reads see — see [`Durable`] for why reporting the
+    /// durability watermark here livelocks every guarded read-modify-write.
+    /// [`EntStore::durable_edition`] is the on-disk frontier.
     fn current(&self) -> Edition {
         Edition(self.inner.lock().unwrap().current)
     }
@@ -728,10 +972,19 @@ impl EditionStore for EntStore {
 
 impl TraceStore for EntStore {
     fn commit(&self, updates: &[(RelId, Tuple, Diff)]) -> Result<Edition> {
-        let mut inner = self.inner.lock().unwrap();
-        let e = inner.current + 1;
-        inner.apply(e, updates);
-        self.persist(&inner, &touched(updates), None)?;
+        let e = {
+            // The short critical section: allocate the edition, apply in memory,
+            // encode. No `fsync` is held here, so the next committer may enter as
+            // soon as this one's work is staged.
+            let mut inner = self.inner.lock().unwrap();
+            let e = inner.current + 1;
+            inner.apply(e, updates);
+            self.stage_commit(&inner, &touched(updates), e)?;
+            e
+        };
+        // Durability, shared with everyone else staged behind us. Returning only
+        // once `e` is durable is what makes the returned edition safe to act on.
+        self.await_durable(e)?;
         Ok(Edition(e))
     }
 
@@ -740,15 +993,22 @@ impl TraceStore for EntStore {
         preconditions: &[(RelId, Tuple)],
         updates: &[(RelId, Tuple, Diff)],
     ) -> Result<Option<Edition>> {
-        let mut inner = self.inner.lock().unwrap();
-        for (rel, tuple) in preconditions {
-            if !inner.holds_now(*rel, tuple) {
-                return Ok(None);
+        let e = {
+            let mut inner = self.inner.lock().unwrap();
+            // Preconditions are checked against the *allocated* state, not the
+            // durable one: two committers in the same group must still serialize
+            // against each other, or both could win a contested precondition.
+            for (rel, tuple) in preconditions {
+                if !inner.holds_now(*rel, tuple) {
+                    return Ok(None);
+                }
             }
-        }
-        let e = inner.current + 1;
-        inner.apply(e, updates);
-        self.persist(&inner, &touched(updates), None)?;
+            let e = inner.current + 1;
+            inner.apply(e, updates);
+            self.stage_commit(&inner, &touched(updates), e)?;
+            e
+        };
+        self.await_durable(e)?;
         Ok(Some(Edition(e)))
     }
 
@@ -918,6 +1178,13 @@ impl TraceStore for EntStore {
 
     fn consolidate(&self, up_to: Edition) -> Result<Edition> {
         let mut inner = self.inner.lock().unwrap();
+        // Consolidation is the one occasion that *replaces* existing roots and
+        // retires the ones below the new watermark. A staged commit still in the
+        // queue would land afterwards and re-insert a root this pass just retired,
+        // so drain the queue first. Holding the edition lock across the flush is
+        // safe (the flush never takes it) and keeps new commits from staging
+        // behind our back.
+        self.flush_pending()?;
         let new_wm = up_to.0.min(inner.current);
         if new_wm <= inner.watermark {
             return Ok(Edition(inner.watermark));

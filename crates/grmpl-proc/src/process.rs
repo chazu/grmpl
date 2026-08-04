@@ -131,7 +131,15 @@ impl Process {
         }
     }
 
-    /// Drain the inbox until idle. Returns how many messages were committed.
+    /// Drain the inbox until idle, **stopping** at the first rejection. Returns
+    /// how many messages were committed.
+    ///
+    /// This is the single-pass form: a rejected message cannot make progress
+    /// against the state this pass read, so the pass ends with the cursor
+    /// unmoved and the message redelivered later. Use
+    /// [`run_to_idle_retrying`](Self::run_to_idle_retrying) when the caller is
+    /// one of several concurrent writers and a rejection means *contention*
+    /// rather than *an answer*.
     pub fn run_to_idle(
         &self,
         store: &dyn TraceStore,
@@ -147,6 +155,54 @@ impl Process {
             }
         }
         Ok(n)
+    }
+
+    /// Drain the inbox until idle, **retrying** a rejected message under
+    /// `policy` instead of stopping. Returns how many messages were committed.
+    ///
+    /// This is the concurrent-writer form. A retry is not a re-submission of the
+    /// same patch: [`step`](Self::step) rebuilds it from the store's *current*
+    /// state, so the loser of a race re-runs its behavior against the winner's
+    /// world — which is exactly how a contested `take lamp` turns into "you
+    /// don't see that here" rather than a lost command. Both kinds of rejection
+    /// take this path, and both want it: contention on an allocator counter
+    /// resolves on the next attempt, and a genuinely-false world precondition
+    /// re-decides against the state that falsified it.
+    ///
+    /// Exhausting `policy` is an [`Error::Store`](grmpl_core::Error::Store) —
+    /// livelock is surfaced, never spun on.
+    pub fn run_to_idle_retrying(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+        policy: crate::retry::Backoff,
+    ) -> Result<usize> {
+        let mut n = 0;
+        loop {
+            // `step` returns `None` only when the inbox is idle; a rejection
+            // leaves the cursor unmoved, so the next `step` re-prepares the same
+            // message against fresh state.
+            let mut attempt = policy.clone();
+            loop {
+                match self.step(store, schemas)? {
+                    None => return Ok(n),
+                    Some(CommitOutcome::Committed(_)) => {
+                        n += 1;
+                        break;
+                    }
+                    Some(CommitOutcome::Rejected) => {
+                        if !attempt.wait() {
+                            return Err(grmpl_core::Error::Store(format!(
+                                "process {:?}: inbox message rejected on every \
+                                 attempt (contention or a permanently-false \
+                                 precondition)",
+                                self.entity
+                            )));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

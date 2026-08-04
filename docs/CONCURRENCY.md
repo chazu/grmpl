@@ -9,8 +9,9 @@ code. Concurrency is a *semantic* property — actors, editions, optimistic comm
 
 This document states the model as implemented, then states plainly which of the
 parallelism the model permits is currently left unclaimed, and what claiming it
-would involve. Part 1 is description; part 2 is a proposal and is **not** a
-record of landed work.
+would involve. Part 1 is description; part 2 is a work list whose items are
+individually marked **landed** or *proposal* — items 0, 1 and 4 have landed, and
+their entries record what the doing changed about the plan.
 
 > **Sources.** The model is specified in [`DESIGN.md`](../DESIGN.md) §2.3 #6,
 > §2.4, §5.2, §5.3 and implemented in `grmpl-proc`, `grmpl-ent`, and
@@ -102,26 +103,24 @@ exists.*
 |---|---|
 | Threads | Plain `std::thread`. `grmpl-session::net` spawns one thread per TCP connection. |
 | Async | **None in the core.** `tokio` appears only under the off-by-default `iroh` feature of `grmpl-transport`. |
-| Store | `EntStore` is `Send + Sync` behind a single `Mutex<Inner>`; `commit_if` takes it, checks preconditions, applies, and fsyncs. |
-| Actor loop | Pull-based and caller-driven: `Process::step` / `run_to_idle`. Nothing spins it — `run_to_idle` notes "a real scheduler would retry after new input." |
-| Session server | Commits still serialize behind one writer `Mutex<()>` (`Server.lock`, the interim P3 scheme). Inbox seqs escaped it in P4 via `SeqAlloc`; the entity counter did not. |
+| Store | `EntStore` is `Send + Sync` behind a single `Mutex<Inner>`. **Group commit (landed):** the lock covers allocation, apply and encoding; the batch + `SyncAll` happen outside it, shared across a group. |
+| Actor loop | Pull-based and caller-driven: `Process::step` / `run_to_idle` / `run_to_idle_retrying`. Nothing spins it — a real scheduler is still item 3. |
+| Session server | **No writer lock (landed).** `Server.lock` is deleted; the entity counter is guarded like the P4 inbox seqs, and a rejected command retries under a `Backoff`. |
 | Cross-domain | Durable outbox written in-commit, at-least-once shipping, receiver dedups by `(sender, seq)` (`grmpl-proc::domain`) — exactly-once apply without 2PC. |
 | Branches | `EntStore::fork_at` gives cheap branch-level isolation via structural sharing in a shared granfilade. Independent worlds are real parallelism; within a branch there is one clock and one writer. |
 
-### 7. The honest limitation
+### 7. The limitation, and what removing it did
 
-`PERFORMANCE.md` §5 states it without spin: **writes are single-writer.** Every
-commit serializes behind the edition lock plus fsync, so racing writers do not
-add throughput — they add rejects.
+This section used to end the document's descriptive half with a flat statement:
+**writes are single-writer.** Every commit serialized behind the edition lock
+plus fsync, so racing writers added rejects rather than throughput.
 
 ```
-race x1   221 commits/s   retry_rate 0.00
-race x2   213/s           retry_rate 0.50
-race x4   198/s           retry_rate 0.72
+race x1   221 commits/s   retry_rate 0.00        (PERFORMANCE.md §5)
 race x8   170/s           retry_rate 0.85
 ```
 
-`PERFORMANCE-ENT.md` §3 adds that contention is also *unfair*:
+`PERFORMANCE-ENT.md` §3 added that contention was also *unfair*:
 
 ```
 race x1 threads   1,012 commits/s   0 rejects   fair(min/max)=1.000
@@ -129,81 +128,142 @@ race x8 threads     935 commits/s   8 rejects   fair(min/max)=0.000
 ```
 
 `fair(min/max)=0.000` means at least one thread committed nothing. Correctness
-is never at risk — exactly one winner per contested precondition, which is the
-law — but a hot precondition is a serialization point, not a scaling one, and
-the retry loop currently starves losers.
+was never at risk — exactly one winner per contested precondition, which is the
+law — but a hot precondition was a serialization point, not a scaling one, and
+the retry loop starved losers.
 
-**The design is genuinely concurrent; the implementation deliberately serializes
-the write path and has not yet cashed in the parallelism the model permits.**
+**Items 0, 1 and 4 below have since landed.** The same axis now reads:
+
+```
+race x1 threads     848 commits/s     0 rejects   fair(min/max)=1.000
+race x2 threads     937 commits/s     0 rejects   fair(min/max)=0.914
+race x4 threads   1,740 commits/s    88 rejects   fair(min/max)=0.994
+race x8 threads   3,138 commits/s   138 rejects   fair(min/max)=0.992
+```
+
+Read the ratios within the run, not the absolute numbers (a shared VM, one run):
+throughput now **rises 3.7× from 1 to 8 committers** where it used to be flat,
+and `fair(min/max)` went from `0.000` to `0.992` — no thread starves. The
+retry rate rose from 0.4% to 6.5%, which is the expected shape: more writers are
+actually in flight to lose races.
+
+**The design is genuinely concurrent; the write path is no longer the thing
+stopping it.** Reads are — see item 2.
 
 ---
 
-## Part 2 — Cashing it in (proposal, not landed work)
+## Part 2 — Cashing it in
 
-Three independent capabilities are on the table: **durability amortization**,
+Three independent capabilities were on the table: **durability amortization**,
 **reader/writer decoupling**, and **domain-parallel execution**. Ordered below by
-the payoff the measurements justify.
+the payoff the measurements justified.
 
-| # | Item | Effort | Payoff | Risk |
-|---|---|---|---|---|
-| 0 | Guard `Alloc`, drop `Server.lock` | hours | unblocks the rest | low |
-| 1 | Group commit | days | largest single win | medium (visibility gating) |
-| 2 | Snapshot handles | days | removes reader stalls | medium (trait surface) |
-| 3 | Actor scheduler | week+ | scales with cores | medium |
-| 4 | Retry backoff | hours | fairness | low |
-| 5 | Shared arrangements, background consolidation | week | read fan-out | low |
-| 6 | Per-domain commit clocks | large | true write parallelism | high |
+| # | Item | Effort | Payoff | Risk | Status |
+|---|---|---|---|---|---|
+| 0 | Guard `Alloc`, drop `Server.lock` | hours | unblocks the rest | low | **landed** |
+| 1 | Group commit | days | largest single win | medium (visibility gating) | **landed** |
+| 2 | Snapshot handles | days | removes reader stalls | medium (trait surface) | proposal |
+| 3 | Actor scheduler | week+ | scales with cores | medium | proposal |
+| 4 | Retry backoff | hours | fairness | low | **landed** |
+| 5 | Shared arrangements, background consolidation | week | read fan-out | low | proposal |
+| 6 | Per-domain commit clocks | large | true write parallelism | high | proposal |
 
-### 0. Delete the session writer lock
+### 0. Delete the session writer lock — **landed**
 
-`grmpl-session::session` holds `lock: Mutex<()>` around every commit. P4 already
-freed inbox seqs by moving them onto the guarded `SeqAlloc`; the one remaining
-reason for the lock is `Alloc` (`grmpl-proc::alloc`), the entity counter, whose
-`seal` is an **unguarded** retract/assert — its own doc comment says so and names
-the single-writer session layer as the interim compensation.
+`grmpl-session::session` held `lock: Mutex<()>` around every commit. P4 had
+already freed inbox seqs by moving them onto the guarded `SeqAlloc`; the one
+remaining reason for the lock was `Alloc` (`grmpl-proc::alloc`), the entity
+counter, whose `seal` was an **unguarded** retract/assert.
 
-The fix is a straight port of the pattern `SeqAlloc::seal` already uses: fold the
-counter bump in *with a precondition on the present counter row*, seed the row
-once on the un-raced init path (`Server::init`). Two racing spawns then resolve
-to one winner and the loser retries; `Server.lock` deletes.
+The fix was the pattern `SeqAlloc::seal` already used: fold the counter bump in
+*with a precondition on the present counter row*. Two racing spawns now resolve
+to one winner and the loser retries; `Server.lock` is deleted.
 
-Small in isolation, but it converts the session layer from "serialized by
-construction" to "serialized only by the store", which is what makes items 1–3
-observable at all.
+Three things that only showed up in the doing:
 
-### 1. Group commit — the largest single win available
+* **The seed must ride inside the guard.** A first allocation has no row to
+  precondition on, so it must be un-raced. Seeding a player's inbox-seq counter
+  in a *second* commit after the spawn let two logins of one name seed it twice
+  and hand out a duplicate seq. It is now asserted in the same atomic commit the
+  entity-counter guard protects, which is what makes it un-raced. (`INBOX_SEQ`
+  joined `world_authority` for this: a spawn creates a process, so it owns that
+  process's inbox plumbing — the read cursor was already there.)
+* **A rejection must be retried, not swallowed.** `Process::run_to_idle` stops at
+  the first rejection, which was right when the lock made rejections impossible
+  and wrong the moment it was gone: a lost race left the command unconsumed and
+  the client with no reply at all. `run_to_idle_retrying` rebuilds the patch from
+  the *current* world, so a lost `take lamp` re-decides against the winner's
+  state and answers "you don't see that here" instead of nothing.
+* **Same-name logins need no special case.** Two logins of one new name contend
+  on the entity counter like anything else; the loser re-reads, finds the
+  winner's `PLAYER` row, and adopts that identity. Durable identity is upheld by
+  the counter guard, not by serialization.
+
+Laws: `grmpl-proc/tests/alloc.rs` (racing allocations hand out no id twice — it
+fails on the unguarded `seal`, with 48 allocations collapsing to 30 distinct ids;
+and every contender commits its whole quota under backoff) and
+`grmpl-session/tests/concurrent_world.rs` (concurrent builders never collide,
+concurrent same-name logins bind one identity, racing clients yield exactly one
+taker and no silent losers).
+
+### 1. Group commit — the largest single win available — **landed**
 
 Every axis in `PERFORMANCE-ENT.md` bottoms out on the same ~1 ms `SyncAll` in
-`Granfilade::write_full`. `EntStore::commit_if` holds `Mutex<Inner>` across
-*both* the in-memory apply *and* that fsync, so N committers pay N fsyncs
+`Granfilade::write_full`. `EntStore::commit_if` held `Mutex<Inner>` across
+*both* the in-memory apply *and* that fsync, so N committers paid N fsyncs
 strictly in series.
 
-Shape:
+Shape, as built:
 
 * **Short critical section.** Take the lock; check preconditions; allocate the
-  edition; apply in memory; stage the encoded nodes and meta into a pending
-  batch; release.
-* **One leader per group.** A single `db.batch()` plus one `SyncAll` covering
-  every staged edition in the group.
-* **Followers wait** on a condvar for `durable_edition >= mine`, then return.
+  edition; apply in memory; encode the nodes and meta into a `StagedWrite` and
+  queue it; release. Encoding stays inside the lock because it reads the trees;
+  it is CPU, not I/O.
+* **One leader per group.** Whoever needs the write performs it — there is no
+  dedicated writer thread, so an uncontended commit is its own group of one and
+  pays no handoff. `Granfilade::write_group` applies the whole queue as a single
+  `db.batch()` plus one `SyncAll`.
+* **Followers wait** on a condvar for `durable >= mine`, then return.
 
-**The one real hazard, and its fix.** The patch–edition law forbids a window in
-which an edition is allocated but not written. Group commit deliberately creates
-that window *in memory*, so visibility must be gated on durability rather than on
-allocation:
+**The hazard, and what the fix actually turned out to be.** This document
+proposed gating visibility on durability — `EditionStore::current()` returning
+the durable edition. *That does not work, and the reason is worth recording.*
 
-* `EditionStore::current()` returns the **durable** edition;
-* `commit_if` returns only after its group's fsync completes.
+`commit_if` must validate preconditions against the **allocated** state. Checking
+them against a lagging watermark would let two committers in the same group both
+win a contested precondition, breaking exactly-one-winner — the one thing that
+must not break. And once the validator is at the allocated edition, reads must be
+too: otherwise every optimistic read-modify-write builds its patch on a stale
+world and is rejected. Not occasionally — *systematically*, because under load
+the watermark lags for as long as any group is in flight. The first
+implementation of this item livelocked a guarded allocator within a dozen
+attempts, and `grmpl-ent/tests/group_commit.rs::a_guarded_allocator_does_not_livelock`
+is the regression that pins it.
 
-No observer can then act on an edition a crash would erase — no player is told
-"Taken." for a take that did not happen. The law demands one atomic durable write
-*per edition*, not one *per committer*, and that is the loophole worth taking.
-Anything that weakens the gate instead of the batching is a violation, not an
-optimization.
+So the gate is on the **commit call**, not the clock:
 
-Expected: write throughput scales with committer count until it is bounded by
-tree work rather than fsync. `grmpl-bench`'s contention axis already measures
-exactly this.
+* `commit`/`commit_if` return only after the edition they return is durable;
+* `EntStore::durable_edition()` exposes the on-disk frontier for an observer that
+  externalizes a read *without* committing.
+
+That preserves what the law is protecting. The patch–edition law is about
+*atomicity* — an edition is allocated and written as one step — and a batch is
+still atomic, so no state ever carries part of an edition. No committer learns of
+its own edition before disk does, so no player is told "Taken." for a take a
+crash would erase. The residual window is precise: between a peer's stage and its
+group's fsync, a third party can read an edition not yet on disk — but it cannot
+externalize that read *through the store*, because the queue is FIFO in edition
+order and a group's fsync covers every edition staged before it, so any commit
+built on edition `E` is itself durable only once `E` is.
+
+**Measured** (`grmpl-bench contention`, §7 above): 8 committers went from 935 to
+3,138 commits/s. `Granfilade::syncs()` is the ops counter that keeps the claim
+falsifiable, in the same spirit as `frames_encoded` — 192 concurrent commits cost
+50 fsyncs, and a test fails if grouping ever silently stops.
+
+Consolidation, `gc`, `fork_at` and the context enfilade drain the queue before
+writing on their own: consolidation is the one occasion that *replaces* roots, so
+a staged commit landing afterwards would re-insert one it had just retired.
 
 ### 2. Snapshot handles — lock-free reads
 
@@ -246,12 +306,22 @@ precondition-guarded for exactly-once under racing drivers.
 With items 1–2 in place, a world of mostly-disjoint actors should scale with
 cores rather than flatlining.
 
-### 4. Retry backoff — fix the fairness bug
+### 4. Retry backoff — fix the fairness bug — **landed**
 
-`fair(min/max)=0.000` at 8 threads: correct, but one thread starves. Randomized
-exponential backoff in the `Rejected` path, plus a bounded retry count that
-surfaces a real error rather than spinning forever. Cheap, and the fairness
-metric already exists to prove it.
+`fair(min/max)=0.000` at 8 threads: correct, but one thread starved.
+`grmpl-proc::retry::Backoff` is full-jitter exponential backoff (delay drawn
+uniformly from `[0, min(base·2ᵏ, cap))`, defaulting to 16 attempts from 50 µs to
+a 5 ms ceiling) with a bounded attempt count, so a livelock surfaces as an
+`Error::Store` rather than an infinite spin. `fair(min/max)` is now 0.992 at 8
+threads.
+
+**The jitter is not nondeterminism.** Backoff decides *when a thread tries
+again*, never *what it writes*; the retried patch is still rebuilt from a fresh
+snapshot and is still a pure function of committed data. It deliberately draws no
+entropy from the environment either — jitter's job is to decorrelate contenders,
+not to be unpredictable, so the sequence is a xorshift seeded off a process-wide
+counter. No clock is read and no OS randomness is sampled, so the Replay law is
+untouched and the whole thing stays reproducible under a debugger.
 
 ### 5. Read side: shared arrangements, measured routing, background work
 
@@ -306,6 +376,9 @@ The verification story is the strong part: **none of this changes a law.**
   retry rate, `fair(min/max)`) and the watch fan-out axis. A new axis — commits/s
   across N disjoint authority domains — is what item 3 and item 6 are for.
 
-Suggested order: **0 and 4 first** (both cheap, both immediately visible in the
-fairness numbers), then **1**, then **2**. Items 3, 5, 6 are each their own
-phase.
+Order taken: **0 and 4 first** (both cheap, both immediately visible in the
+fairness numbers), then **1**. All three have landed, and every law suite listed
+above stayed green **unmodified** — which was the point of the check. Next is
+**2**, now the binding constraint: with the write path amortized, a reader that
+takes the global mutex three times for a three-way join is what a committer's
+fsync blocks. Items 3, 5, 6 are each their own phase.

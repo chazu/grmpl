@@ -72,6 +72,12 @@ pub fn world_authority() -> Authority {
             Scope::whole(PLAYER),
             Scope::whole(CURSOR),
             Scope::whole(ENTITY_SEQ),
+            // A spawn creates a process, so it owns that process's inbox
+            // plumbing: the read cursor (`CURSOR`) *and* the write counter
+            // (`INBOX_SEQ`). Both must be seeded in the same atomic commit that
+            // allocates the player, or a concurrent login could seed the counter
+            // twice and hand out a duplicate seq.
+            Scope::whole(INBOX_SEQ),
         ],
     )
 }

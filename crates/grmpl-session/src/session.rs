@@ -10,20 +10,40 @@
 //!   3. **a `Process`** — bound to a per-player inbox slice, driving the actor
 //!      loop.
 //!
-//! Commits are serialized behind one writer (`lock`). Inbox seqs no longer rely
-//! on that serialization: they are drawn from the durable, race-safe P4
-//! [`SeqAlloc`](grmpl_proc::SeqAlloc) via [`enqueue_seq`](grmpl_proc::enqueue_seq)
-//! (seeded once per player at spawn), so a concurrent append resolves to a
-//! distinct seq on its own. The entity counter still advances under the writer.
+//! **There is no writer lock.** Every commit this module makes is guarded by a
+//! precondition and resolves under the ordinary optimistic protocol:
+//!
+//! * inbox seqs come from the durable, race-safe P4
+//!   [`SeqAlloc`](grmpl_proc::SeqAlloc) via
+//!   [`enqueue_seq`](grmpl_proc::enqueue_seq), seeded once per player at spawn;
+//! * entity ids come from the now-guarded [`Alloc`], whose `seal` preconditions
+//!   the counter row, so two spawns (or two `dig`s) racing the counter resolve to
+//!   one winner and the loser retries against the winner's value;
+//! * a rejected command is retried by
+//!   [`run_to_idle_retrying`](Process::run_to_idle_retrying) under a
+//!   [`Backoff`], which rebuilds the patch from the *current* world — so a lost
+//!   `take lamp` race re-decides against the state that beat it rather than
+//!   silently doing nothing.
+//!
+//! The one un-raced path is [`Server::init`], which seeds the world's counters.
+//! That is the sanctioned exception the substrate forces on any counter (there is
+//! no "assert-if-absent" to precondition a first allocation on) and it is
+//! precisely where [`SeqAlloc::seed`](grmpl_proc::SeqAlloc::seed) and
+//! [`Alloc::seed`](grmpl_proc::Alloc::seed) exist to be used.
+//!
+//! The session layer is therefore serialized only by the *store*, which is what
+//! makes the substrate's own commit throughput observable through it.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use grmpl_core::{
     Edition, Entity, Error, Fact, NoSchemas, Patch, Result, TraceStore, Tuple, Value,
 };
 use grmpl_diff::Query;
-use grmpl_proc::{commit_patch, enqueue_seq, seed_seq, Alloc, CommitOutcome, Process};
+use grmpl_proc::{
+    commit_patch, commit_retrying, enqueue_seq, Alloc, Backoff, CommitOutcome, Process, SeqAlloc,
+};
 
 use crate::watch::Subscription;
 use crate::world::{
@@ -31,17 +51,24 @@ use crate::world::{
     NAMED, PLAYER, ROOT_ROOM, TELL,
 };
 
-/// A running world server. Holds the store and serializes all commits behind a
-/// single writer (the interim P3 scheme).
+/// A running world server. Holds the store; commits are ordinary optimistic
+/// commits, not serialized here.
 pub struct Server {
     store: Arc<dyn TraceStore>,
-    lock: Mutex<()>,
+    /// The retry policy every commit this server makes runs under.
+    policy: Backoff,
 }
 
 impl Server {
     /// Wrap a store. Call [`init`](Self::init) once to seed the world.
     pub fn new(store: Arc<dyn TraceStore>) -> Arc<Server> {
-        Arc::new(Server { store, lock: Mutex::new(()) })
+        Arc::new(Server { store, policy: Backoff::default() })
+    }
+
+    /// Wrap a store with an explicit retry policy — for tests that want to pin
+    /// contention behavior, and for deployments that want a different budget.
+    pub fn with_policy(store: Arc<dyn TraceStore>, policy: Backoff) -> Arc<Server> {
+        Arc::new(Server { store, policy })
     }
 
     /// The underlying store (for tests and observers).
@@ -52,8 +79,12 @@ impl Server {
     /// Seed the world if it is empty: name the root room and start the entity
     /// counter above the fixed ids. Idempotent — a no-op once the root room
     /// exists (safe across reopens).
+    ///
+    /// **The un-raced path.** This is world creation, called once before any
+    /// player connects; it is the sanctioned place to seed a counter row that no
+    /// precondition can guard (see the module docs). Calling it concurrently with
+    /// itself is not supported and not needed.
     pub fn init(&self) -> Result<()> {
-        let _w = self.lock.lock().unwrap();
         let at = self.store.current();
         let seeded = self
             .store
@@ -72,8 +103,15 @@ impl Server {
 
     /// Provision a connection into a player session. Reconnects rebind an
     /// existing identity; a new name spawns a fresh player as one commit.
+    ///
+    /// Concurrent logins need no lock. Two new names racing contend only on the
+    /// entity counter, and the guarded [`Alloc`] resolves that to one winner per
+    /// commit. Two logins of the *same* new name contend on it too — and because
+    /// the loser retries by re-reading the world, it finds the winner's `PLAYER`
+    /// row and rebinds to that identity instead of spawning a second one. The
+    /// durable-identity invariant is upheld by the counter guard, not by
+    /// serialization.
     pub fn login(self: &Arc<Self>, name: &str) -> Result<Session> {
-        let _w = self.lock.lock().unwrap();
         let player = match self.lookup_identity(name)? {
             Some(e) => e, // reconnect: identity persists
             None => self.spawn_player(name)?,
@@ -109,25 +147,49 @@ impl Server {
 
     /// Allocate a player entity, record its identity, and place it in the root
     /// room — one atomic commit ("spawn as a commit").
+    ///
+    /// The guarded [`Alloc`] makes this a racing commit, so it runs under the
+    /// server's retry policy. Every attempt re-reads the world: it re-checks
+    /// whether a concurrent login already bound this name (in which case that
+    /// identity is *the* identity and nothing is spawned), and otherwise draws a
+    /// fresh id from the counter as it now stands. `player` is therefore whatever
+    /// the winning attempt allocated, never a stale id from a rejected one.
     fn spawn_player(&self, name: &str) -> Result<Entity> {
-        let mut alloc = Alloc::read(&*self.store, ENTITY_SEQ, ID_BASE)?;
-        let player = alloc.fresh();
-        let patch = Patch::new()
-            .assert(Fact::new(NAMED, Tuple::from([Value::Ent(player), Value::text(name)])))
-            .assert(Fact::new(PLAYER, Tuple::from([Value::Ent(player), Value::text(name)])))
-            .assert(Fact::new(LOCATED, Tuple::from([Value::Ent(player), Value::Ent(ROOT_ROOM)])));
-        let patch = alloc.seal(patch);
-        match commit_patch(&*self.store, &NoSchemas, &patch, &world_authority())? {
-            CommitOutcome::Committed(_) => {
-                // Seed the player's durable inbox-seq counter once, here on the
-                // un-raced spawn path, so every later `enqueue_seq` is race-safe.
-                seed_seq(&*self.store, INBOX_SEQ, player)?;
-                Ok(player)
+        let mut spawned = None;
+        commit_retrying(self.policy.clone(), || {
+            // A peer may have bound this name since the last attempt; if so this
+            // spawn is moot and the caller must use the peer's entity.
+            if let Some(existing) = self.lookup_identity(name)? {
+                spawned = Some(existing);
+                // Nothing to write — report a committed no-op so the loop ends.
+                return Ok(CommitOutcome::Committed(self.store.current()));
             }
-            CommitOutcome::Rejected => {
-                Err(Error::Store("player spawn was rejected".into()))
+            let mut alloc = Alloc::read(&*self.store, ENTITY_SEQ, ID_BASE)?;
+            let player = alloc.fresh();
+            // The player's durable inbox-seq counter is seeded **in this same
+            // commit**. A first `SeqAlloc` allocation has no row to precondition
+            // on, so the seed must be un-raced — and the only thing that makes it
+            // un-raced here is riding inside the entity-counter guard, which
+            // exactly one spawn wins. Seeding it afterwards, as a second commit,
+            // would let two logins of one name seed it twice and hand out a
+            // duplicate seq.
+            let seqs = SeqAlloc::read(&*self.store, INBOX_SEQ, vec![Value::Ent(player)])?;
+            let patch = alloc.seal(
+                seqs.seed(Patch::new())
+                    .assert(Fact::new(NAMED, Tuple::from([Value::Ent(player), Value::text(name)])))
+                    .assert(Fact::new(PLAYER, Tuple::from([Value::Ent(player), Value::text(name)])))
+                    .assert(Fact::new(
+                        LOCATED,
+                        Tuple::from([Value::Ent(player), Value::Ent(ROOT_ROOM)]),
+                    )),
+            );
+            let outcome = commit_patch(&*self.store, &NoSchemas, &patch, &world_authority())?;
+            if matches!(outcome, CommitOutcome::Committed(_)) {
+                spawned = Some(player);
             }
-        }
+            Ok(outcome)
+        })?;
+        spawned.ok_or_else(|| Error::Store("player spawn committed without an entity".into()))
     }
 }
 
@@ -152,18 +214,20 @@ impl Session {
     }
 
     /// Submit one command line: enqueue it, run the process to idle, and return
-    /// everything the player was told as a result. Serialized behind the
-    /// server's single writer.
+    /// everything the player was told as a result.
+    ///
+    /// Nothing is serialized here. The enqueue draws a race-safe seq; the
+    /// command is committed under the server's retry policy, so a command that
+    /// loses a race is *re-decided against the winner's world* rather than
+    /// dropped — which is what turns a lost `take lamp` into "you don't see that
+    /// here" instead of silence.
     pub fn submit(&mut self, line: &str) -> Result<Vec<String>> {
-        // Hold the store/lock via a clone so the writer guard doesn't borrow
-        // `self` (which we mutate to advance the output cursor).
-        let server = Arc::clone(&self.server);
-        let _w = server.lock.lock().unwrap();
-        let store_arc = Arc::clone(&server.store);
+        let store_arc = Arc::clone(&self.server.store);
         let store: &dyn TraceStore = &*store_arc;
+        let policy = self.server.policy.clone();
 
         enqueue_seq(store, INBOX, INBOX_SEQ, self.player, tokenize(line))?;
-        self.process.run_to_idle(store, &NoSchemas)?;
+        self.process.run_to_idle_retrying(store, &NoSchemas, policy)?;
 
         self.drain_output(store)
     }
@@ -176,7 +240,6 @@ impl Session {
     /// subscription per player).
     pub fn subscribe(&mut self) -> Result<()> {
         let server = Arc::clone(&self.server);
-        let _w = server.lock.lock().unwrap();
         let store: &dyn TraceStore = &*server.store;
 
         let sub = Subscription::new(Query::rel(NAMED), self.player, self.player);
@@ -189,15 +252,17 @@ impl Session {
 
     /// Pump the player's subscription and stream any newly-materialized
     /// activations to `out`, exactly as `TELL` text is streamed — reactive push.
-    /// A no-op (returns `0`) if the player has not subscribed. Serialized behind
-    /// the server's single writer.
+    /// A no-op (returns `0`) if the player has not subscribed.
+    ///
+    /// Needs no lock: the pump's commit is preconditioned on its own watch
+    /// cursor and the drain's on its own delivery cursor (P5), so concurrent
+    /// pushes are already race-safe against each other by construction.
     pub fn push_activations(&mut self, out: &mut dyn Write) -> Result<usize> {
         let sub = match &self.subscription {
             Some(s) => s,
             None => return Ok(0),
         };
         let server = Arc::clone(&self.server);
-        let _w = server.lock.lock().unwrap();
         let store: &dyn TraceStore = &*server.store;
         Ok(sub.pump_and_drain(store, out)?.len())
     }

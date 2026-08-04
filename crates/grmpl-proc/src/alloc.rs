@@ -6,19 +6,26 @@
 //! re-running a behavior from the same edition reproduces the same ids — no
 //! wall-clock, no `Math.random`, nothing outside the trace (Replay law).
 //!
-//! This is the interim **single-writer** scheme: because the counter bump is a
-//! plain retract/assert (not guarded by a precondition), two patches allocating
-//! from the same counter value must not commit concurrently. P4 replaces it with
-//! a durable, concurrency-safe allocator; until then the session layer serializes
-//! commits behind one writer.
+//! It is also **race-safe**: [`Alloc::seal`] preconditions the present counter
+//! row, so two patches allocating from the same counter value resolve to exactly
+//! one winner and the loser retries against the winner's value. This is the same
+//! guard [`SeqAlloc::seal`](crate::SeqAlloc::seal) uses for inbox seqs; the P3
+//! interim scheme was an unguarded retract/assert that required the session layer
+//! to serialize every commit behind one writer. It no longer does.
+//!
+//! The one unguarded case is the very first allocation, when no counter row
+//! exists yet: there is no present tuple to precondition on (the substrate offers
+//! no "assert-if-absent"). Seed the counter once, on a path that is not raced,
+//! with [`seed`](Alloc::seed) — or simply assert the row in the world's `init`
+//! commit; every allocation thereafter is fully race-safe.
 
 use grmpl_core::{Entity, Patch, RelId, Result, TraceStore, Tuple, Value};
 use grmpl_diff::Snapshot;
 
-/// A replay-safe id allocator over a counter relation.
+/// A replay-safe, race-safe id allocator over a counter relation.
 ///
 /// Build one from the world it will commit against ([`read`](Self::read) /
-/// [`from_snapshot`](Self::from_snapshot)), pull ids with [`next`](Self::next),
+/// [`from_snapshot`](Self::from_snapshot)), pull ids with [`fresh`](Self::fresh),
 /// then fold the counter bump into the committing patch with
 /// [`seal`](Self::seal). The counter relation must lie within the committing
 /// authority's scope (the bump is an ordinary owned write).
@@ -28,7 +35,7 @@ pub struct Alloc {
     /// out).
     start: i64,
     /// Whether a positive counter row existed — determines whether `seal`
-    /// retracts the prior value.
+    /// guards and retracts the prior value.
     present: bool,
     /// How many ids have been handed out.
     n: i64,
@@ -75,16 +82,47 @@ impl Alloc {
         self.n
     }
 
-    /// Fold the counter advance into `patch`: retract the prior counter row (if
-    /// one existed) and assert the new one, so the whole allocation commits
-    /// atomically with the effects that consumed the ids. A no-op when nothing
-    /// was allocated — the invariant is that a present counter row always has
-    /// weight exactly 1.
+    /// Whether the counter row already exists. A seeded counter allocates fully
+    /// race-safe; an unseeded one has nothing to precondition on.
+    pub fn is_seeded(&self) -> bool {
+        self.present
+    }
+
+    /// Seed the counter row at the allocator's base if it is absent — a no-op
+    /// once the counter exists. Intended for the single, un-raced commit that
+    /// creates the world, and it must be *its own* commit: `seed` and
+    /// [`seal`](Self::seal) both assert a counter row, so folding them into one
+    /// patch would leave two.
+    pub fn seed(&self, patch: Patch) -> Patch {
+        if self.present {
+            return patch;
+        }
+        patch.assert(grmpl_core::Fact::new(
+            self.rel,
+            Tuple::from([Value::Int(self.start)]),
+        ))
+    }
+
+    /// Fold the counter advance into `patch`: **precondition** the present
+    /// counter row, retract it, and assert the bumped value, so the whole
+    /// allocation commits atomically with the effects that consumed the ids. A
+    /// no-op when nothing was allocated — the invariant is that a present counter
+    /// row always has weight exactly 1.
+    ///
+    /// The precondition is what makes concurrent allocation resolve to one
+    /// winner: the loser is `Rejected` with zero effect and retries with a fresh
+    /// [`read`](Self::read) against the winner's value, so no two commits ever
+    /// hand out the same entity id.
     pub fn seal(&self, mut patch: Patch) -> Patch {
         if self.n == 0 {
             return patch;
         }
         if self.present {
+            // Guard: the counter must still hold `start` at commit time.
+            patch = patch.expect(grmpl_core::Fact::new(
+                self.rel,
+                Tuple::from([Value::Int(self.start)]),
+            ));
             patch = patch.retract(grmpl_core::Fact::new(
                 self.rel,
                 Tuple::from([Value::Int(self.start)]),

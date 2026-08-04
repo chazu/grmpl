@@ -139,6 +139,21 @@ impl Persist for Value {
     }
 }
 
+/// One commit's worth of durable work, **already encoded and hashed** but not
+/// yet written: the node frames it adds, the meta entries (enfilade roots, the
+/// clock) that name them, and any meta keys it retires.
+///
+/// Encoding is pure and needs only the immutable trees, so it happens inside the
+/// store's edition lock; the batch and its `fsync` happen outside, where a group
+/// of them can share one. Splitting the two is what [`write_group`] exists for.
+///
+/// [`write_group`]: Granfilade::write_group
+pub struct StagedWrite {
+    pub nodes: Vec<(ContentKey, Vec<u8>)>,
+    pub meta: Vec<(Vec<u8>, Vec<u8>)>,
+    pub drop_meta: Vec<Vec<u8>>,
+}
+
 /// The content-addressed node store for one or more enfilades, plus a small
 /// `meta` keyspace for enfilade roots and the edition clock.
 pub struct Granfilade {
@@ -158,6 +173,15 @@ pub struct Granfilade {
     /// becomes a scan. One relaxed atomic add per node, against a SHA-256 — not
     /// measurable.
     encoded: AtomicU64,
+    /// **Durability ops counter (group commit).** `SyncAll`s issued since this
+    /// handle was opened.
+    ///
+    /// The same discipline as `encoded`, applied to what actually costs: every
+    /// axis of `docs/PERFORMANCE-ENT.md` bottoms out on this ~1 ms call. Without
+    /// a counter, "N committers now share one fsync" is prose; with it, a test
+    /// can *fail* when grouping silently stops happening and the write path
+    /// quietly returns to one fsync per committer.
+    syncs: AtomicU64,
 }
 
 impl Granfilade {
@@ -172,6 +196,7 @@ impl Granfilade {
             meta,
             present: Mutex::new(HashSet::new()),
             encoded: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
         })
     }
 
@@ -211,20 +236,46 @@ impl Granfilade {
         meta: Vec<(Vec<u8>, Vec<u8>)>,
         drop_meta: Vec<Vec<u8>>,
     ) -> Result<()> {
+        self.write_group(vec![StagedWrite { nodes, meta, drop_meta }])
+    }
+
+    /// **Group commit (the durability half).** Apply several already-encoded
+    /// writes as **one** batch and **one** `SyncAll`.
+    ///
+    /// Every axis of `docs/PERFORMANCE-ENT.md` bottoms out on that single
+    /// ~1 ms fsync, so N committers writing one at a time pay N fsyncs strictly
+    /// in series. Amortising one fsync across a group is the largest single win
+    /// available, and it does **not** weaken the patch–edition law: the law
+    /// demands one atomic durable write *per edition*, not one *per committer*.
+    /// A batch containing editions `e..=e+k` still lands entirely or not at all.
+    ///
+    /// `group` must be in **edition order**. Later entries overwrite earlier ones
+    /// for a repeated meta key (the clock, a relation's log root), which is
+    /// exactly right: the last edition in the group is the state the batch
+    /// leaves behind. Writing them out of order would durably record a stale
+    /// clock; skipping one would leave a hole in the history a reopen could not
+    /// see past.
+    pub fn write_group(&self, group: Vec<StagedWrite>) -> Result<()> {
+        if group.is_empty() {
+            return Ok(());
+        }
         let mut batch = self.db.batch();
-        let mut written = Vec::with_capacity(nodes.len());
-        for (k, v) in nodes {
-            batch.insert(&self.nodes, k.to_vec(), v);
-            written.push(k);
-        }
-        for (k, v) in meta {
-            batch.insert(&self.meta, k, v);
-        }
-        for k in drop_meta {
-            batch.remove(&self.meta, k);
+        let mut written = Vec::new();
+        for staged in group {
+            for (k, v) in staged.nodes {
+                batch.insert(&self.nodes, k.to_vec(), v);
+                written.push(k);
+            }
+            for (k, v) in staged.meta {
+                batch.insert(&self.meta, k, v);
+            }
+            for k in staged.drop_meta {
+                batch.remove(&self.meta, k);
+            }
         }
         batch.commit().map_err(store_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         // Only after the batch is durable may these count as present — otherwise
         // a crash mid-write would leave the memo claiming a node is on disk.
         self.present.lock().unwrap().extend(written);
@@ -339,6 +390,13 @@ impl Granfilade {
         self.encoded.load(Ordering::Relaxed)
     }
 
+    /// `SyncAll`s issued since this handle was opened — the durability cost of
+    /// the world so far. Under group commit this is **fewer** than the number of
+    /// commits whenever writers overlap; equal to it when they do not.
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
     /// Number of distinct nodes stored — for structural-sharing verification.
     pub fn node_count(&self) -> Result<usize> {
         Ok(self.nodes.iter().count())
@@ -386,6 +444,7 @@ impl Granfilade {
         }
         batch.commit().map_err(store_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(collected)
     }
 }

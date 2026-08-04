@@ -169,7 +169,37 @@ impl Subscription {
     /// them re-delivers the batch on reconnect (at-least-once) rather than losing
     /// it; a clean drain at a batch boundary leaves the cursor reflecting exactly
     /// what was streamed.
+    /// Two live subscriptions sharing one `watch` identity (the same player on
+    /// two connections) can race the cursor advance. That is contention, not an
+    /// invariant break, so a rejection re-runs the whole drain: the retry re-reads
+    /// the cursor the peer advanced and streams only what is *still* undelivered.
+    /// A row the peer already streamed to its own socket may have been written to
+    /// this one first — which is the same at-least-once boundary a crash between
+    /// the write and the cursor advance produces, and is why the delivery
+    /// guarantee is stated that way.
     pub fn drain(&self, store: &dyn TraceStore, out: &mut dyn Write) -> Result<Vec<Delivered>> {
+        let mut policy = grmpl_proc::Backoff::default();
+        loop {
+            match self.drain_once(store, out)? {
+                Some(delivered) => return Ok(delivered),
+                None => {
+                    if !policy.wait() {
+                        return Err(Error::Store(
+                            "watch delivery cursor advance was rejected on every attempt".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One drain attempt. `None` means the cursor advance was rejected — a peer
+    /// moved it under us — and the caller should re-read and try again.
+    fn drain_once(
+        &self,
+        store: &dyn TraceStore,
+        out: &mut dyn Write,
+    ) -> Result<Option<Vec<Delivered>>> {
         let from = self.delivered_through(store)?;
         let at = store.current();
 
@@ -191,7 +221,7 @@ impl Subscription {
         // order `read_at` may surface.
         pending.sort_by_key(|d| d.seq);
         if pending.is_empty() {
-            return Ok(pending);
+            return Ok(Some(pending));
         }
         // The pump appends contiguous seqs, so the drained prefix must run
         // `from, from+1, …` with no gap; a gap would mean a lost inbox row.
@@ -221,13 +251,9 @@ impl Subscription {
             assert: self.delivery_tuple(next),
         });
         match commit_patch(store, &NoSchemas, &patch, &self.on_watch.authority)? {
-            CommitOutcome::Committed(_) => Ok(pending),
-            // Serialized behind the server's single writer, no peer advances the
-            // delivery cursor under us — a rejection here is a real invariant
-            // break, not benign contention.
-            CommitOutcome::Rejected => {
-                Err(Error::Store("delivery cursor advance was rejected".into()))
-            }
+            CommitOutcome::Committed(_) => Ok(Some(pending)),
+            // A peer sharing this watch identity advanced the cursor first.
+            CommitOutcome::Rejected => Ok(None),
         }
     }
 }
