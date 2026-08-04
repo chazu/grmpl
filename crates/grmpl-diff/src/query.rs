@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grmpl_core::{Diff, Edition, Error, Result, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, EditionReader, Error, Result, RelId, TraceStore, Tuple, Value};
 
 use crate::multiset::{self, Multiset};
 
@@ -339,9 +339,20 @@ fn contains_reduce(q: &Query) -> bool {
 pub type Arrangements = HashMap<(usize, u64), Multiset>;
 
 /// Full evaluation at one edition (the `find` primitive).
+///
+/// Acquires **one** [`EditionReader`] for the whole evaluation, so a plan with N
+/// base-relation reads costs one store entry rather than N (see
+/// [`TraceStore::reader_at`]). Use [`eval_snapshot_on`] when the caller already
+/// holds a reader — a `Snapshot` does, and reusing it makes every read a
+/// behavior performs lock-free on a substrate that supports it.
 pub fn eval_snapshot(q: &Query, store: &dyn TraceStore, at: Edition) -> Result<Multiset> {
+    eval_snapshot_on(q, &*store.dyn_reader_at(at))
+}
+
+/// [`eval_snapshot`] against a reader the caller already holds.
+pub fn eval_snapshot_on(q: &Query, reader: &dyn EditionReader) -> Result<Multiset> {
     let mut arr = Arrangements::new();
-    eval_inner(q, store, at, None, None, &mut arr)
+    eval_inner(q, reader, None, None, &mut arr)
 }
 
 /// Evaluate reusing a caller-supplied arrangement cache, so shared sub-DAGs
@@ -353,7 +364,7 @@ pub fn eval_snapshot_with(
     at: Edition,
     arr: &mut Arrangements,
 ) -> Result<Multiset> {
-    eval_inner(q, store, at, None, None, arr)
+    eval_inner(q, &*store.dyn_reader_at(at), None, None, arr)
 }
 
 /// Evaluate `q` at `at` with the recursion variable ([`Query::recur`]) bound to
@@ -366,7 +377,7 @@ pub fn eval_with_recur(
     recur: &Multiset,
 ) -> Result<Multiset> {
     let mut arr = Arrangements::new();
-    eval_inner(q, store, at, Some(recur), None, &mut arr)
+    eval_inner(q, &*store.dyn_reader_at(at), Some(recur), None, &mut arr)
 }
 
 /// Evaluate `q` at `at` with the recursion variable optionally bound (`recur`)
@@ -383,15 +394,14 @@ pub fn eval_with(
     overrides: &HashMap<RelId, Multiset>,
 ) -> Result<Multiset> {
     let mut arr = Arrangements::new();
-    eval_inner(q, store, at, recur, Some(overrides), &mut arr)
+    eval_inner(q, &*store.dyn_reader_at(at), recur, Some(overrides), &mut arr)
 }
 
 /// Evaluation with an optional recursion variable in scope (`recur`), optional
 /// base-relation overrides (`overrides`), and a shared-arrangement cache (`arr`).
 fn eval_inner(
     q: &Query,
-    store: &dyn TraceStore,
-    at: Edition,
+    reader: &dyn EditionReader,
     recur: Option<&Multiset>,
     overrides: Option<&HashMap<RelId, Multiset>>,
     arr: &mut Arrangements,
@@ -399,23 +409,23 @@ fn eval_inner(
     Ok(match q {
         Query::Rel(r) => match overrides.and_then(|o| o.get(r)) {
             Some(m) => m.clone(),
-            None => multiset::from_pairs(store.read_at(*r, at)?),
+            None => multiset::from_pairs(reader.read(*r)?),
         },
         Query::RangeRel { rel, lo, hi } => match overrides.and_then(|o| o.get(rel)) {
             // An overridden relation is already in memory; apply the same range
             // restriction the store would, so the operator stays a pure filter.
             Some(m) => m.iter().filter(|(t, _)| lo <= *t && *t < hi).map(|(t, d)| (t.clone(), *d)).collect(),
-            None => multiset::from_pairs(store.read_range(*rel, at, lo, hi)?),
+            None => multiset::from_pairs(reader.read_range(*rel, lo, hi)?),
         },
         Query::RangeRelOn { rel, col, lo, hi } => {
             let keep = |t: &Tuple| t.as_slice().get(*col).is_some_and(|v| lo <= v && v < hi);
             match overrides.and_then(|o| o.get(rel)) {
                 Some(m) => m.iter().filter(|(t, _)| keep(t)).map(|(t, d)| (t.clone(), *d)).collect(),
-                None => multiset::from_pairs(store.read_range_on(*rel, at, *col, lo, hi)?),
+                None => multiset::from_pairs(reader.read_range_on(*rel, *col, lo, hi)?),
             }
         }
         Query::Map { input, f } => {
-            let child = eval_inner(input, store, at, recur, overrides, arr)?;
+            let child = eval_inner(input, reader, recur, overrides, arr)?;
             let mut out = Multiset::new();
             for (t, d) in &child {
                 multiset::add(&mut out, f(t), *d);
@@ -424,11 +434,11 @@ fn eval_inner(
             out
         }
         Query::Filter { input, pred } => {
-            let child = eval_inner(input, store, at, recur, overrides, arr)?;
+            let child = eval_inner(input, reader, recur, overrides, arr)?;
             child.into_iter().filter(|(t, _)| pred(t)).collect()
         }
         Query::Project { input, cols } => {
-            let child = eval_inner(input, store, at, recur, overrides, arr)?;
+            let child = eval_inner(input, reader, recur, overrides, arr)?;
             let mut out = Multiset::new();
             for (t, d) in &child {
                 multiset::add(&mut out, project_tuple(t, cols), *d);
@@ -437,21 +447,21 @@ fn eval_inner(
             out
         }
         Query::Join { left, right, left_key, right_key } => {
-            let l = eval_inner(left, store, at, recur, overrides, arr)?;
-            let r = eval_inner(right, store, at, recur, overrides, arr)?;
+            let l = eval_inner(left, reader, recur, overrides, arr)?;
+            let r = eval_inner(right, reader, recur, overrides, arr)?;
             join_multisets(&l, left_key, &r, right_key)
         }
         Query::Union(a, b) => {
-            let mut out = eval_inner(a, store, at, recur, overrides, arr)?;
-            let rhs = eval_inner(b, store, at, recur, overrides, arr)?;
+            let mut out = eval_inner(a, reader, recur, overrides, arr)?;
+            let rhs = eval_inner(b, reader, recur, overrides, arr)?;
             multiset::merge(&mut out, &rhs);
             multiset::strip_zeros(&mut out);
             out
         }
-        Query::Negate(a) => negate(&eval_inner(a, store, at, recur, overrides, arr)?),
-        Query::Distinct(a) => distinct_snapshot(&eval_inner(a, store, at, recur, overrides, arr)?),
+        Query::Negate(a) => negate(&eval_inner(a, reader, recur, overrides, arr)?),
+        Query::Distinct(a) => distinct_snapshot(&eval_inner(a, reader, recur, overrides, arr)?),
         Query::Reduce { input, key, agg } => {
-            let child = eval_inner(input, store, at, recur, overrides, arr)?;
+            let child = eval_inner(input, reader, recur, overrides, arr)?;
             reduce_snapshot(&child, key, agg)
         }
         Query::Recur => recur.cloned().unwrap_or_default(),
@@ -465,10 +475,10 @@ fn eval_inner(
             }
             // Least fixpoint of R = distinct(init ∪ step(R)) over a finite
             // domain, so iteration terminates (R grows monotonically as a set).
-            let init_val = eval_inner(init, store, at, None, overrides, arr)?;
+            let init_val = eval_inner(init, reader, None, overrides, arr)?;
             let mut r = distinct_snapshot(&init_val);
             loop {
-                let stepped = eval_inner(step, store, at, Some(&r), overrides, arr)?;
+                let stepped = eval_inner(step, reader, Some(&r), overrides, arr)?;
                 let mut union = init_val.clone();
                 multiset::merge(&mut union, &stepped);
                 let next = distinct_snapshot(&union);
@@ -485,15 +495,15 @@ fn eval_inner(
             // the store contents are shadowed — caching by (identity, edition)
             // alone would be unsound in either case.
             if recur.is_none() && overrides.is_none() {
-                let k = (Arc::as_ptr(inner) as usize, at.0);
+                let k = (Arc::as_ptr(inner) as usize, reader.edition().0);
                 if let Some(hit) = arr.get(&k) {
                     return Ok(hit.clone());
                 }
-                let v = eval_inner(inner, store, at, None, None, arr)?;
+                let v = eval_inner(inner, reader, None, None, arr)?;
                 arr.insert(k, v.clone());
                 v
             } else {
-                eval_inner(inner, store, at, recur, overrides, arr)?
+                eval_inner(inner, reader, recur, overrides, arr)?
             }
         }
     })

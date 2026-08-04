@@ -184,7 +184,10 @@ fn find_committed(
             .commit(&[(score, Tuple::from(tuples[i].clone()), 1)])
             .unwrap();
     }
-    q.find(&Snapshot::at_current(store)).unwrap()
+    // Bound rather than returned directly: a `Snapshot` holds a pinned reader
+    // borrowed from the store, so the temporary must drop before `sib` does.
+    let rows = q.find(&Snapshot::at_current(store)).unwrap();
+    rows
 }
 
 #[test]

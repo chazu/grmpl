@@ -10,8 +10,8 @@ code. Concurrency is a *semantic* property — actors, editions, optimistic comm
 This document states the model as implemented, then states plainly which of the
 parallelism the model permits is currently left unclaimed, and what claiming it
 would involve. Part 1 is description; part 2 is a work list whose items are
-individually marked **landed** or *proposal* — items 0, 1 and 4 have landed, and
-their entries record what the doing changed about the plan.
+individually marked **landed** or *proposal* — items 0, 1, 2 and 4 have landed,
+and their entries record what the doing changed about the plan.
 
 > **Sources.** The model is specified in [`DESIGN.md`](../DESIGN.md) §2.3 #6,
 > §2.4, §5.2, §5.3 and implemented in `grmpl-proc`, `grmpl-ent`, and
@@ -105,6 +105,7 @@ exists.*
 | Async | **None in the core.** `tokio` appears only under the off-by-default `iroh` feature of `grmpl-transport`. |
 | Store | `EntStore` is `Send + Sync` behind a single `Mutex<Inner>`. **Group commit (landed):** the lock covers allocation, apply and encoding; the batch + `SyncAll` happen outside it, shared across a group. |
 | Actor loop | Pull-based and caller-driven: `Process::step` / `run_to_idle` / `run_to_idle_retrying`. Nothing spins it — a real scheduler is still item 3. |
+| Reads | **Lock-free (landed).** A `Snapshot` holds an `EditionReader` captured once; on the Ent that is a versioned Fact root, so reads never contend with committers. |
 | Session server | **No writer lock (landed).** `Server.lock` is deleted; the entity counter is guarded like the P4 inbox seqs, and a rejected command retries under a `Backoff`. |
 | Cross-domain | Durable outbox written in-commit, at-least-once shipping, receiver dedups by `(sender, seq)` (`grmpl-proc::domain`) — exactly-once apply without 2PC. |
 | Branches | `EntStore::fork_at` gives cheap branch-level isolation via structural sharing in a shared granfilade. Independent worlds are real parallelism; within a branch there is one clock and one writer. |
@@ -147,8 +148,10 @@ and `fair(min/max)` went from `0.000` to `0.992` — no thread starves. The
 retry rate rose from 0.4% to 6.5%, which is the expected shape: more writers are
 actually in flight to lose races.
 
-**The design is genuinely concurrent; the write path is no longer the thing
-stopping it.** Reads are — see item 2.
+**The design is genuinely concurrent, and neither the write path nor the read
+path is the thing stopping it any more.** What remains is that nothing *drives*
+it: `Process::step` is still caller-pulled, so the parallelism is available but
+unscheduled — item 3.
 
 ---
 
@@ -162,7 +165,7 @@ the payoff the measurements justified.
 |---|---|---|---|---|---|
 | 0 | Guard `Alloc`, drop `Server.lock` | hours | unblocks the rest | low | **landed** |
 | 1 | Group commit | days | largest single win | medium (visibility gating) | **landed** |
-| 2 | Snapshot handles | days | removes reader stalls | medium (trait surface) | proposal |
+| 2 | Snapshot handles | days | removes reader stalls | medium (trait surface) | **landed** |
 | 3 | Actor scheduler | week+ | scales with cores | medium | proposal |
 | 4 | Retry backoff | hours | fairness | low | **landed** |
 | 5 | Shared arrangements, background consolidation | week | read fan-out | low | proposal |
@@ -265,28 +268,57 @@ Consolidation, `gc`, `fork_at` and the context enfilade drain the queue before
 writing on their own: consolidation is the one occasion that *replaces* roots, so
 a staged commit landing afterwards would re-insert one it had just retired.
 
-### 2. Snapshot handles — lock-free reads
+### 2. Snapshot handles — lock-free reads — **landed**
 
-`Snapshot` is currently `(edition, &dyn TraceStore)` (`grmpl-diff::snapshot`), so
-every `read` re-enters the store and takes the *global* mutex. A behavior
-evaluating a three-way join takes that lock three times, and each acquisition can
-block behind a committer sitting inside its ~1 ms fsync. **Readers are stalled by
+`Snapshot` was `(edition, &dyn TraceStore)` (`grmpl-diff::snapshot`), so every
+`read` re-entered the store and took the *global* mutex. A behavior evaluating a
+three-way join took that lock three times, and each acquisition could block
+behind a committer sitting inside its ~1 ms fsync. **Readers stalled by
 durability they do not care about.**
 
 The Ent's Fact enfilade is already immutable and versioned by edition — the G-2
 persist fix turns on precisely that property ("an older version's root is
-immutable"), and cheap forks fall out of the same fact. So a `Snapshot` should
-clone the root handle for its edition under one brief lock at construction and
-read lock-free thereafter.
+immutable"), and cheap forks fall out of the same fact. So a `Snapshot` now
+captures the root handle for its edition under one brief lock at construction and
+reads lock-free thereafter.
 
-That yields real snapshot isolation with **zero reader/writer contention** — the
+**The shape.** `grmpl-core::EditionReader` is the new contract — "an immutable
+view of the world at one edition", three methods mirroring the store's three
+pinned-edition reads, only one of them required. `TraceStore::reader_at` returns
+one, and it has a **default**: a reader that forwards each call back to the
+store, which is exactly what callers had before, so every substrate is correct
+with no work. `grmpl-ent` overrides it to capture the Rel enfilade's root — a
+single `Arc` refcount bump, because it is a persistent tree — and answer from
+that. The trait stays technology-free: it returns an opaque reader, and only
+`grmpl-ent` knows the thing inside is a versioned enfilade root.
+
+**It reaches the evaluator, which is where the three acquisitions actually
+were.** `Snapshot::read`/`holds` were only part of it; `Query::find` went through
+`eval_snapshot(q, store, at)`, whose `eval_inner` read the store once per base
+relation. `eval_inner` now takes a reader instead of `(store, at)`, and
+`Query::find` reuses the snapshot's rather than acquiring its own. Every public
+entry point kept its signature, so no call site changed.
+
+**One read still takes the lock**, and the exception is honest rather than
+overlooked: `read_range_on` may *build* an Arrangement on first use, which a
+reader over a captured immutable root cannot do. It delegates to the store, at
+one lock per `RangeRelOn` node — exactly as before. Everything else is lock-free.
+
+This yields real snapshot isolation with **zero reader/writer contention** — the
 read-and-branch-optimised shape `PERFORMANCE-ENT.md` §5 claims, actually cashed —
-and it makes pure behaviors trivially parallel, since they would touch no shared
-state until commit.
+and it makes pure behaviors trivially parallel, since they touch no shared state
+until commit. That is the prerequisite item 3 was waiting on.
 
-Cost: a `TraceStore` addition for an opaque snapshot handle. It must stay
-technology-free above the bright line — the trait returns an opaque reader; only
-`grmpl-ent` knows it is an `Arc` over a Fact root.
+Laws (`grmpl-ent/tests/snapshot_reader.rs`), with `EntStore::read_locks()` as the
+ops counter that keeps them falsifiable — the third in the same discipline as
+`frames_encoded` and `syncs`:
+
+* a three-way join over a pinned snapshot, plus two direct reads and a `holds`,
+  costs **one** acquisition (it is 3 for the join alone on the forwarding
+  reader — checked by removing the override);
+* a pinned reader keeps answering for its edition while four threads commit 100
+  more, and does not drift;
+* the P6 watermark door still closes for a reader, at the same place.
 
 ### 3. A real actor scheduler — parallelism across authority domains
 
@@ -377,8 +409,11 @@ The verification story is the strong part: **none of this changes a law.**
   across N disjoint authority domains — is what item 3 and item 6 are for.
 
 Order taken: **0 and 4 first** (both cheap, both immediately visible in the
-fairness numbers), then **1**. All three have landed, and every law suite listed
-above stayed green **unmodified** — which was the point of the check. Next is
-**2**, now the binding constraint: with the write path amortized, a reader that
-takes the global mutex three times for a three-way join is what a committer's
-fsync blocks. Items 3, 5, 6 are each their own phase.
+fairness numbers), then **1**, then **2**. All four have landed, and every law
+suite listed above stayed green **unmodified** — which was the point of the
+check.
+
+With the write path amortized and the read path off the lock, item **3** (a real
+actor scheduler) is now unblocked: behaviors are pure, they read through pinned
+readers that touch no shared state, and only the commit synchronizes. Items 3, 5,
+6 are each their own phase.

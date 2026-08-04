@@ -186,6 +186,17 @@ pub struct EntStore {
     dur: Mutex<Durable>,
     /// Signalled whenever a group lands (or fails), waking its followers.
     flushed: Condvar,
+    /// **Read-lock ops counter.** How many times a pinned-edition read has had to
+    /// take the edition lock.
+    ///
+    /// The third counter in the same discipline as `frames_encoded` (is the
+    /// commit path still path-sized?) and `syncs` (are committers still sharing
+    /// fsyncs?). This one pins the reader claim: a `Snapshot` acquires an
+    /// `EntReader` once and every read through it is lock-free, so a plan with N
+    /// base relations costs **one** acquisition rather than N. Without a counter
+    /// that is prose; with it, a test fails the day a read quietly re-enters the
+    /// store.
+    read_locks: std::sync::atomic::AtomicU64,
     /// The node substrate, **shared with every fork of this store** (G-6): all
     /// branches live in one granfilade with their roots namespaced by branch, so
     /// a durable fork shares nodes with its ancestor instead of copying them.
@@ -269,6 +280,7 @@ impl EntStore {
             inner: Mutex::new(Inner::empty()),
             dur: Mutex::new(Durable::default()),
             flushed: Condvar::new(),
+            read_locks: std::sync::atomic::AtomicU64::new(0),
             gran: None,
             branch: Dag::ROOT,
             dag: Arc::new(Mutex::new(Dag::new())),
@@ -289,6 +301,7 @@ impl EntStore {
         Ok(EntStore {
             dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
             flushed: Condvar::new(),
+            read_locks: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(inner),
             gran: Some(Arc::new(gran)),
             branch: Dag::ROOT,
@@ -302,6 +315,7 @@ impl EntStore {
     /// relation. (Lead-prefix pruning on the primary order; per-column
     /// Arrangements for trailing-column spans are the next increment.)
     pub fn range_at(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        self.note_read_lock();
         let inner = self.inner.lock().unwrap();
         if at.0 < inner.watermark {
             return Err(door("range_at", at.0, inner.watermark));
@@ -389,6 +403,18 @@ impl EntStore {
         Edition(self.dur.lock().unwrap().durable)
     }
 
+    /// Count one edition-lock acquisition on a pinned-edition read path.
+    fn note_read_lock(&self) {
+        self.read_locks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Times a pinned-edition read has taken the edition lock since this store
+    /// was opened — the reader ops counter. A `Snapshot` costs **one** (acquiring
+    /// its reader) however many relations its queries touch.
+    pub fn read_locks(&self) -> u64 {
+        self.read_locks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `SyncAll`s issued since this store was opened — the group-commit ops
     /// counter, surfaced so tests can assert that concurrent committers *share*
     /// their durability cost rather than each paying it. `0` for an in-memory
@@ -473,6 +499,7 @@ impl EntStore {
         let child = EntStore {
             dur: Mutex::new(Durable { durable: at.0, ..Durable::default() }),
             flushed: Condvar::new(),
+            read_locks: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 current: at.0,
                 watermark: inner.watermark,
@@ -522,6 +549,7 @@ impl EntStore {
         Ok(EntStore {
             dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
             flushed: Condvar::new(),
+            read_locks: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(inner),
             gran: self.gran.clone(),
             branch,
@@ -543,6 +571,7 @@ impl EntStore {
         Ok(EntStore {
             dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
             flushed: Condvar::new(),
+            read_locks: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(inner),
             gran: Some(Arc::new(gran)),
             branch,
@@ -958,6 +987,82 @@ impl Inner {
     }
 }
 
+/// **The Ent's lock-free reader.**
+///
+/// `Inner` sits behind one mutex, so before this every read of a pinned edition
+/// took that mutex — and could block behind a committer inside its `fsync`. But
+/// the Fact enfilade is *immutable and versioned by edition*: a commit inserts a
+/// new root beside the old one and never edits it. That is the same property
+/// that makes `fork_at` free and that G-2's persist fix turns on, and it means a
+/// reader needs nothing from the store after it has the roots.
+///
+/// So this captures the Rel enfilade's root — **one `Arc` bump**, the whole
+/// relation directory, under one brief lock — and answers every later read by
+/// descending it. No lock, no contention with committers, and real snapshot
+/// isolation: the reader keeps reading its edition no matter how far the store
+/// moves on, because the version it holds cannot change.
+struct EntReader<'a> {
+    /// The store, for the one read that cannot be lock-free (see
+    /// [`EntReader::read_range_on`]).
+    store: &'a EntStore,
+    /// The Rel enfilade as of construction: relation → its versioned Fact roots.
+    rels: RelTree,
+    at: u64,
+    watermark: u64,
+}
+
+impl EntReader<'_> {
+    /// The Fact root in force at this reader's edition — the same `O(log n)`
+    /// descent `Inner::fact_at` makes, over the captured directory.
+    fn facts(&self, rel: RelId) -> Option<&FactTree> {
+        self.rels.get(&rel.0).and_then(|r| r.versions.last_le(&self.at)).map(|(_, t)| t)
+    }
+
+    fn door(&self, op: &str) -> Result<()> {
+        if self.at < self.watermark {
+            return Err(door(op, self.at, self.watermark));
+        }
+        Ok(())
+    }
+}
+
+impl grmpl_core::EditionReader for EntReader<'_> {
+    fn edition(&self) -> Edition {
+        Edition(self.at)
+    }
+
+    fn read(&self, rel: RelId) -> Result<Vec<(Tuple, Diff)>> {
+        self.door("read_at")?;
+        Ok(self
+            .facts(rel)
+            .map(|t| t.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default())
+    }
+
+    fn read_range(&self, rel: RelId, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        self.door("read_range")?;
+        // The WID range walk (E2), pruning out-of-range subtrees by their cached
+        // measures — unchanged except that it needs no lock to do it.
+        Ok(self.facts(rel).map(|t| t.range_collect(lo, hi)).unwrap_or_default())
+    }
+
+    fn read_range_on(
+        &self,
+        rel: RelId,
+        col: usize,
+        lo: &Value,
+        hi: &Value,
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        // **The one read that keeps the lock, and why.** An Arrangement is built
+        // on first use and maintained thereafter, so answering this can *write*
+        // to the store's state — which a reader over a captured immutable root
+        // cannot do. Delegating keeps the build-on-first-use behavior intact at
+        // the cost of one lock per `RangeRelOn` node, exactly as before. Every
+        // other read in a plan is lock-free.
+        self.store.read_range_on(rel, Edition(self.at), col, lo, hi)
+    }
+}
+
 impl EditionStore for EntStore {
     /// The world's clock: the **allocated** edition.
     ///
@@ -1013,6 +1118,7 @@ impl TraceStore for EntStore {
     }
 
     fn read_at(&self, rel: RelId, at: Edition) -> Result<Vec<(Tuple, Diff)>> {
+        self.note_read_lock();
         let inner = self.inner.lock().unwrap();
         if at.0 < inner.watermark {
             return Err(door("read_at", at.0, inner.watermark));
@@ -1089,6 +1195,7 @@ impl TraceStore for EntStore {
         lo: &Value,
         hi: &Value,
     ) -> Result<Vec<(Tuple, Diff)>> {
+        self.note_read_lock();
         let mut inner = self.inner.lock().unwrap();
         if at.0 < inner.watermark {
             return Err(door("read_range_on", at.0, inner.watermark));
@@ -1174,6 +1281,24 @@ impl TraceStore for EntStore {
 
     fn watermark(&self) -> Edition {
         Edition(self.inner.lock().unwrap().watermark)
+    }
+
+    /// **Lock-free reads (see [`EntReader`]).** One brief lock to capture the
+    /// edition's roots; every read after that touches no shared state.
+    fn reader_at(&self, at: Edition) -> Box<dyn grmpl_core::EditionReader + '_> {
+        self.dyn_reader_at(at)
+    }
+
+    fn dyn_reader_at(&self, at: Edition) -> Box<dyn grmpl_core::EditionReader + '_> {
+        self.note_read_lock();
+        let (rels, watermark) = {
+            let inner = self.inner.lock().unwrap();
+            // Cloning the Rel enfilade is one `Arc` refcount bump: it is a
+            // persistent tree, so this hands out the whole directory as it stands
+            // without copying any of it.
+            (inner.rels.clone(), inner.watermark)
+        };
+        Box::new(EntReader { store: self, rels, at: at.0, watermark })
     }
 
     fn consolidate(&self, up_to: Edition) -> Result<Edition> {

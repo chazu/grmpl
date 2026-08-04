@@ -21,7 +21,8 @@ pub use differential::{
 pub use multiset::Multiset;
 pub use parse_stream::{ParseStream, WindowParser};
 pub use query::{
-    eval_delta, eval_snapshot, eval_snapshot_with, eval_with, eval_with_recur, Agg, Arrangements,
+    eval_delta, eval_snapshot, eval_snapshot_on, eval_snapshot_with, eval_with, eval_with_recur, Agg,
+    Arrangements,
     MapFn, Pred, Query,
 };
 pub use recursive::{IncrementalFixpoint, Maintenance};

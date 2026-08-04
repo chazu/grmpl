@@ -186,6 +186,123 @@ pub trait TraceStore: EditionStore {
     fn consolidate(&self, _up_to: Edition) -> Result<Edition> {
         Ok(self.watermark())
     }
+
+    /// **An immutable reader pinned at one edition.**
+    ///
+    /// Every read a query makes at a fixed edition — `read_at`, `read_range`,
+    /// `read_range_on` — re-enters the store, and a store that serializes its
+    /// state behind a lock therefore takes that lock once *per base-relation
+    /// read*. A three-way join takes it three times, and each acquisition can
+    /// block behind a committer sitting inside its `fsync`: **readers stalled by
+    /// durability they do not care about.**
+    ///
+    /// A reader is the fix. The caller acquires one, and every read it makes goes
+    /// through it. What that buys depends on the substrate, which is exactly why
+    /// this is a trait method with a default rather than a fixed mechanism:
+    ///
+    /// * The **default** returns a reader that simply forwards each call back to
+    ///   the store at the pinned edition — identical behavior to reading the
+    ///   store directly, so every substrate is correct with no work.
+    /// * A store whose state is **immutable and versioned by edition** (the Ent's
+    ///   Fact enfilade — the same property that makes forks free) overrides this
+    ///   to capture that edition's roots under one brief lock and answer every
+    ///   later read **lock-free**.
+    ///
+    /// Infallible by construction, so pinning a snapshot cannot fail: an
+    /// out-of-range edition is reported by the *read*, at the same watermark door
+    /// as before.
+    ///
+    /// The trait stays technology-free — a reader is "an immutable view of the
+    /// world at one edition", a pure value-level notion. Only the substrate knows
+    /// whether that is a borrowed handle on a persistent tree or a re-entry into
+    /// a mutex.
+    fn reader_at(&self, at: Edition) -> Box<dyn EditionReader + '_>
+    where
+        Self: Sized,
+    {
+        Box::new(ForwardingReader { store: self, at })
+    }
+
+    /// Object-safe [`reader_at`](Self::reader_at), for a `&dyn TraceStore`.
+    ///
+    /// `reader_at` is `Self: Sized` so implementors can return their own reader
+    /// type; this is the vtable-reachable entry point, and a store that overrides
+    /// `reader_at` must override this too (they are the same method for a
+    /// concrete and an erased receiver). The default forwards, so a store that
+    /// overrides neither is correct.
+    fn dyn_reader_at(&self, at: Edition) -> Box<dyn EditionReader + '_> {
+        Box::new(ForwardingReader { store: self, at })
+    }
+}
+
+/// An immutable view of the world at one [`Edition`] — the read half of a
+/// [`Snapshot`](https://docs.rs/grmpl-diff), acquired once and used many times.
+///
+/// The three methods mirror the store's three pinned-edition reads. Only
+/// [`read`](Self::read) is required; the range reads default to it plus a filter,
+/// exactly as they do on [`TraceStore`], so a reader is never *wrong*, only
+/// sometimes slower than the substrate could be.
+pub trait EditionReader: Send + Sync {
+    /// The edition this reader is pinned at. Fixed for its whole life — a reader
+    /// is a snapshot, not a cursor.
+    fn edition(&self) -> Edition;
+
+    /// Consolidated contents of `rel` as-of this reader's edition.
+    fn read(&self, rel: RelId) -> Result<Vec<(Tuple, Diff)>>;
+
+    /// [`read`](Self::read) restricted to the tuple-key half-open range
+    /// `[lo, hi)`.
+    fn read_range(&self, rel: RelId, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self.read(rel)?.into_iter().filter(|(t, _)| lo <= t && t < hi).collect())
+    }
+
+    /// [`read`](Self::read) restricted to rows whose column `col` lies in
+    /// `[lo, hi)`.
+    fn read_range_on(
+        &self,
+        rel: RelId,
+        col: usize,
+        lo: &crate::value::Value,
+        hi: &crate::value::Value,
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self
+            .read(rel)?
+            .into_iter()
+            .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| lo <= v && v < hi))
+            .collect())
+    }
+}
+
+/// The default [`EditionReader`]: every read re-enters the store at the pinned
+/// edition. Correct for any substrate, and exactly the behavior callers had
+/// before readers existed.
+struct ForwardingReader<'a, S: ?Sized> {
+    store: &'a S,
+    at: Edition,
+}
+
+impl<S: TraceStore + ?Sized> EditionReader for ForwardingReader<'_, S> {
+    fn edition(&self) -> Edition {
+        self.at
+    }
+
+    fn read(&self, rel: RelId) -> Result<Vec<(Tuple, Diff)>> {
+        self.store.read_at(rel, self.at)
+    }
+
+    fn read_range(&self, rel: RelId, lo: &Tuple, hi: &Tuple) -> Result<Vec<(Tuple, Diff)>> {
+        self.store.read_range(rel, self.at, lo, hi)
+    }
+
+    fn read_range_on(
+        &self,
+        rel: RelId,
+        col: usize,
+        lo: &crate::value::Value,
+        hi: &crate::value::Value,
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        self.store.read_range_on(rel, self.at, col, lo, hi)
+    }
 }
 
 /// A durable directory mapping interned relation *names* to their [`RelId`].
