@@ -1,0 +1,37 @@
+[tasks.build]
+description = "Build the whole workspace"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "Run the full test suite"
+run = "cargo test --workspace"
+
+[tasks.moo]
+description = "Play the MOO example (worlds/moo.grmpl) in a REPL against a persistent store"
+dir = "{{config_root}}"
+run = "cargo run -p grmpl-cli --quiet -- run worlds/moo.grmpl .grmpl/moo"
+
+[tasks.showcase]
+description = "Run the narrated tour of the substrate's features"
+dir = "{{config_root}}"
+run = "cargo run -p grmpl-cli --quiet -- showcase"
+
+[tasks."docs:build"]
+description = "Build the mdbook (docs/book -> docs/book/book)"
+dir = "{{config_root}}/docs/book"
+run = "mdbook build"
+
+[tasks."docs:serve"]
+description = "Serve the mdbook locally with live reload"
+dir = "{{config_root}}/docs/book"
+run = "mdbook serve --open"
+
+# Publishes to https://<your-pico-user>-grmpl.pgs.sh — pgs.sh authenticates by
+# SSH key alone and creates the project on first upload, so there is nothing to
+# register. Override the project name with PGS_PROJECT=... mise run docs:publish.
+# Manage what is up there with `ssh pgs.sh help` (ls / link / rm / cache).
+[tasks."docs:publish"]
+description = "Publish the built mdbook to pgs.sh"
+depends = ["docs:build"]
+dir = "{{config_root}}/docs/book"
+run = 'rsync --delete -rv ./book/ pgs.sh:/${PGS_PROJECT:-grmpl}'

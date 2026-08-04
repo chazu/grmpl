@@ -1,0 +1,311 @@
+// ============================================================================
+// Kasumi Shotengai — a larger MOO world whose rules live on grmpl's relational
+// surface. Initial places, people, finite combat tables, and dungeon templates
+// are data seeded by the edge host.
+// ============================================================================
+
+// ---- ordinary world ---------------------------------------------------------
+rel located(thing: Ent, place: Ent)
+rel named(thing: Ent, name: Text)
+rel described(thing: Ent, text: Text)
+rel held(owner: Ent, thing: Ent)
+rel exits(from: Ent, way: Text, to: Ent)
+rel players(who: Ent, name: Text)
+rel value(thing: Ent, coins: Int)
+
+rel person(thing: Ent)
+rel label(thing: Ent, text: Text)
+rel knows(viewer: Ent, thing: Ent)
+rel patrol(from: Ent, to: Ent)
+rel job_clock(place: Ent)
+
+// ---- jobs and combat --------------------------------------------------------
+rel job(which: Ent, name: Text)
+rel active_job(player: Ent, job: Ent)
+rel job_rank(player: Ent, job: Ent, rank: Int)
+rel job_points(player: Ent, job: Ent, points: Int)
+rel job_stats(job: Ent, rank: Int, power: Int, guard: Int, max_hp: Int)
+rel job_progression(job: Ent, old_rank: Int, old_points: Int, reward: Int,
+                    new_rank: Int, new_points: Int, ability: Ent,
+                    old_ability_rank: Int, new_ability_rank: Int)
+
+rel ability(which: Ent, name: Text)
+rel ability_rank(player: Ent, ability: Ent, rank: Int)
+rel ability_power(ability: Ent, rank: Int, power: Int)
+
+rel monster(thing: Ent)
+rel hp(thing: Ent, current: Int)
+rel defense(thing: Ent, guard: Int)
+rel monster_power(thing: Ent, power: Int)
+rel monster_reward(thing: Ent, points: Int)
+rel defeated(thing: Ent)
+rel attack_result(power: Int, guard: Int, old_hp: Int, new_hp: Int, outcome: Text)
+rel combat_event(player: Ent, monster: Ent, outcome: Text)
+
+// ---- durable edge/runtime state --------------------------------------------
+rel session_branch(player: Ent, branch: Int)
+rel echo_depth(world: Ent, depth: Int)
+rel instance_state(player: Ent, shift: Int, home: Ent)
+rel instance_counter(player: Ent, next: Int)
+rel rng_state(world: Ent, state: Int)
+
+// ---- card table: arithmetic and combinations are relations -----------------
+rel card(holder: Ent, slot: Int, code: Int)
+rel cardval(code: Int, pips: Int)
+rel cardrank(code: Int, rank: Int)
+rel slotpair(i: Int, j: Int)
+rel slottrio(i: Int, j: Int, k: Int)
+rel sum15two(a: Int, b: Int)
+rel sum15three(a: Int, b: Int, c: Int)
+
+// ---- process and watch plumbing --------------------------------------------
+rel tell(player: Ent, text: Text)
+rel inbox(process: Ent, seq: Int, body: Tuple)
+rel inbox_seq(process: Ent, next: Int)
+rel cursor(process: Ent, pos: Int)
+rel wmail(who: Ent, seq: Int, body: Tuple)
+rel wcursor(watch: Ent, edition: Int)
+rel wseq(inbox: Int, target: Ent, n: Int)
+
+// ---- base views -------------------------------------------------------------
+view here(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    named(thing, name)
+    yield thing, name
+}
+
+view contents(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    yield thing
+}
+
+view inventory(owner) {
+    held(owner, thing)
+    named(thing, name)
+    yield thing, name
+}
+
+view whereami(viewer) {
+    located(viewer, room)
+    named(room, name)
+    yield room, name
+}
+
+view ways(viewer) {
+    located(viewer, room)
+    exits(room, way, destination)
+    yield way, destination
+}
+
+view roster() {
+    players(who, name)
+    yield who, name
+}
+
+view treasure() {
+    located(thing, room)
+    value(thing, coins)
+    named(room, name)
+    yield name, sum(coins)
+}
+
+view world() {
+    located(thing, room)
+    named(thing, name)
+    yield thing, name
+}
+
+view folks(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    label(thing, text)
+    yield thing, text
+}
+
+view acquainted(viewer) {
+    knows(viewer, thing)
+    named(thing, name)
+    yield thing, name
+}
+
+// ---- RPG views --------------------------------------------------------------
+view jobs() {
+    job(which, name)
+    yield which, name
+}
+
+view current_job(player) {
+    active_job(player, which)
+    job(which, name)
+    job_rank(player, which, rank)
+    job_points(player, which, points)
+    job_stats(which, rank, power, guard, max_hp)
+    yield which, name, rank, points, power, guard, max_hp
+}
+
+view abilities(player) {
+    ability_rank(player, which, rank)
+    ability(which, name)
+    ability_power(which, rank, power)
+    yield which, name, rank, power
+}
+
+view enemies(viewer) {
+    located(viewer, room)
+    located(enemy, room)
+    monster(enemy)
+    named(enemy, name)
+    yield enemy, name
+}
+
+// Join an unlocked ability to a monster in the player's room. This must be a
+// view rather than sequential `find monster` / `find located`: `find` binds the
+// least global monster and does not backtrack when that monster is elsewhere.
+view ability_targets(player) {
+    ability_rank(player, which, rank)
+    ability(which, name)
+    ability_power(which, rank, power)
+    located(player, room)
+    located(enemy, room)
+    monster(enemy)
+    yield which, name, rank, power, enemy
+}
+
+// ---- card scoring views -----------------------------------------------------
+view crib_pairs(who) {
+    slotpair(i, j)
+    card(who, i, c1)
+    card(who, j, c2)
+    cardrank(c1, rank)
+    cardrank(c2, rank)
+    yield i, j
+}
+
+view crib_fif2(who) {
+    slotpair(i, j)
+    card(who, i, c1)
+    card(who, j, c2)
+    cardval(c1, a)
+    cardval(c2, b)
+    sum15two(a, b)
+    yield i, j
+}
+
+view crib_fif3(who) {
+    slottrio(i, j, k)
+    card(who, i, c1)
+    card(who, j, c2)
+    card(who, k, c3)
+    cardval(c1, a)
+    cardval(c2, b)
+    cardval(c3, c)
+    sum15three(a, b, c)
+    yield i, j, k
+}
+
+// ---- textual command grammar -----------------------------------------------
+form command {
+    "take" noun   -> Take(noun)
+    "drop" noun   -> Drop(noun)
+    "go" way      -> Go(way)
+    "say" message -> Say(message)
+    "greet" who   -> Greet(who)
+    "change" job  -> Change(job)
+    "attack" who  -> Attack(who)
+    "use" skill   -> Use(skill)
+    "tick"         -> Tick()
+}
+
+// ---- behaviors: guarded patches over the relations above -------------------
+on inbox parse command {
+    match Take(noun) {
+        resolve here(self) where name ~ noun
+        find located(thing, room)
+        expect located(thing, room)
+        retract located(thing, room)
+        assert held(self, thing)
+        emit tell(self, "Taken.")
+    }
+
+    match Drop(noun) {
+        resolve inventory(self) where name ~ noun
+        find located(self, room)
+        expect held(self, thing)
+        retract held(self, thing)
+        assert located(thing, room)
+        emit tell(self, "Dropped.")
+    }
+
+    match Go(direction) {
+        find located(self, room)
+        resolve ways(self) where way = direction
+        expect located(self, room)
+        retract located(self, room)
+        assert located(self, destination)
+        emit tell(self, "You go.")
+    }
+
+    match Say(message) {
+        emit tell(self, message)
+    }
+
+    match Greet(who) {
+        resolve folks(self) where text ~ who
+        find named(thing, name)
+        assert knows(self, thing)
+        assert knows(thing, self)
+        emit tell(self, name)
+    }
+
+    // The relation lookup is also the location gate: outside the cooperative
+    // office `find job_clock(room)` aborts the arm without changing anything.
+    match Change(wanted) {
+        find located(self, room)
+        find job_clock(room)
+        resolve jobs() where name ~ wanted
+        find active_job(self, old_job)
+        expect active_job(self, old_job)
+        retract active_job(self, old_job)
+        assert active_job(self, which)
+        emit tell(self, "Job changed.")
+    }
+
+    match Attack(who) {
+        resolve enemies(self) where name ~ who
+        find active_job(self, job)
+        find job_rank(self, job, rank)
+        find job_stats(job, rank, power, player_guard, max_hp)
+        find hp(enemy, old_hp)
+        find defense(enemy, enemy_guard)
+        find attack_result(power, enemy_guard, old_hp, new_hp, outcome)
+        expect hp(enemy, old_hp)
+        retract hp(enemy, old_hp)
+        assert hp(enemy, new_hp)
+        assert combat_event(self, enemy, outcome)
+        emit tell(self, "You strike.")
+    }
+
+    match Use(wanted) {
+        resolve ability_targets(self) where name ~ wanted
+        find hp(enemy, old_hp)
+        find defense(enemy, enemy_guard)
+        find attack_result(power, enemy_guard, old_hp, new_hp, outcome)
+        expect hp(enemy, old_hp)
+        retract hp(enemy, old_hp)
+        assert hp(enemy, new_hp)
+        assert combat_event(self, enemy, outcome)
+        emit tell(self, "Ability used.")
+    }
+
+    match Tick() {
+        find located(self, room)
+        find patrol(room, destination)
+        expect located(self, room)
+        retract located(self, room)
+        assert located(self, destination)
+    }
+}
+
+on watch world including current { inbox wmail cursor wcursor seqs wseq }

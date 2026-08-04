@@ -4,10 +4,12 @@
 //!   and play it from an interactive REPL.
 //! * `grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]` — expose that same world
 //!   through the TCP session adapter.
+//! * `grmpl shotengai [STORE_DIR]` — play the durable Kasumi Shotengai RPG.
 //! * `grmpl showcase` — a narrated tour of the substrate's distinctive features.
 
 mod run;
 mod serve;
+mod shotengai;
 mod showcase;
 
 const USAGE: &str = "\
@@ -22,6 +24,8 @@ USAGE:
                                           Serve the same runtime over TCP.
                                           Defaults to the built-in MOO,
                                           .grmpl/moo, and 127.0.0.1:7777.
+    grmpl shotengai [STORE_DIR]           Enter the durable Kasumi Shotengai RPG.
+                                          Defaults to .grmpl/shotengai.
     grmpl showcase                        Run a narrated tour of the substrate's
                                           distinctive features.
     grmpl help                            Show this help.
@@ -38,6 +42,7 @@ fn main() {
             args.get(2).cloned(),
             args.get(3).cloned(),
         ),
+        "shotengai" => shotengai::run(args.get(1).cloned()),
         "showcase" => showcase::run(),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
