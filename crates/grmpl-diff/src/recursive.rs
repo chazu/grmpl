@@ -55,6 +55,12 @@ pub enum Maintenance {
     DeleteRederive,
 }
 
+/// Collect every base relation referenced by a query (for monotonicity checks,
+/// and for the delta path's "was anything touched?" routing question).
+pub(crate) fn collect_rels_of(q: &Query, out: &mut Vec<RelId>) {
+    collect_rels(q, out)
+}
+
 /// Collect every base relation referenced by a query (for monotonicity checks).
 fn collect_rels(q: &Query, out: &mut Vec<RelId>) {
     match q {

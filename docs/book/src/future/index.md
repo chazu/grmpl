@@ -88,9 +88,17 @@ edition in `O(depth)`:
 ## Provenance and version-compare as a first-class surface
 
 Backfollow / version-compare is implemented, and subtree-pruned: comparing two
-editions costs the size of the difference, not the size of the relation. What is
-missing is not the mechanism but the *surface*. Exposing it to the language and
-to tooling — "show me every edition in which this fact held," "diff the world
+editions costs the size of the difference, not the size of the relation. It is
+also **on the running system's path** now rather than beside it: it is a
+substrate primitive (`TraceStore::compare`, with a read-both-ends default so any
+store is correct), and the differential engine answers the non-linear `distinct`
+delta from it — which is exact, because `distinct` at a tuple depends only on
+whether that tuple's weight is positive, so only tuples the comparison names can
+possibly contribute. A maintained `distinct` therefore costs the edit rather than
+the relation.
+
+What is still missing is not the mechanism but the *surface*. Exposing it to the
+language and to tooling — "show me every edition in which this fact held," "diff the world
 between these two editions," "where did this content come from" — is Xanadu's
 original transclusion-and-provenance vision, now over a relational world. This is
 the job Green gave the **spanfilade**: given a span, find everywhere it is

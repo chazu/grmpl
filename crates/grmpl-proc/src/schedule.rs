@@ -110,6 +110,19 @@ impl SeqAlloc {
         Ok(SeqAlloc::from_rows(rel, key, store.read_at(rel, at)?))
     }
 
+    /// Build from a pinned snapshot — the form to use when this allocation must
+    /// be decided at the *same* edition as something else the caller read, so
+    /// that one precondition can guard both. (A spawn does exactly this: it
+    /// checks a name is unbound and seeds that process's counter at one edition,
+    /// under the entity counter's guard.)
+    pub fn from_snapshot(
+        snap: &grmpl_diff::Snapshot,
+        rel: RelId,
+        key: Vec<Value>,
+    ) -> Result<SeqAlloc> {
+        Ok(SeqAlloc::from_rows(rel, key, snap.read(rel)?))
+    }
+
     /// The seq that the next [`fresh`](Self::fresh) would hand out.
     pub fn peek(&self) -> i64 {
         self.start + self.n

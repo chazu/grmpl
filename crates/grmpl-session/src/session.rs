@@ -40,7 +40,7 @@ use std::sync::Arc;
 use grmpl_core::{
     Edition, Entity, Error, Fact, NoSchemas, Patch, Result, TraceStore, Tuple, Value,
 };
-use grmpl_diff::Query;
+use grmpl_diff::{Query, Snapshot};
 use grmpl_proc::{
     commit_patch, commit_retrying, enqueue_seq, Alloc, Backoff, CommitOutcome, Process, SeqAlloc,
 };
@@ -110,9 +110,10 @@ impl Server {
     /// the loser retries by re-reading the world, it finds the winner's `PLAYER`
     /// row and rebinds to that identity instead of spawning a second one. The
     /// durable-identity invariant is upheld by the counter guard, not by
-    /// serialization.
+    /// serialization — see [`spawn_player`](Self::spawn_player) for the part of
+    /// that argument which is easy to get wrong.
     pub fn login(self: &Arc<Self>, name: &str) -> Result<Session> {
-        let player = match self.lookup_identity(name)? {
+        let player = match self.lookup_identity(&Snapshot::at_current(&*self.store), name)? {
             Some(e) => e, // reconnect: identity persists
             None => self.spawn_player(name)?,
         };
@@ -131,11 +132,14 @@ impl Server {
         })
     }
 
-    /// The player entity previously bound to `name`, if any.
-    fn lookup_identity(&self, name: &str) -> Result<Option<Entity>> {
-        let at = self.store.current();
+    /// The player entity bound to `name` as-of `snap`, if any.
+    ///
+    /// Takes a pinned snapshot rather than reading the store, because
+    /// [`spawn_player`](Self::spawn_player) needs this answer and the entity
+    /// counter to come from the *same* edition.
+    fn lookup_identity(&self, snap: &Snapshot, name: &str) -> Result<Option<Entity>> {
         let want = Value::text(name);
-        for (t, d) in self.store.read_at(PLAYER, at)? {
+        for (t, d) in snap.read(PLAYER)? {
             if d > 0 && t.as_slice().get(1) == Some(&want) {
                 if let Some(Value::Ent(e)) = t.as_slice().first() {
                     return Ok(Some(*e));
@@ -154,17 +158,30 @@ impl Server {
     /// identity is *the* identity and nothing is spawned), and otherwise draws a
     /// fresh id from the counter as it now stands. `player` is therefore whatever
     /// the winning attempt allocated, never a stale id from a rejected one.
+    ///
+    /// **Both reads must come from one pinned edition, and this is the subtle
+    /// part.** The counter precondition is what makes "one name, one identity"
+    /// hold, but only because a spawn *always* bumps the counter: if a peer
+    /// spawned between our two reads, our precondition must fail. Reading the
+    /// identity at one edition and the counter at a later one breaks exactly
+    /// that — the lookup says "no such name", the counter read already reflects
+    /// the peer's bump, so the precondition holds and a second player is spawned
+    /// for the same name. Pinning one `Snapshot` for both closes it: anything
+    /// that could have bound the name also moved the counter we preconditioned
+    /// on, so we lose the race and adopt the winner on the retry.
     fn spawn_player(&self, name: &str) -> Result<Entity> {
         let mut spawned = None;
         commit_retrying(self.policy.clone(), || {
+            // One edition for the identity lookup *and* the counter read.
+            let snap = Snapshot::at_current(&*self.store);
             // A peer may have bound this name since the last attempt; if so this
             // spawn is moot and the caller must use the peer's entity.
-            if let Some(existing) = self.lookup_identity(name)? {
+            if let Some(existing) = self.lookup_identity(&snap, name)? {
                 spawned = Some(existing);
                 // Nothing to write — report a committed no-op so the loop ends.
-                return Ok(CommitOutcome::Committed(self.store.current()));
+                return Ok(CommitOutcome::Committed(snap.edition));
             }
-            let mut alloc = Alloc::read(&*self.store, ENTITY_SEQ, ID_BASE)?;
+            let mut alloc = Alloc::from_snapshot(&snap, ENTITY_SEQ, ID_BASE)?;
             let player = alloc.fresh();
             // The player's durable inbox-seq counter is seeded **in this same
             // commit**. A first `SeqAlloc` allocation has no row to precondition
@@ -173,7 +190,7 @@ impl Server {
             // exactly one spawn wins. Seeding it afterwards, as a second commit,
             // would let two logins of one name seed it twice and hand out a
             // duplicate seq.
-            let seqs = SeqAlloc::read(&*self.store, INBOX_SEQ, vec![Value::Ent(player)])?;
+            let seqs = SeqAlloc::from_snapshot(&snap, INBOX_SEQ, vec![Value::Ent(player)])?;
             let patch = alloc.seal(
                 seqs.seed(Patch::new())
                     .assert(Fact::new(NAMED, Tuple::from([Value::Ent(player), Value::text(name)])))

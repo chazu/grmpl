@@ -62,17 +62,17 @@ fn version_compare_reports_what_changed_between_editions() {
     let after = store.current();
 
     // LOCATED between the two editions: the lamp's row went from weight 1 to gone.
-    let d = store.compare(LOCATED, before, after).unwrap();
+    let d = store.version_compare(LOCATED, before, after).unwrap();
     assert_eq!(d, vec![(Tuple::from([e(LAMP), e(ROOM)]), Some(1), None)]);
 
     // HELD: the player-lamp row appeared.
-    let d = store.compare(HELD, before, after).unwrap();
+    let d = store.version_compare(HELD, before, after).unwrap();
     assert_eq!(d, vec![(Tuple::from([e(PLAYER), e(LAMP)]), None, Some(1))]);
 
     // NAMED was untouched — the versions are shared, so O(1) empty diff.
-    assert!(store.compare(NAMED, before, after).unwrap().is_empty());
+    assert!(store.version_compare(NAMED, before, after).unwrap().is_empty());
     // A relation compared to itself is empty.
-    assert!(store.compare(LOCATED, after, after).unwrap().is_empty());
+    assert!(store.version_compare(LOCATED, after, after).unwrap().is_empty());
 }
 
 #[test]

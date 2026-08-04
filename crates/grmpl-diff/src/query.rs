@@ -509,9 +509,77 @@ fn eval_inner(
     })
 }
 
+/// A query that reads exactly one base relation, possibly range-restricted —
+/// the shape whose *boundary at an edition is that relation's state*, which is
+/// what lets a non-linear delta be answered by [`TraceStore::compare`] instead
+/// of by materializing both ends.
+struct BaseRel<'a> {
+    rel: RelId,
+    /// The restriction the query applies, if any. `None` is the whole relation.
+    span: Option<Span<'a>>,
+}
+
+enum Span<'a> {
+    /// A tuple-key range, as `RangeRel`.
+    Tuples(&'a Tuple, &'a Tuple),
+    /// A single-column range, as `RangeRelOn`.
+    Column(usize, &'a Value, &'a Value),
+}
+
+impl BaseRel<'_> {
+    /// Does `t` fall inside this query's restriction?
+    fn admits(&self, t: &Tuple) -> bool {
+        match &self.span {
+            None => true,
+            Some(Span::Tuples(lo, hi)) => *lo <= t && t < *hi,
+            Some(Span::Column(col, lo, hi)) => {
+                t.as_slice().get(*col).is_some_and(|v| *lo <= v && v < *hi)
+            }
+        }
+    }
+}
+
+/// Recognize the base-relation shape, seeing through `Shared` (which is
+/// transparent to delta computation).
+fn base_of(q: &Query) -> Option<BaseRel<'_>> {
+    match q {
+        Query::Rel(r) => Some(BaseRel { rel: *r, span: None }),
+        Query::RangeRel { rel, lo, hi } => {
+            Some(BaseRel { rel: *rel, span: Some(Span::Tuples(lo, hi)) })
+        }
+        Query::RangeRelOn { rel, col, lo, hi } => {
+            Some(BaseRel { rel: *rel, span: Some(Span::Column(*col, lo, hi)) })
+        }
+        Query::Shared(inner) => base_of(inner),
+        _ => None,
+    }
+}
+
+/// Is `q` **provably** unchanged over `(from, to]`?
+///
+/// A query is a pure function of its base relations, so if the substrate can
+/// prove none of them was touched, the delta is empty. This is the same routing
+/// question the reactive pump asks, asked here so that *any* caller of
+/// `eval_delta` gets the cheap exit — and it matters most exactly where it is
+/// used: in front of the non-linear operators, whose alternative is two full
+/// boundary recomputes (for `Iterate`, two whole fixpoints).
+///
+/// [`TraceStore::touched_since`] is conservative in the safe direction — `false`
+/// is a proof of no change, `true` merely means "possibly" — and its default is
+/// an unconditional `true`, so a store that cannot prove anything simply never
+/// takes this exit.
+fn quiet(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition) -> Result<bool> {
+    let mut rels = Vec::new();
+    crate::recursive::collect_rels_of(q, &mut rels);
+    rels.sort_unstable_by_key(|r| r.0);
+    rels.dedup();
+    Ok(!store.touched_since(from, to, &rels)?)
+}
+
 /// The change in a query's result over `(from, to]` — computed incrementally
-/// from children's deltas (linear ops), the bilinear rule (join), or a
-/// boundary recompute (distinct). Equal to `snapshot(to) − snapshot(from)`.
+/// from children's deltas (linear ops), the bilinear rule (join), a
+/// version-compare over the changed tuples (distinct over a base relation), or
+/// a boundary recompute. Equal to `snapshot(to) − snapshot(from)`.
 pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition) -> Result<Multiset> {
     Ok(match q {
         Query::Rel(r) => {
@@ -579,18 +647,68 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
         }
         Query::Negate(a) => negate(&eval_delta(a, store, from, to)?),
         Query::Distinct(a) => {
-            // Non-linear: recompute the boundary at each end and difference.
-            let to_set = distinct_snapshot(&eval_snapshot(a, store, to)?);
-            let from_set = distinct_snapshot(&eval_snapshot(a, store, from)?);
-            let mut out = to_set;
-            multiset::merge(&mut out, &negate(&from_set));
-            multiset::strip_zeros(&mut out);
-            out
+            // **The O(edit) path (version compare).** `distinct(A@e)(t)` is
+            // `[A@e(t) > 0]`, so the delta at `t` is
+            // `[A@to(t) > 0] − [A@from(t) > 0]` — which is zero whenever
+            // `A@to(t) == A@from(t)`. **Only tuples whose weight actually
+            // changed can contribute**, and that set is exactly what
+            // `TraceStore::compare` returns. So when the input is a base
+            // relation we can answer from the difference alone, without
+            // materializing either boundary.
+            //
+            // On the Ent that costs the size of the edit (shared subtrees prune,
+            // and an untouched relation short-circuits on its shared root); on
+            // any other store the default compare reads both ends, which is
+            // exactly the recompute below, so this is never worse.
+            match base_of(a) {
+                Some(base) => {
+                    let mut out = Multiset::new();
+                    for (t, w_from, w_to) in store.compare(base.rel, from, to)? {
+                        if !base.admits(&t) {
+                            continue;
+                        }
+                        let d = i64::from(w_to > 0) - i64::from(w_from > 0);
+                        if d != 0 {
+                            multiset::add(&mut out, t, d);
+                        }
+                    }
+                    multiset::strip_zeros(&mut out);
+                    out
+                }
+                // A compound input: its boundary is not a relation's state, so
+                // recompute both ends and difference (the general rule).
+                None => {
+                    if quiet(q, store, from, to)? {
+                        return Ok(Multiset::new());
+                    }
+                    let to_set = distinct_snapshot(&eval_snapshot(a, store, to)?);
+                    let from_set = distinct_snapshot(&eval_snapshot(a, store, from)?);
+                    let mut out = to_set;
+                    multiset::merge(&mut out, &negate(&from_set));
+                    multiset::strip_zeros(&mut out);
+                    out
+                }
+            }
         }
         Query::Reduce { input, key, agg } => {
             // Non-linear, like `distinct`: recompute the aggregate boundary at
-            // each end and difference. Stateless — per-key incremental state
-            // (recompute only changed keys, DESIGN.md §3) is P13.
+            // each end and difference.
+            //
+            // Unlike `distinct` this cannot be answered from the difference
+            // alone: an aggregate over a group depends on *every* member, so a
+            // single changed row means re-folding its whole group, and the
+            // members are not in the difference. `compare` does give the
+            // **affected keys** for free, but reading a group by key needs a
+            // read-the-rows-with-this-key primitive the substrate does not have
+            // (`read_range` takes tuple bounds, and a group's exclusive upper
+            // bound is not computable for an arbitrary `Value`). Per-key
+            // incremental state (DESIGN.md §3) is P13 and is the real answer.
+            //
+            // What is available is the cheap exit: if no base relation was
+            // touched, the delta is empty and neither boundary need be built.
+            if quiet(q, store, from, to)? {
+                return Ok(Multiset::new());
+            }
             let to_set = reduce_snapshot(&eval_snapshot(input, store, to)?, key, agg);
             let from_set = reduce_snapshot(&eval_snapshot(input, store, from)?, key, agg);
             let mut out = to_set;
@@ -604,6 +722,13 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
             // risk 1). Correct including retraction; incremental recursion via
             // the iteration coordinate is a later optimization behind this same
             // interface. `Δ = fixpoint(to) − fixpoint(from)`.
+            //
+            // A fixpoint is a pure function of its base relations, so if none of
+            // them moved over the interval neither did it — and two fixpoint
+            // evaluations are the most expensive thing in this function to skip.
+            if quiet(q, store, from, to)? {
+                return Ok(Multiset::new());
+            }
             let to_val = eval_snapshot(q, store, to)?;
             let from_val = eval_snapshot(q, store, from)?;
             let mut out = to_val;

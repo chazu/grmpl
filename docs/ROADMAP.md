@@ -435,6 +435,21 @@ corresponding tickets for detail.
   `grmpl_proc::commit_patch_checked`; `commit_patch` = the `NoBehaviorCheck`
   variant). Law oracles: behavior-codec round-trip, dispatch-equals-model under
   churn, and commit-boundary-recheck ⇔ static verdict + runtime soundness.
-* **P13 — Benchmarks,** then engine statefulness.
+* **P13 — Benchmarks,** then engine statefulness. **Partly landed:**
+  `TraceStore::compare` (version compare / backfollow) is now a substrate
+  primitive — default: read both ends and difference; the Ent: prune shared
+  subtrees, so it costs the size of the *edit*. `grmpl-diff` routes the
+  non-linear `distinct` delta through it, which is exact rather than approximate
+  (`distinct(A@e)(t) = [A@e(t) > 0]`, so only tuples whose weight actually
+  changed can contribute), and all three non-linear operators now short-circuit
+  to an empty delta when `touched_since` proves their base relations were not
+  touched. **Still open:** per-key incremental `Reduce` state. An aggregate over
+  a group depends on every member, so a changed row means re-folding its whole
+  group and the members are not in the difference; `compare` gives the affected
+  keys for free, but reading a group *by key* needs a primitive the substrate
+  does not have (`read_range` takes tuple bounds, and a group's exclusive upper
+  bound is not computable for an arbitrary `Value`). That primitive, or genuine
+  per-key state, is the remaining work. Laws:
+  `grmpl-diff/tests/compare_delta_law.rs`.
 * **P14 — Diff generalization** (abelian groups).
 * **P15 — Distribution.**

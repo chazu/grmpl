@@ -188,7 +188,7 @@ fn version_compare_costs_the_edit_not_the_relation() {
     for k in 0..200i64 {
         store.commit(&[(REL, t(100_000 + k), 1)]).unwrap();
         expected.push((t(100_000 + k), 1));
-        let d = store.compare(REL, base, store.current()).unwrap();
+        let d = store.version_compare(REL, base, store.current()).unwrap();
         assert_eq!(
             d.len(),
             expected.len(),
@@ -205,11 +205,11 @@ fn version_compare_costs_the_edit_not_the_relation() {
     }
 
     // An unchanged pair short-circuits entirely.
-    assert!(store.compare(REL, base, base).unwrap().is_empty());
+    assert!(store.version_compare(REL, base, base).unwrap().is_empty());
     // And a comparison spanning a retraction reports the disappearance.
     let before = store.current();
     store.commit(&[(REL, t(0), -1)]).unwrap();
-    let d = store.compare(REL, before, store.current()).unwrap();
+    let d = store.version_compare(REL, before, store.current()).unwrap();
     assert_eq!(d.len(), 1);
     assert_eq!(d[0], (t(0), Some(1), None));
 }

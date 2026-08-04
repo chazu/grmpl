@@ -187,6 +187,45 @@ pub trait TraceStore: EditionStore {
         Ok(self.watermark())
     }
 
+    /// **Version compare / backfollow.** How `rel` differs between editions `a`
+    /// and `b`: `(tuple, weight_at_a, weight_at_b)` for every tuple whose net
+    /// weight differs, **tuple-sorted** (the Determinism invariant — the answer
+    /// may not depend on physical scan order).
+    ///
+    /// This is the *state* difference, not the *log* difference, and the
+    /// distinction is the point. `scan_updates` returns every raw update in the
+    /// interval, so a tuple asserted and retracted fifty times costs a hundred
+    /// entries that sum to nothing. This returns only what actually differs — the
+    /// read side of the trace, "what is the same, what moved".
+    ///
+    /// The default implementation reads both ends and differences them, so every
+    /// store is correct without extra work. A store whose state is a **versioned,
+    /// content-addressed tree** (the Ent) overrides it to prune whole subtrees
+    /// that the two editions share, so the comparison costs the size of the
+    /// *edit* rather than the size of the relation — and short-circuits to `O(1)`
+    /// when the two editions share a root, which is the common case for a
+    /// relation nothing touched.
+    ///
+    /// Both editions are subject to the same watermark floor as `read_at`:
+    /// comparing against a consolidated-away edition errors rather than lying.
+    fn compare(&self, rel: RelId, a: Edition, b: Edition) -> Result<Vec<(Tuple, Diff, Diff)>> {
+        use std::collections::BTreeMap;
+        let mut sides: BTreeMap<Tuple, (Diff, Diff)> = BTreeMap::new();
+        for (t, d) in self.read_at(rel, a)? {
+            sides.entry(t).or_default().0 = d;
+        }
+        for (t, d) in self.read_at(rel, b)? {
+            sides.entry(t).or_default().1 = d;
+        }
+        // A `BTreeMap` yields keys ascending, so the result is tuple-sorted by
+        // construction rather than by a trailing sort.
+        Ok(sides
+            .into_iter()
+            .filter(|(_, (wa, wb))| wa != wb)
+            .map(|(t, (wa, wb))| (t, wa, wb))
+            .collect())
+    }
+
     /// **An immutable reader pinned at one edition.**
     ///
     /// Every read a query makes at a fixed edition — `read_at`, `read_range`,

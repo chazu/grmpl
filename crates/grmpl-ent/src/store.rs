@@ -372,7 +372,14 @@ impl EntStore {
     /// net weight differs. An unchanged relation shares its Fact root across the
     /// two editions, so the comparison short-circuits in `O(1)` — the read side of
     /// the trace ("what is the same, what moved").
-    pub fn compare(&self, rel: RelId, a: Edition, b: Edition) -> Result<Vec<crate::tree::EntryDiff<Tuple, Diff>>> {
+    ///
+    /// This is the substrate-native form, with absent sides as `None`. It is
+    /// reachable above the bright line through
+    /// [`TraceStore::compare`](grmpl_core::TraceStore::compare), which is what
+    /// puts it on the running system's path: `grmpl-diff` routes the non-linear
+    /// `distinct` delta through it, so a maintained `distinct` costs the edit
+    /// rather than the relation.
+    pub fn version_compare(&self, rel: RelId, a: Edition, b: Edition) -> Result<Vec<crate::tree::EntryDiff<Tuple, Diff>>> {
         let inner = self.inner.lock().unwrap();
         for at in [a, b] {
             if at.0 < inner.watermark {
@@ -1281,6 +1288,23 @@ impl TraceStore for EntStore {
 
     fn watermark(&self) -> Edition {
         Edition(self.inner.lock().unwrap().watermark)
+    }
+
+    /// **Subtree-pruned version compare (E6).** The Ent's override of the
+    /// substrate's state-difference primitive: two editions that share a Fact
+    /// root compare in `O(1)`, and below that the descent prunes on shared
+    /// content keys and disjoint `KeyBounds`, so the cost is the size of the
+    /// difference rather than the size of the relation — where the default must
+    /// read both ends in full.
+    ///
+    /// `Tree::diff` walks both versions in key order, so the result is
+    /// tuple-sorted as the contract requires, with no sort of its own.
+    fn compare(&self, rel: RelId, a: Edition, b: Edition) -> Result<Vec<(Tuple, Diff, Diff)>> {
+        Ok(self
+            .version_compare(rel, a, b)?
+            .into_iter()
+            .map(|(t, wa, wb)| (t, wa.unwrap_or(0), wb.unwrap_or(0)))
+            .collect())
     }
 
     /// **Lock-free reads (see [`EntReader`]).** One brief lock to capture the

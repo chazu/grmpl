@@ -103,50 +103,81 @@ fn concurrent_builders_never_collide_on_an_entity_id() {
 }
 
 /// Law 2 — racing logins of one name bind one identity.
+///
+/// The subtle one. The counter guard alone does *not* give this: it makes
+/// exactly one spawn win per counter value, but a login that reads "no such
+/// name" at edition E and then reads the counter at a later edition E′ has
+/// already absorbed the winner's bump, so its precondition holds and it spawns a
+/// second player under the same name. Both reads have to come from one pinned
+/// snapshot — see `Server::spawn_player`.
+///
+/// The window is a few instructions wide, so this races many connections over
+/// several names, with the threads released together, and repeats: a single
+/// six-way race caught the bug only occasionally, which is not a regression
+/// guard.
 #[test]
 fn concurrent_logins_of_one_name_bind_exactly_one_player() {
     grmpl_conformance::for_each_store(|c| {
-        let server = server(c);
-        const CONNECTIONS: usize = 6;
+        const CONNECTIONS: usize = 8;
+        const NAMES: usize = 4;
 
-        let players: Vec<Entity> = thread::scope(|scope| {
-            let handles: Vec<_> = (0..CONNECTIONS)
-                .map(|_| {
-                    let server = Arc::clone(&server);
-                    scope.spawn(move || server.login("mallory").unwrap().player())
+        let server = server(c);
+        let mut all: HashSet<Entity> = HashSet::new();
+
+        for round in 0..NAMES {
+            let name = format!("mallory{round}");
+            // Release every connection at once, so the lookup/counter interleaving
+            // the bug lives in is actually exercised.
+            let gate = Arc::new(std::sync::Barrier::new(CONNECTIONS));
+
+            let players: Vec<Entity> = thread::scope(|scope| {
+                let handles: Vec<_> = (0..CONNECTIONS)
+                    .map(|_| {
+                        let server = Arc::clone(&server);
+                        let gate = Arc::clone(&gate);
+                        let name = name.clone();
+                        scope.spawn(move || {
+                            gate.wait();
+                            server.login(&name).unwrap().player()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let distinct: HashSet<Entity> = players.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "`{name}` is one durable identity even under concurrent logins: {players:?}"
+            );
+
+            // And the world holds exactly one PLAYER row for that name — the
+            // losers adopted the winner's identity, they did not each spawn one.
+            let store = Arc::clone(server.store());
+            let at = store.current();
+            let bound: Vec<Entity> = store
+                .read_at(PLAYER, at)
+                .unwrap()
+                .into_iter()
+                .filter(|(t, d)| *d > 0 && t.as_slice().get(1) == Some(&Value::text(&name)))
+                .filter_map(|(t, _)| match t.as_slice().first() {
+                    Some(Value::Ent(e)) => Some(*e),
+                    _ => None,
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+            assert_eq!(bound, vec![players[0]], "exactly one durable PLAYER binding for `{name}`");
+            all.extend(distinct);
+        }
 
-        let distinct: HashSet<Entity> = players.iter().copied().collect();
-        assert_eq!(
-            distinct.len(),
-            1,
-            "one name is one durable identity even under concurrent logins: {players:?}"
-        );
+        // Each name got its own player, and no id was reused across names.
+        assert_eq!(all.len(), NAMES, "one identity per name, all distinct: {all:?}");
 
-        // And the world holds exactly one PLAYER row for that name — the losers
-        // adopted the winner's identity, they did not each spawn one.
-        let store = Arc::clone(server.store());
-        let at = store.current();
-        let bound: Vec<Entity> = store
-            .read_at(PLAYER, at)
-            .unwrap()
-            .into_iter()
-            .filter(|(t, d)| *d > 0 && t.as_slice().get(1) == Some(&Value::text("mallory")))
-            .filter_map(|(t, _)| match t.as_slice().first() {
-                Some(Value::Ent(e)) => Some(*e),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(bound, vec![players[0]], "exactly one durable PLAYER binding");
-
-        // Distinct names still get distinct players.
+        // Distinct names still get distinct players on the ordinary path.
         let a = server.login("norah").unwrap().player();
         let b = server.login("oscar").unwrap().player();
         assert_ne!(a, b);
-        assert!(!distinct.contains(&a) && !distinct.contains(&b));
+        assert!(!all.contains(&a) && !all.contains(&b));
     });
 }
 

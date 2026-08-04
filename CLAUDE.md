@@ -61,8 +61,33 @@ order:
 * `TraceStore::scan_updates` returns updates in **commit order**
   `(edition, counter)` — the exact order in which they were written, not scan
   order.
+* `TraceStore::compare` returns **tuple-sorted** state differences.
 * The language `find`/`resolve` binds to the **least** matching tuple, never
   whichever the scan surfaced first (`grmpl-lang::compile`).
+
+### Concurrency
+
+The write path is **group-committed** and the read path is **off the lock**;
+neither weakens a law, and `docs/CONCURRENCY.md` is the full account.
+
+* **Durability gates the commit call, not the clock.** `commit`/`commit_if`
+  return only once the edition they return is durable. `EditionStore::current`
+  is the **allocated** edition, because `commit_if` validates preconditions
+  against the allocated state and reads must agree with the validator — a store
+  whose clock lags what it validates against livelocks every guarded
+  read-modify-write. `EntStore::durable_edition` is the on-disk frontier.
+* **Every counter is guarded.** `Alloc::seal` and `SeqAlloc::seal` precondition
+  the present counter row, so concurrent allocation resolves to one winner. The
+  only unguarded write is the *first* seed of a counter, which must ride inside
+  an already-guarded commit or an un-raced setup path.
+* **A rejection is retried, not swallowed** (`grmpl-proc::Backoff`). The retry
+  rebuilds the patch from current state, which is what makes a lost race
+  re-decide rather than vanish. Backoff jitter draws no entropy from the
+  environment, so the Replay law is untouched.
+* **Reads go through a pinned `EditionReader`** (`Snapshot` holds one). Two
+  reads that must be decided together must come from **one** snapshot — a check
+  at one edition and a counter read at another is a race no precondition can
+  close.
 
 ### Catalog (`grmpl-core::Catalog`)
 
