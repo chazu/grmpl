@@ -138,7 +138,8 @@ grmpl-core ── grmpl-diff ── grmpl-proc ── grmpl-lang
      ├── grmpl-pattern ──────────┴── grmpl-lang
      └── grmpl-transport (iroh, feature-gated)
 
-grmpl-session (P3 edge crate: TCP sessions, provisioning, world verbs)
+grmpl (public runtime facade: compiled worlds, sessions, and TCP adapter;
+       source remains under crates/grmpl-session during the migration)
 grmpl-conformance (dev-only: one law suite, every substrate)
 ```
 
@@ -149,7 +150,7 @@ patch–edition law, history/consolidation, and fork identity, each against an
 independent model — and every law of the language runs through
 `grmpl-conformance`, which is what made the cutover checkable.
 
-`grmpl-session` is an **edge** crate, *not* part of the semantic core: it sits
+`grmpl` is an **edge** crate, *not* part of the semantic core: it sits
 above the bright line and wires the core to clients, so it may name a concrete
 transport (std TCP) exactly as an application would. The bright line constrains
 the core crates, not the app built on them.

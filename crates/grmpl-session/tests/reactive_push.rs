@@ -25,11 +25,10 @@
 
 use std::collections::BTreeSet;
 
-use grmpl_core::{Entity, RelId, TraceStore, Tuple, Value};
+use grmpl::{Subscription, WatchRelations};
+use grmpl_core::{Authority, DomainId, Entity, RelId, Scope, Tuple, Value, WorldStore};
 use grmpl_diff::Query;
 use grmpl_proc::decode_activation;
-use grmpl_session::world::WATCH_INBOX;
-use grmpl_session::Subscription;
 
 /// One decoded activation as observed on the wire / in the inbox: `(seq, diff,
 /// a)`.
@@ -37,6 +36,10 @@ type Act = (i64, i64, i64);
 
 // The random "world" relation the watched view reads: `(a, b)`.
 const BASE: RelId = RelId(40);
+const WATCH_INBOX: RelId = RelId(41);
+const WATCH_CURSOR: RelId = RelId(42);
+const WATCH_SEQS: RelId = RelId(43);
+const WATCH_DELIVERY: RelId = RelId(44);
 // Subscription identity: `watch` keys the durable cursors, `player` is the inbox
 // addressee. Distinct entities, so a target/watch mix-up would be caught.
 const WATCH: Entity = Entity(700);
@@ -59,12 +62,27 @@ fn view() -> Query {
 }
 
 fn subscription() -> Subscription {
-    Subscription::new(view(), WATCH, PLAYER)
+    let relations = WatchRelations {
+        inbox: WATCH_INBOX,
+        cursor: WATCH_CURSOR,
+        seqs: WATCH_SEQS,
+        delivery: WATCH_DELIVERY,
+    };
+    let authority = Authority::new(
+        DomainId(1),
+        vec![
+            Scope::whole(WATCH_INBOX),
+            Scope::whole(WATCH_CURSOR),
+            Scope::whole(WATCH_SEQS),
+            Scope::whole(WATCH_DELIVERY),
+        ],
+    );
+    Subscription::new(view(), WATCH, PLAYER, relations, authority)
 }
 
 /// Commit one world change to `BASE` (a raw store commit — the world moving,
 /// outside the pump's authority).
-fn churn(store: &dyn TraceStore, a: i64, b: i64, diff: i64) {
+fn churn(store: &dyn WorldStore, a: i64, b: i64, diff: i64) {
     store
         .commit(&[(BASE, Tuple::from([Value::Int(a), Value::Int(b)]), diff)])
         .unwrap();
@@ -73,13 +91,16 @@ fn churn(store: &dyn TraceStore, a: i64, b: i64, diff: i64) {
 /// The activations the pump has *materialized* into `PLAYER`'s durable inbox, in
 /// **seq order** (the pump's commit order): `(seq, diff, a)`. Every inbox row
 /// must be weight-1 (an exactly-once witness at the source).
-fn materialized(store: &dyn TraceStore) -> Vec<Act> {
+fn materialized(store: &dyn WorldStore) -> Vec<Act> {
     let at = store.current();
     let mut v: Vec<Act> = Vec::new();
     for (t, d) in store.read_at(WATCH_INBOX, at).unwrap() {
         let s = t.as_slice();
         if s.first() == Some(&Value::Ent(PLAYER)) {
-            assert_eq!(d, 1, "inbox row not weight-1 (duplicate materialization): {t:?}");
+            assert_eq!(
+                d, 1,
+                "inbox row not weight-1 (duplicate materialization): {t:?}"
+            );
             if let (Some(Value::Int(seq)), Some(Value::Tuple(body))) = (s.get(1), s.get(2)) {
                 let (diff, row) = decode_activation(&Tuple(body.clone())).expect("activation body");
                 let a = match row.as_slice() {
@@ -96,14 +117,16 @@ fn materialized(store: &dyn TraceStore) -> Vec<Act> {
 
 /// Parse the bytes actually written to the mock socket back into `(seq, diff,
 /// a)` — the sequence a real line client would observe. Each activation is one
-/// `"{seq} {diff} {a}"` line (see [`grmpl_session::Delivered::render`]).
+/// `"{seq} {diff} {a}"` line (see [`grmpl::Delivered::render`]).
 fn parse_socket(bytes: &[u8]) -> Vec<Act> {
     let text = std::str::from_utf8(bytes).expect("socket bytes are utf-8");
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            let toks: Vec<i64> =
-                l.split_whitespace().map(|t| t.parse().expect("numeric activation token")).collect();
+            let toks: Vec<i64> = l
+                .split_whitespace()
+                .map(|t| t.parse().expect("numeric activation token"))
+                .collect();
             assert_eq!(toks.len(), 3, "activation line has unexpected arity: {l:?}");
             (toks[0], toks[1], toks[2])
         })
@@ -115,7 +138,10 @@ fn parse_socket(bytes: &[u8]) -> Vec<Act> {
 fn assert_clean_stream(streamed: &[Act], ctx: &str) {
     let seqs: Vec<i64> = streamed.iter().map(|(s, ..)| *s).collect();
     let expected: Vec<i64> = (0..streamed.len() as i64).collect();
-    assert_eq!(seqs, expected, "{ctx}: streamed seqs not contiguous/unique (loss or duplication)");
+    assert_eq!(
+        seqs, expected,
+        "{ctx}: streamed seqs not contiguous/unique (loss or duplication)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +154,7 @@ fn assert_clean_stream(streamed: &[Act], ctx: &str) {
 /// Returns `(streamed-from-socket, materialized-inbox)`.
 fn run_delivery(case: &grmpl_conformance::Case, seed: u64) -> (Vec<Act>, Vec<Act>) {
     let sib = case.sibling();
-    let store = sib.store();
+    let store = sib.world();
     let sub = subscription();
     sub.install_including_current(store).unwrap();
 
@@ -139,7 +165,11 @@ fn run_delivery(case: &grmpl_conformance::Case, seed: u64) -> (Vec<Act>, Vec<Act
         // Small value space forces crossings of zero (real ± cancellation).
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
-        let diff = if next_rand(&mut st).is_multiple_of(2) { 1 } else { -1 };
+        let diff = if next_rand(&mut st).is_multiple_of(2) {
+            1
+        } else {
+            -1
+        };
         churn(store, a, b, diff);
         // Drain most rounds, but not always — so some drains carry a multi-delta
         // batch pumped across several churns.
@@ -161,26 +191,29 @@ fn run_delivery(case: &grmpl_conformance::Case, seed: u64) -> (Vec<Act>, Vec<Act
 #[test]
 fn delivery_is_exactly_once_and_in_order_under_random_churn() {
     grmpl_conformance::for_each_store(|c| {
-    for seed in 0..32u64 {
-        let (streamed, materialized) = run_delivery(c, seed);
+        for seed in 0..32u64 {
+            let (streamed, materialized) = run_delivery(c, seed);
 
-        // Exactly-once + in-order + no loss: the bytes on the socket are exactly
-        // the materialized inbox, in seq (commit) order.
-        assert_eq!(
-            streamed, materialized,
-            "seed {seed}: socket stream != materialized inbox (loss/dup/reorder)"
-        );
-        assert_clean_stream(&streamed, &format!("seed {seed}"));
+            // Exactly-once + in-order + no loss: the bytes on the socket are exactly
+            // the materialized inbox, in seq (commit) order.
+            assert_eq!(
+                streamed, materialized,
+                "seed {seed}: socket stream != materialized inbox (loss/dup/reorder)"
+            );
+            assert_clean_stream(&streamed, &format!("seed {seed}"));
 
-        // Replay determinism: the same committed churn reproduces the identical
-        // socket stream (the pump and drain read no clock/random — pure functions
-        // of the committed trace). Checked on a subset — each replay is a full
-        // fjall store — since the law above already runs on every seed.
-        if seed < 8 {
-            let (streamed2, _) = run_delivery(c, seed);
-            assert_eq!(streamed, streamed2, "seed {seed}: delivery is not replay-deterministic");
+            // Replay determinism: the same committed churn reproduces the identical
+            // socket stream (the pump and drain read no clock/random — pure functions
+            // of the committed trace). Checked on a subset — each replay is a full
+            // fjall store — since the law above already runs on every seed.
+            if seed < 8 {
+                let (streamed2, _) = run_delivery(c, seed);
+                assert_eq!(
+                    streamed, streamed2,
+                    "seed {seed}: delivery is not replay-deterministic"
+                );
+            }
         }
-    }
     });
 }
 
@@ -196,7 +229,7 @@ fn delivery_is_exactly_once_and_in_order_under_random_churn() {
 /// truth), all separately.
 fn run_resume(case: &grmpl_conformance::Case, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<Act>) {
     let sib = case.sibling();
-    let store = sib.store();
+    let store = sib.world();
     let mut st = seed ^ 0x1234_5678_9ABC_DEF0;
 
     // ---- connection A ----
@@ -208,7 +241,11 @@ fn run_resume(case: &grmpl_conformance::Case, seed: u64) -> (Vec<u8>, Vec<u8>, V
     for _ in 0..a_rounds {
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
-        let diff = if next_rand(&mut st).is_multiple_of(2) { 1 } else { -1 };
+        let diff = if next_rand(&mut st).is_multiple_of(2) {
+            1
+        } else {
+            -1
+        };
         churn(store, a, b, diff);
         if !next_rand(&mut st).is_multiple_of(3) {
             sub_a.pump_and_drain(store, &mut socket_a).unwrap();
@@ -219,25 +256,36 @@ fn run_resume(case: &grmpl_conformance::Case, seed: u64) -> (Vec<u8>, Vec<u8>, V
     for _ in 0..(3 + (next_rand(&mut st) % 6)) {
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
-        let diff = if next_rand(&mut st).is_multiple_of(2) { 1 } else { -1 };
+        let diff = if next_rand(&mut st).is_multiple_of(2) {
+            1
+        } else {
+            -1
+        };
         churn(store, a, b, diff);
     }
     sub_a.pump(store).unwrap(); // materialize; delivery cursor NOT advanced
-    // "disconnect": A goes away with undrained activations pending.
+                                // "disconnect": A goes away with undrained activations pending.
     drop(sub_a);
 
     // ---- connection B (reconnect) ----
     // A brand-new subscription over the SAME store + watch identity. It must NOT
     // reinstall (that would double the on-watch cursor); it just resumes.
     let sub_b = subscription();
-    assert!(sub_b.is_installed(store).unwrap(), "seed {seed}: watch should already be installed");
+    assert!(
+        sub_b.is_installed(store).unwrap(),
+        "seed {seed}: watch should already be installed"
+    );
     let mut socket_b: Vec<u8> = Vec::new();
 
     let b_rounds = 10 + (next_rand(&mut st) % 15) as i64;
     for _ in 0..b_rounds {
         let a = (next_rand(&mut st) % 4) as i64;
         let b = (next_rand(&mut st) % 3) as i64;
-        let diff = if next_rand(&mut st).is_multiple_of(2) { 1 } else { -1 };
+        let diff = if next_rand(&mut st).is_multiple_of(2) {
+            1
+        } else {
+            -1
+        };
         churn(store, a, b, diff);
         if !next_rand(&mut st).is_multiple_of(3) {
             sub_b.pump_and_drain(store, &mut socket_b).unwrap();
@@ -246,7 +294,10 @@ fn run_resume(case: &grmpl_conformance::Case, seed: u64) -> (Vec<u8>, Vec<u8>, V
     // Final drain on B so everything materialized has been streamed.
     sub_b.pump_and_drain(store, &mut socket_b).unwrap();
     assert!(
-        sub_b.pump_and_drain(store, &mut socket_b).unwrap().is_empty(),
+        sub_b
+            .pump_and_drain(store, &mut socket_b)
+            .unwrap()
+            .is_empty(),
         "seed {seed}: B not caught up after final drain"
     );
 
@@ -297,7 +348,7 @@ fn durable_resume_across_reconnect_never_loses_or_duplicates() {
 fn witness_skip_initial_then_pushes_a_change() {
     grmpl_conformance::for_each_store(|_c| {
         grmpl_conformance::for_each_store(|c| {
-            let store = c.store();
+            let store = c.world();
             churn(store, 1, 10, 1); // pre-existing (would be the initial snapshot)
 
             let sub = subscription();
@@ -324,7 +375,7 @@ fn witness_skip_initial_then_pushes_a_change() {
 fn witness_reconnect_resumes_from_cursor() {
     grmpl_conformance::for_each_store(|_c| {
         grmpl_conformance::for_each_store(|c| {
-            let store = c.store();
+            let store = c.world();
             let sub_a = subscription();
             sub_a.install(store).unwrap();
 

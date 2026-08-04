@@ -10,6 +10,7 @@ name = "grmpl"
 path = "src/main.rs"
 
 [dependencies]
+grmpl = { path = "../grmpl-session" }
 grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }

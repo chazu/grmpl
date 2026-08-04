@@ -3,7 +3,8 @@
 //! One connection = one player. The first line is the login name (minimal
 //! auth); each subsequent line is a command, whose resulting `TELL` text is
 //! written straight back. Each connection runs on its own thread; the session
-//! engine serializes their commits behind its single writer.
+//! engine resolves concurrent commits through the runtime's guarded optimistic
+//! protocol.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -48,7 +49,12 @@ fn handle(server: Arc<Server>, stream: TcpStream) -> std::io::Result<()> {
             return Ok(());
         }
     };
-    writeln!(writer, "Welcome, {}. You are entity {}.", name, session.player().0)?;
+    writeln!(
+        writer,
+        "Welcome, {}. You are entity {}.",
+        name,
+        session.player().0
+    )?;
     writer.flush()?;
 
     // The command loop: one line in, its told-text out.

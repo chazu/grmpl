@@ -28,12 +28,21 @@
 use std::io::Write;
 
 use grmpl_core::{
-    CursorMove, Edition, Entity, Error, Fact, NoSchemas, Patch, Result, TraceStore, Tuple, Value,
+    Authority, CursorMove, Edition, Entity, Error, Fact, Patch, RelId, Result, Tuple, Value,
+    WorldStore,
 };
 use grmpl_diff::Query;
 use grmpl_proc::{commit_patch, decode_activation, CommitOutcome, OnWatch};
 
-use crate::world::{watch_authority, WATCH_CURSOR, WATCH_DELIVERY, WATCH_INBOX, WATCH_SEQS};
+/// Relations that make one reactive subscription durable. They are resolved
+/// from the world program rather than fixed by the client adapter.
+#[derive(Clone, Copy, Debug)]
+pub struct WatchRelations {
+    pub inbox: RelId,
+    pub cursor: RelId,
+    pub seqs: RelId,
+    pub delivery: RelId,
+}
 
 /// One activation handed to the socket: the signed view delta `diff` on `row`,
 /// at its durable inbox position `seq`. The full Z-weight `diff` is preserved
@@ -72,6 +81,7 @@ impl Delivered {
 /// it — so the same `watch` across a reconnect resumes the same durable stream.
 pub struct Subscription {
     on_watch: OnWatch,
+    relations: WatchRelations,
 }
 
 impl Subscription {
@@ -80,17 +90,35 @@ impl Subscription {
     /// for one subscription per player, or a distinct entity per view for
     /// several. Does not install — call [`install`](Self::install) or
     /// [`install_including_current`](Self::install_including_current) once.
-    pub fn new(view: Query, watch: Entity, player: Entity) -> Subscription {
+    pub fn new(
+        view: Query,
+        watch: Entity,
+        player: Entity,
+        relations: WatchRelations,
+        authority: Authority,
+    ) -> Subscription {
         Subscription {
             on_watch: OnWatch {
                 view,
                 watch,
                 target: player,
-                inbox: WATCH_INBOX,
-                cursor_rel: WATCH_CURSOR,
-                seqs: WATCH_SEQS,
-                authority: watch_authority(),
+                inbox: relations.inbox,
+                cursor_rel: relations.cursor,
+                seqs: relations.seqs,
+                authority,
             },
+            relations,
+        }
+    }
+
+    /// Wrap an `OnWatch` lowered from the world program.
+    pub fn from_watch(on_watch: OnWatch, relations: WatchRelations) -> Subscription {
+        debug_assert_eq!(on_watch.inbox, relations.inbox);
+        debug_assert_eq!(on_watch.cursor_rel, relations.cursor);
+        debug_assert_eq!(on_watch.seqs, relations.seqs);
+        Subscription {
+            on_watch,
+            relations,
         }
     }
 
@@ -101,20 +129,20 @@ impl Subscription {
 
     /// Whether this subscription's on-watch is already installed (its durable
     /// pump cursor exists). Lets a reconnect skip a duplicate install.
-    pub fn is_installed(&self, store: &dyn TraceStore) -> Result<bool> {
+    pub fn is_installed(&self, store: &dyn WorldStore) -> Result<bool> {
         Ok(self.on_watch.cursor(store)?.is_some())
     }
 
     /// Install **skip-initial** (the default): only view changes committed after
     /// this call are delivered. A one-time setup commit — not meant to be raced.
-    pub fn install(&self, store: &dyn TraceStore) -> Result<CommitOutcome> {
-        self.on_watch.install(store, &NoSchemas)
+    pub fn install(&self, store: &dyn WorldStore) -> Result<CommitOutcome> {
+        self.on_watch.install(store, store)
     }
 
     /// Install **`including current`**: the first pump delivers the whole current
     /// view as `+` rows (the initial snapshot) before streaming deltas.
-    pub fn install_including_current(&self, store: &dyn TraceStore) -> Result<CommitOutcome> {
-        self.on_watch.install_including_current(store, &NoSchemas)
+    pub fn install_including_current(&self, store: &dyn WorldStore) -> Result<CommitOutcome> {
+        self.on_watch.install_including_current(store, store)
     }
 
     /// Pump the view once: materialize the deltas produced since the durable
@@ -123,8 +151,8 @@ impl Subscription {
     /// appended. Draining them to the socket is a separate, later step, so an
     /// activation can be materialized (durable) yet not-yet-delivered — the state
     /// a mid-stream disconnect leaves behind.
-    pub fn pump(&self, store: &dyn TraceStore) -> Result<usize> {
-        self.on_watch.pump(store, &NoSchemas)
+    pub fn pump(&self, store: &dyn WorldStore) -> Result<usize> {
+        self.on_watch.pump(store, store)
     }
 
     /// Pump the view (materialize any new deltas as durable inbox messages),
@@ -132,19 +160,19 @@ impl Subscription {
     /// Returns the activations streamed, in delivery order.
     pub fn pump_and_drain(
         &self,
-        store: &dyn TraceStore,
+        store: &dyn WorldStore,
         out: &mut dyn Write,
     ) -> Result<Vec<Delivered>> {
-        self.on_watch.pump(store, &NoSchemas)?;
+        self.on_watch.pump(store, store)?;
         self.drain(store, out)
     }
 
     /// The exclusive inbox frontier the socket has already consumed (`0` if no
     /// [`WATCH_DELIVERY`] row exists — the delivery cursor is only ever written
     /// forward, so a stored value is always `>= 1`, and `0` means "absent").
-    pub fn delivered_through(&self, store: &dyn TraceStore) -> Result<i64> {
+    pub fn delivered_through(&self, store: &dyn WorldStore) -> Result<i64> {
         let at = store.current();
-        for (t, d) in store.read_at(WATCH_DELIVERY, at)? {
+        for (t, d) in store.read_at(self.relations.delivery, at)? {
             let s = t.as_slice();
             if d > 0 && s.first() == Some(&Value::Ent(self.on_watch.watch)) {
                 if let Some(Value::Int(next)) = s.get(1) {
@@ -177,7 +205,7 @@ impl Subscription {
     /// this one first — which is the same at-least-once boundary a crash between
     /// the write and the cursor advance produces, and is why the delivery
     /// guarantee is stated that way.
-    pub fn drain(&self, store: &dyn TraceStore, out: &mut dyn Write) -> Result<Vec<Delivered>> {
+    pub fn drain(&self, store: &dyn WorldStore, out: &mut dyn Write) -> Result<Vec<Delivered>> {
         let mut policy = grmpl_proc::Backoff::default();
         loop {
             match self.drain_once(store, out)? {
@@ -197,20 +225,24 @@ impl Subscription {
     /// moved it under us — and the caller should re-read and try again.
     fn drain_once(
         &self,
-        store: &dyn TraceStore,
+        store: &dyn WorldStore,
         out: &mut dyn Write,
     ) -> Result<Option<Vec<Delivered>>> {
         let from = self.delivered_through(store)?;
         let at = store.current();
 
         let mut pending: Vec<Delivered> = Vec::new();
-        for (t, d) in store.read_at(WATCH_INBOX, at)? {
+        for (t, d) in store.read_at(self.relations.inbox, at)? {
             let s = t.as_slice();
             if d > 0 && s.first() == Some(&Value::Ent(self.on_watch.target)) {
                 if let (Some(Value::Int(seq)), Some(Value::Tuple(body))) = (s.get(1), s.get(2)) {
                     if *seq >= from {
                         if let Some((diff, row)) = decode_activation(&Tuple(body.clone())) {
-                            pending.push(Delivered { seq: *seq, diff, row });
+                            pending.push(Delivered {
+                                seq: *seq,
+                                diff,
+                                row,
+                            });
                         }
                     }
                 }
@@ -243,14 +275,17 @@ impl Subscription {
         let next = from + pending.len() as i64;
         let mut patch = Patch::new();
         if from > 0 {
-            patch = patch.expect(Fact::new(WATCH_DELIVERY, self.delivery_tuple(from)));
+            patch = patch.expect(Fact::new(
+                self.relations.delivery,
+                self.delivery_tuple(from),
+            ));
         }
         patch = patch.advance_cursor(CursorMove {
-            rel: WATCH_DELIVERY,
+            rel: self.relations.delivery,
             retract: (from > 0).then(|| self.delivery_tuple(from)),
             assert: self.delivery_tuple(next),
         });
-        match commit_patch(store, &NoSchemas, &patch, &self.on_watch.authority)? {
+        match commit_patch(store, store, &patch, &self.on_watch.authority)? {
             CommitOutcome::Committed(_) => Ok(Some(pending)),
             // A peer sharing this watch identity advanced the cursor first.
             CommitOutcome::Rejected => Ok(None),
@@ -259,9 +294,13 @@ impl Subscription {
 }
 
 /// The edition the on-watch pump has delivered through, for observers/tests.
-pub fn watch_cursor(store: &dyn TraceStore, watch: Entity) -> Result<Option<Edition>> {
+pub fn watch_cursor(
+    store: &dyn WorldStore,
+    cursor_rel: RelId,
+    watch: Entity,
+) -> Result<Option<Edition>> {
     let at = store.current();
-    for (t, d) in store.read_at(WATCH_CURSOR, at)? {
+    for (t, d) in store.read_at(cursor_rel, at)? {
         let s = t.as_slice();
         if d > 0 && s.first() == Some(&Value::Ent(watch)) {
             if let Some(Value::Int(e)) = s.get(1) {

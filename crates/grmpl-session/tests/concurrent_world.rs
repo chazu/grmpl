@@ -26,22 +26,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 
-use grmpl_core::{Entity, TraceStore, Value};
-use grmpl_session::world::{HELD, LOCATED, NAMED, PLAYER};
-use grmpl_session::Server;
+mod common;
 
-fn server(case: &grmpl_conformance::Case) -> Arc<Server> {
-    let store: Arc<dyn TraceStore> = case.trace();
-    let server = Server::new(store);
-    server.init().unwrap();
-    server
-}
+use grmpl_core::{Entity, RelId, TraceStore, Value};
 
 /// Every entity that carries a `NAMED` row, with its name.
-fn named(store: &dyn TraceStore) -> Vec<(Entity, String)> {
+fn named(store: &dyn TraceStore, relation: RelId) -> Vec<(Entity, String)> {
     let at = store.current();
     store
-        .read_at(NAMED, at)
+        .read_at(relation, at)
         .unwrap()
         .into_iter()
         .filter(|(_, d)| *d > 0)
@@ -56,7 +49,8 @@ fn named(store: &dyn TraceStore) -> Vec<(Entity, String)> {
 #[test]
 fn concurrent_builders_never_collide_on_an_entity_id() {
     grmpl_conformance::for_each_store(|c| {
-        let server = server(c);
+        let server = common::server(c);
+        let rels = server.world().relations();
         const BUILDERS: usize = 4;
         const EACH: usize = 5;
 
@@ -77,8 +71,8 @@ fn concurrent_builders_never_collide_on_an_entity_id() {
             }
         });
 
-        let store = Arc::clone(server.store());
-        let rows = named(&*store);
+        let store = server.store();
+        let rows = named(&*store, rels.named);
 
         // Every created thing is present, exactly once.
         for b in 0..BUILDERS {
@@ -121,7 +115,8 @@ fn concurrent_logins_of_one_name_bind_exactly_one_player() {
         const CONNECTIONS: usize = 8;
         const NAMES: usize = 4;
 
-        let server = server(c);
+        let server = common::server(c);
+        let rels = server.world().relations();
         let mut all: HashSet<Entity> = HashSet::new();
 
         for round in 0..NAMES {
@@ -154,10 +149,10 @@ fn concurrent_logins_of_one_name_bind_exactly_one_player() {
 
             // And the world holds exactly one PLAYER row for that name — the
             // losers adopted the winner's identity, they did not each spawn one.
-            let store = Arc::clone(server.store());
+            let store = server.store();
             let at = store.current();
             let bound: Vec<Entity> = store
-                .read_at(PLAYER, at)
+                .read_at(rels.players, at)
                 .unwrap()
                 .into_iter()
                 .filter(|(t, d)| *d > 0 && t.as_slice().get(1) == Some(&Value::text(&name)))
@@ -166,12 +161,20 @@ fn concurrent_logins_of_one_name_bind_exactly_one_player() {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(bound, vec![players[0]], "exactly one durable PLAYER binding for `{name}`");
+            assert_eq!(
+                bound,
+                vec![players[0]],
+                "exactly one durable PLAYER binding for `{name}`"
+            );
             all.extend(distinct);
         }
 
         // Each name got its own player, and no id was reused across names.
-        assert_eq!(all.len(), NAMES, "one identity per name, all distinct: {all:?}");
+        assert_eq!(
+            all.len(),
+            NAMES,
+            "one identity per name, all distinct: {all:?}"
+        );
 
         // Distinct names still get distinct players on the ordinary path.
         let a = server.login("norah").unwrap().player();
@@ -185,16 +188,20 @@ fn concurrent_logins_of_one_name_bind_exactly_one_player() {
 #[test]
 fn racing_clients_yield_exactly_one_taker_and_no_silent_losers() {
     grmpl_conformance::for_each_store(|c| {
-        let server = server(c);
+        let server = common::server(c);
+        let rels = server.world().relations();
 
         // Build the room and the lamp through a client, as P3 requires.
         let mut builder = server.login("builder").unwrap();
         assert_eq!(builder.submit("dig hall").unwrap(), vec!["Dug hall."]);
-        assert_eq!(builder.submit("go hall").unwrap(), vec!["You move."]);
-        assert_eq!(builder.submit("create lamp").unwrap(), vec!["Created lamp."]);
+        assert_eq!(builder.submit("go hall").unwrap(), vec!["You go."]);
+        assert_eq!(
+            builder.submit("create lamp").unwrap(),
+            vec!["Created lamp."]
+        );
 
-        let store = Arc::clone(server.store());
-        let lamp = named(&*store)
+        let store = server.store();
+        let lamp = named(&*store, rels.named)
             .into_iter()
             .find(|(_, n)| n == "lamp")
             .map(|(e, _)| e)
@@ -205,7 +212,7 @@ fn racing_clients_yield_exactly_one_taker_and_no_silent_losers() {
         let mut sessions: Vec<_> = (0..RACERS)
             .map(|i| {
                 let mut s = server.login(&format!("racer{i}")).unwrap();
-                assert_eq!(s.submit("go hall").unwrap(), vec!["You move."]);
+                assert_eq!(s.submit("go hall").unwrap(), vec!["You go."]);
                 s
             })
             .collect();
@@ -218,7 +225,10 @@ fn racing_clients_yield_exactly_one_taker_and_no_silent_losers() {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        let winners = results.iter().filter(|r| r.iter().any(|l| l == "Taken.")).count();
+        let winners = results
+            .iter()
+            .filter(|r| r.iter().any(|l| l == "Taken."))
+            .count();
         assert_eq!(winners, 1, "exactly one taker: {results:?}");
 
         // No loser is silent. The retry re-runs the behavior against the winner's
@@ -226,13 +236,16 @@ fn racing_clients_yield_exactly_one_taker_and_no_silent_losers() {
         // landed, a lost race left the command unconsumed and the client with
         // nothing at all.
         for r in &results {
-            assert!(!r.is_empty(), "no client is left without a reply: {results:?}");
+            assert!(
+                !r.is_empty(),
+                "no client is left without a reply: {results:?}"
+            );
         }
 
         // World invariant: one holder, and the lamp left the floor.
         let at = store.current();
         let held: Vec<Entity> = store
-            .read_at(HELD, at)
+            .read_at(rels.held, at)
             .unwrap()
             .into_iter()
             .filter(|(t, d)| *d > 0 && t.as_slice().get(1) == Some(&Value::Ent(lamp)))
@@ -243,7 +256,7 @@ fn racing_clients_yield_exactly_one_taker_and_no_silent_losers() {
             .collect();
         assert_eq!(held.len(), 1, "exactly one owner holds the lamp");
         let on_floor = store
-            .read_at(LOCATED, at)
+            .read_at(rels.located, at)
             .unwrap()
             .into_iter()
             .any(|(t, d)| d > 0 && t.as_slice().first() == Some(&Value::Ent(lamp)));

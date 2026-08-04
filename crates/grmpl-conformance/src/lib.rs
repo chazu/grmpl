@@ -27,15 +27,9 @@
 
 use std::sync::Arc;
 
-use grmpl_core::{Catalog, SchemaCatalog, TraceStore};
+use grmpl_core::{Catalog, SchemaCatalog, TraceStore, WorldStore};
 use grmpl_ent::EntStore;
 use tempfile::TempDir;
-
-/// Everything a world needs from its substrate: the edition/tuple trace, the
-/// durable name catalog, and the edition-versioned schema registry. Both
-/// implementations provide all three, so a law may use any of them.
-pub trait WorldStore: TraceStore + Catalog + SchemaCatalog {}
-impl<T: TraceStore + Catalog + SchemaCatalog> WorldStore for T {}
 
 /// One substrate under test: a named store in its own fresh directory.
 ///

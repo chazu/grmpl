@@ -37,11 +37,14 @@ rel sum15three(a: Int, b: Int, c: Int)       // value triples that total 15 (all
 rel tell(player: Ent, text: Text)           // outbound text to a client
 rel inbox(process: Ent, seq: Int, body: Tuple)  // per-player command inbox
 rel cursor(process: Ent, pos: Int)              // inbox read cursor
+rel inbox_seq(process: Ent, n: Int)             // durable command sequence allocator
+rel entity_seq(n: Int)                          // durable entity allocator
 
 // on-watch reactive plumbing (named here so the `on watch` handler can wire them)
 rel wmail(who: Ent, seq: Int, body: Tuple)  // activation inbox
 rel wcursor(watch: Ent, edition: Int)       // durable exactly-once watch cursor
-rel wseq(inbox: Ent, target: Ent, n: Int)   // shared activation seq counter
+rel wseq(inbox: Int, target: Ent, n: Int)   // shared activation seq counter
+rel wdelivery(watch: Ent, n: Int)           // durable client-delivery cursor
 
 // ---- views: reading the world is just a query ------------------------------
 

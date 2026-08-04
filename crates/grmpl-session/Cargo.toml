@@ -1,14 +1,15 @@
 [package]
-name = "grmpl-session"
+name = "grmpl"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Client sessions & world construction (P3): replay-safe entity allocation, provisioning (connection -> player Process spawned as a commit), dig/create verbs as ordinary patches, and a line-based TCP session layer. An edge crate above the semantic core — it may name std TCP, but the semantic core does not."
+description = "The public grmpl runtime facade: compile a language-defined world, bind it to a durable substrate, and drive it through terminal, TCP, or embedded Rust adapters."
 
 [dependencies]
 grmpl-ent = { path = "../grmpl-ent" }
 grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
+grmpl-lang = { path = "../grmpl-lang" }
 grmpl-pattern = { path = "../grmpl-pattern" }
 grmpl-proc = { path = "../grmpl-proc" }
 

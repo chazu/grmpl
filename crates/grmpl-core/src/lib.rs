@@ -25,7 +25,9 @@ pub use error::{Error, Result};
 pub use fact::Fact;
 pub use patch::{CursorMove, Message, Patch, Scheduled};
 pub use schema::{Column, Schema, Ty};
-pub use store::{Catalog, EditionReader, EditionStore, NoSchemas, SchemaCatalog, TraceStore};
+pub use store::{
+    Catalog, EditionReader, EditionStore, NoSchemas, SchemaCatalog, TraceStore, WorldStore,
+};
 pub use transport::Transport;
 pub use time::{Diff, Edition, Time, Update};
 pub use value::{DomainId, Entity, RelId, Tuple, Value};

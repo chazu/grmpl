@@ -1066,6 +1066,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "grmpl"
+version = "0.0.1"
+dependencies = [
+ "grmpl-conformance",
+ "grmpl-core",
+ "grmpl-diff",
+ "grmpl-ent",
+ "grmpl-lang",
+ "grmpl-pattern",
+ "grmpl-proc",
+ "tempfile",
+]
+
+[[package]]
 name = "grmpl-bench"
 version = "0.0.1"
 dependencies = [
@@ -1080,6 +1094,7 @@ dependencies = [
 name = "grmpl-cli"
 version = "0.0.1"
 dependencies = [
+ "grmpl",
  "grmpl-conformance",
  "grmpl-core",
  "grmpl-diff",
@@ -1117,10 +1132,10 @@ name = "grmpl-ent"
 version = "0.0.1"
 dependencies = [
  "fjall",
+ "grmpl",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-proc",
- "grmpl-session",
  "tempfile",
 ]
 
@@ -1152,19 +1167,6 @@ dependencies = [
  "grmpl-diff",
  "grmpl-pattern",
  "grmpl-transport",
- "tempfile",
-]
-
-[[package]]
-name = "grmpl-session"
-version = "0.0.1"
-dependencies = [
- "grmpl-conformance",
- "grmpl-core",
- "grmpl-diff",
- "grmpl-ent",
- "grmpl-pattern",
- "grmpl-proc",
  "tempfile",
 ]
 

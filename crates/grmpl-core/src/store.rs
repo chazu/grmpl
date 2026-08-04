@@ -400,6 +400,16 @@ pub trait SchemaCatalog: Send + Sync {
     fn schema_at(&self, rel: RelId, at: Edition) -> Result<Option<Schema>>;
 }
 
+/// Everything the public world runtime needs from a substrate: the editioned
+/// tuple trace, durable relation-name catalog, and edition-versioned schemas.
+///
+/// Keeping this bundle in core lets the runtime accept one store handle without
+/// naming the Ent implementation, while the three constituent interfaces remain
+/// independently usable by lower modules.
+pub trait WorldStore: TraceStore + Catalog + SchemaCatalog {}
+
+impl<T: TraceStore + Catalog + SchemaCatalog> WorldStore for T {}
+
 /// A no-op [`SchemaCatalog`] for callers that have no schema registry — every
 /// relation reads as unregistered, so commit-boundary enforcement is a pass
 /// (schemas are opt-in). Registering into it is an error: it has nowhere to

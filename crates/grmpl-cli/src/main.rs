@@ -2,9 +2,12 @@
 //!
 //! * `grmpl run [WORLD.grmpl] [STORE_DIR]` — stand up a language-defined world
 //!   and play it from an interactive REPL.
+//! * `grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]` — expose that same world
+//!   through the TCP session adapter.
 //! * `grmpl showcase` — a narrated tour of the substrate's distinctive features.
 
 mod run;
+mod serve;
 mod showcase;
 
 const USAGE: &str = "\
@@ -15,6 +18,10 @@ USAGE:
                                           open an interactive REPL. With no WORLD
                                           the built-in MOO is used; with no
                                           STORE_DIR a fresh temporary store.
+    grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]
+                                          Serve the same runtime over TCP.
+                                          Defaults to the built-in MOO,
+                                          .grmpl/moo, and 127.0.0.1:7777.
     grmpl showcase                        Run a narrated tour of the substrate's
                                           distinctive features.
     grmpl help                            Show this help.
@@ -26,6 +33,11 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let result = match cmd {
         "run" => run::run(args.get(1).cloned(), args.get(2).cloned()),
+        "serve" => serve::run(
+            args.get(1).cloned(),
+            args.get(2).cloned(),
+            args.get(3).cloned(),
+        ),
         "showcase" => showcase::run(),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");

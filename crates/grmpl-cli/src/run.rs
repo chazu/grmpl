@@ -15,89 +15,40 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use grmpl_core::{
-    Authority, Column, DomainId, Diff, Edition, EditionStore, Entity, RelId, Schema,
-    SchemaCatalog, Scope, Ty, TraceStore,
-    Tuple, Value,
+use grmpl::moo::{
+    CAT, INSTANCE_BASE, INSTANCE_STRIDE, OBSERVATORY, PLAYER, VAULT_ANTE, VAULT_BASE, VAULT_SPAN,
 };
-use grmpl_diff::Snapshot;
-use grmpl_lang::Program;
-use grmpl_proc::{decode_activation, enqueue, OnWatch, Process};
+use grmpl::{MooRelations as Rels, MooRuntime};
+use grmpl_core::{
+    Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value, WorldStore,
+};
 use grmpl_ent::EntStore;
-
-const BUILTIN_MOO: &str = include_str!("../../../worlds/moo.grmpl");
-
-// Entities ------------------------------------------------------------------
-const PLAYER: Entity = Entity(1);
-// Rooms
-const FOYER: Entity = Entity(10);
-const LIBRARY: Entity = Entity(11);
-const GARDEN: Entity = Entity(12);
-const MARKET: Entity = Entity(13);
-const OBSERVATORY: Entity = Entity(14);
-const KITCHEN: Entity = Entity(15);
-// Things
-const LAMP: Entity = Entity(20);
-const KEY: Entity = Entity(21);
-const BOOK: Entity = Entity(22);
-const ROSE: Entity = Entity(23);
-const COIN: Entity = Entity(24);
-const CAKE: Entity = Entity(25);
-// NPCs
-const CAT: Entity = Entity(30);
-const MERCHANT: Entity = Entity(31);
-
-// The vault TEMPLATE — a self-contained sub-world in the id block
-// [VAULT_BASE, VAULT_BASE+VAULT_SPAN). It is never entered directly; `enter vault`
-// relocates it (DSP `apply_all`) into a fresh instance block, one per visit, so
-// every player explores a private disjoint copy.
-const VAULT_BASE: u64 = 1000;
-const VAULT_SPAN: u64 = 10;
-const VAULT_ANTE: Entity = Entity(1000);
-const VAULT_INNER: Entity = Entity(1001);
-const VAULT_TORCH: Entity = Entity(1002);
-const VAULT_GEM: Entity = Entity(1003);
-// Instances live far above the manor: block k = [INSTANCE_BASE + k·STRIDE, …).
-const INSTANCE_BASE: u64 = 100_000;
-const INSTANCE_STRIDE: u64 = 1_000;
-
-/// The cat's patrol loop (each `tick` follows one edge).
-const PATROL: [(Entity, Entity); 4] = [
-    (FOYER, LIBRARY),
-    (LIBRARY, GARDEN),
-    (GARDEN, MARKET),
-    (MARKET, FOYER),
-];
+use grmpl_proc::{decode_activation, OnWatch, Process};
 
 pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), String> {
     let src = match &world {
         Some(path) => {
             std::fs::read_to_string(path).map_err(|e| format!("cannot read world `{path}`: {e}"))?
         }
-        None => BUILTIN_MOO.to_string(),
+        None => grmpl::moo::SOURCE.to_string(),
     };
     // Open the world *first*, then compile against its durable catalog: names
     // resolve to the ids the store already bound, so a relation keeps its id
     // across reopens however the source is later reordered. Compiling first and
     // ignoring the catalog would have made the ids a function of source layout.
-    let store = open_store(store_dir.as_deref())?;
-    let prog = Arc::new(Program::compile_with_catalog(&src, &store, 1)?);
-    let r = Rels::resolve(&prog)?;
-    declare_schemas(&store, &r)?;
-    seed_world(&store, &r)?;
-    seed_rules(&store, &r)?;
-
-    let player = process(&prog, &r, PLAYER, player_authority(&r))?;
-    let cat = process(&prog, &r, CAT, npc_authority(&r))?;
+    let store = Arc::new(open_store(store_dir.as_deref())?);
+    let shared: Arc<dyn WorldStore> = store.clone();
+    let runtime = MooRuntime::compile(shared, &src)?;
+    let r = runtime.relations();
+    let player = runtime.player_process(PLAYER)?;
+    let cat = runtime.patrol_process(CAT)?;
 
     let mut repl = Repl {
-        prog: &prog,
+        world: &runtime,
         store: &store,
         r,
         player,
         cat,
-        player_seq: 0,
-        cat_seq: 0,
         out_cursor: store.current(),
         watch: None,
         delivered: 0,
@@ -109,31 +60,6 @@ pub fn run(world: Option<String>, store_dir: Option<String>) -> Result<(), Strin
     repl.loop_forever()
 }
 
-/// Declare the shapes of the world relations whose columns are unambiguous, so
-/// the commit boundary type-checks every fact the MOO writes.
-///
-/// Schemas are opt-in per relation: an unregistered relation is unchecked, so
-/// this is a real check on the ones named here rather than an all-or-nothing
-/// switch. `put_schema` is idempotent, so re-running `grmpl run` on an existing
-/// world is a no-op.
-fn declare_schemas(store: &EntStore, r: &Rels) -> Result<(), String> {
-    let at = Edition(store.current().0 + 1);
-    let decl: [(RelId, &[(&str, Ty)]); 7] = [
-        (r.located, &[("thing", Ty::Ent), ("place", Ty::Ent)]),
-        (r.named, &[("thing", Ty::Ent), ("name", Ty::Text)]),
-        (r.held, &[("owner", Ty::Ent), ("thing", Ty::Ent)]),
-        (r.exits, &[("from", Ty::Ent), ("way", Ty::Text), ("to", Ty::Ent)]),
-        (r.players, &[("who", Ty::Ent)]),
-        (r.value, &[("thing", Ty::Ent), ("coins", Ty::Int)]),
-        (r.patrol, &[("from", Ty::Ent), ("to", Ty::Ent)]),
-    ];
-    for (rel, cols) in decl {
-        let schema = Schema::new(cols.iter().map(|(n, t)| Column::new(*n, *t)).collect());
-        store.put_schema(rel, &schema, at).map_err(err)?;
-    }
-    Ok(())
-}
-
 fn open_store(dir: Option<&str>) -> Result<EntStore, String> {
     let path = match dir {
         Some(d) => std::path::PathBuf::from(d),
@@ -143,263 +69,14 @@ fn open_store(dir: Option<&str>) -> Result<EntStore, String> {
 }
 
 // ===========================================================================
-// Relation handles
-// ===========================================================================
-struct Rels {
-    located: RelId,
-    named: RelId,
-    held: RelId,
-    exits: RelId,
-    players: RelId,
-    value: RelId,
-    person: RelId,
-    label: RelId,
-    knows: RelId,
-    patrol: RelId,
-    card: RelId,
-    cardval: RelId,
-    cardrank: RelId,
-    slotpair: RelId,
-    slottrio: RelId,
-    sum15two: RelId,
-    sum15three: RelId,
-    tell: RelId,
-    inbox: RelId,
-    cursor: RelId,
-    wmail: RelId,
-    wcursor: RelId,
-    wseq: RelId,
-}
-
-impl Rels {
-    fn resolve(prog: &Program) -> Result<Rels, String> {
-        let g = |n: &str| prog.rel_id(n).ok_or_else(|| format!("world has no `rel {n}`"));
-        Ok(Rels {
-            located: g("located")?,
-            named: g("named")?,
-            held: g("held")?,
-            exits: g("exits")?,
-            players: g("players")?,
-            value: g("value")?,
-            person: g("person")?,
-            label: g("label")?,
-            knows: g("knows")?,
-            patrol: g("patrol")?,
-            card: g("card")?,
-            cardval: g("cardval")?,
-            cardrank: g("cardrank")?,
-            slotpair: g("slotpair")?,
-            slottrio: g("slottrio")?,
-            sum15two: g("sum15two")?,
-            sum15three: g("sum15three")?,
-            tell: g("tell")?,
-            inbox: g("inbox")?,
-            cursor: g("cursor")?,
-            wmail: g("wmail")?,
-            wcursor: g("wcursor")?,
-            wseq: g("wseq")?,
-        })
-    }
-}
-
-fn player_authority(r: &Rels) -> Authority {
-    Authority::new(
-        DomainId(1),
-        vec![
-            Scope::whole(r.located),
-            Scope::whole(r.held),
-            Scope::whole(r.knows),
-            Scope::whole(r.tell),
-            Scope::whole(r.cursor),
-        ],
-    )
-}
-
-fn npc_authority(r: &Rels) -> Authority {
-    Authority::new(DomainId(1), vec![Scope::whole(r.located), Scope::whole(r.cursor)])
-}
-
-fn process(
-    prog: &Arc<Program>,
-    r: &Rels,
-    who: Entity,
-    authority: Authority,
-) -> Result<Process, String> {
-    Ok(Process {
-        entity: who,
-        authority,
-        inbox: r.inbox,
-        cursor_rel: r.cursor,
-        behavior: Program::behavior(prog, "inbox", who)?,
-    })
-}
-
-// ===========================================================================
-// Seeding (all data — no rules)
-// ===========================================================================
-fn seed_world(store: &EntStore, r: &Rels) -> Result<(), String> {
-    let at = store.current();
-    let seeded = store
-        .read_at(r.named, at)
-        .map_err(err)?
-        .into_iter()
-        .any(|(t, d)| d > 0 && t.as_slice().first() == Some(&Value::Ent(PLAYER)));
-    if seeded {
-        return Ok(());
-    }
-    let e = Value::Ent;
-    let t = Value::text;
-    let mut b: Vec<(RelId, Tuple, Diff)> = Vec::new();
-    let loc = |who: Entity, room: Entity, b: &mut Vec<_>| {
-        b.push((r.located, Tuple::from([e(who), e(room)]), 1));
-    };
-    // Player + things
-    loc(PLAYER, FOYER, &mut b);
-    loc(LAMP, FOYER, &mut b);
-    loc(KEY, FOYER, &mut b);
-    loc(BOOK, LIBRARY, &mut b);
-    loc(ROSE, GARDEN, &mut b);
-    loc(COIN, MARKET, &mut b);
-    loc(CAKE, KITCHEN, &mut b);
-    // NPCs
-    loc(CAT, FOYER, &mut b);
-    loc(MERCHANT, MARKET, &mut b);
-
-    for (who, name) in [
-        (PLAYER, "you"),
-        (FOYER, "Foyer"),
-        (LIBRARY, "Library"),
-        (GARDEN, "Garden"),
-        (MARKET, "Market"),
-        (OBSERVATORY, "Observatory"),
-        (KITCHEN, "Kitchen"),
-        (LAMP, "brass lamp"),
-        (KEY, "iron key"),
-        (BOOK, "old book"),
-        (ROSE, "red rose"),
-        (COIN, "gold coin"),
-        (CAKE, "iced cake"),
-        (CAT, "Whiskers"),
-        (MERCHANT, "Bartleby"),
-    ] {
-        b.push((r.named, Tuple::from([e(who), t(name)]), 1));
-    }
-    b.push((r.players, Tuple::from([e(PLAYER), t("you")]), 1));
-
-    // People wear a public label until you learn their name.
-    for (who, lbl) in [(CAT, "a cat"), (MERCHANT, "a merchant")] {
-        b.push((r.person, Tuple::from([e(who)]), 1));
-        b.push((r.label, Tuple::from([e(who), t(lbl)]), 1));
-    }
-    // You always know yourself.
-    b.push((r.knows, Tuple::from([e(PLAYER), e(PLAYER)]), 1));
-
-    // Object values (coins).
-    for (obj, coins) in [(LAMP, 10), (KEY, 1), (BOOK, 3), (ROSE, 5), (COIN, 20), (CAKE, 2)] {
-        b.push((r.value, Tuple::from([e(obj), Value::Int(coins)]), 1));
-    }
-
-    // The map (one-way passages, seeded both ways).
-    for (from, way, to) in [
-        (FOYER, "north", LIBRARY),
-        (LIBRARY, "south", FOYER),
-        (FOYER, "east", GARDEN),
-        (GARDEN, "west", FOYER),
-        (FOYER, "west", KITCHEN),
-        (KITCHEN, "east", FOYER),
-        (FOYER, "up", OBSERVATORY),
-        (OBSERVATORY, "down", FOYER),
-        (GARDEN, "south", MARKET),
-        (MARKET, "north", GARDEN),
-    ] {
-        b.push((r.exits, Tuple::from([e(from), t(way), e(to)]), 1));
-    }
-
-    // The cat's patrol route (its whole "AI", as data).
-    for (from, to) in PATROL {
-        b.push((r.patrol, Tuple::from([e(from), e(to)]), 1));
-    }
-
-    // The vault TEMPLATE (never entered directly; `enter vault` instances it).
-    // A two-room cluster: an antechamber with a torch, a north passage to the
-    // inner vault holding a gemstone. No `value` rows, so it stays out of the
-    // manor's treasure economy — the vault is about private exploration.
-    loc(VAULT_TORCH, VAULT_ANTE, &mut b);
-    loc(VAULT_GEM, VAULT_INNER, &mut b);
-    for (who, name) in [
-        (VAULT_ANTE, "Vault Antechamber"),
-        (VAULT_INNER, "Inner Vault"),
-        (VAULT_TORCH, "a guttering torch"),
-        (VAULT_GEM, "a great gemstone"),
-    ] {
-        b.push((r.named, Tuple::from([e(who), t(name)]), 1));
-    }
-    for (from, way, to) in [(VAULT_ANTE, "north", VAULT_INNER), (VAULT_INNER, "south", VAULT_ANTE)] {
-        b.push((r.exits, Tuple::from([e(from), t(way), e(to)]), 1));
-    }
-
-    store.commit(&b).map_err(|e| format!("seed_world: {e:?}"))?;
-    Ok(())
-}
-
-/// Seed the cribbage rule tables: the *arithmetic*, precomputed as relations the
-/// scoring views join against. This is data entry, not scoring.
-fn seed_rules(store: &EntStore, r: &Rels) -> Result<(), String> {
-    let at = store.current();
-    let already = !store.read_at(r.cardval, at).map_err(err)?.is_empty();
-    if already {
-        return Ok(());
-    }
-    let i = Value::Int;
-    let mut b: Vec<(RelId, Tuple, Diff)> = Vec::new();
-    // card code -> pip value and rank
-    for code in 0..52i64 {
-        let rank = code % 13;
-        let pips = (rank + 1).min(10);
-        b.push((r.cardval, Tuple::from([i(code), i(pips)]), 1));
-        b.push((r.cardrank, Tuple::from([i(code), i(rank)]), 1));
-    }
-    // slot combinations (views can't say i != j, so we enumerate them as data)
-    for a in 0..5i64 {
-        for c in (a + 1)..5 {
-            b.push((r.slotpair, Tuple::from([i(a), i(c)]), 1));
-        }
-    }
-    for a in 0..5i64 {
-        for c in (a + 1)..5 {
-            for d in (c + 1)..5 {
-                b.push((r.slottrio, Tuple::from([i(a), i(c), i(d)]), 1));
-            }
-        }
-    }
-    // value combos totalling 15 (all orders, since slot order is arbitrary)
-    for a in 1..=10i64 {
-        for c in 1..=10i64 {
-            if a + c == 15 {
-                b.push((r.sum15two, Tuple::from([i(a), i(c)]), 1));
-            }
-            for d in 1..=10i64 {
-                if a + c + d == 15 {
-                    b.push((r.sum15three, Tuple::from([i(a), i(c), i(d)]), 1));
-                }
-            }
-        }
-    }
-    store.commit(&b).map_err(|e| format!("seed_rules: {e:?}"))?;
-    Ok(())
-}
-
-// ===========================================================================
 // The REPL
 // ===========================================================================
 struct Repl<'a> {
-    prog: &'a Arc<Program>,
+    world: &'a MooRuntime,
     store: &'a EntStore,
     r: Rels,
     player: Process,
     cat: Process,
-    player_seq: i64,
-    cat_seq: i64,
     out_cursor: Edition,
     watch: Option<OnWatch>,
     delivered: usize,
@@ -515,12 +192,18 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         } else {
             println!("You see: {}.", here.join(", "));
         }
-        let ways = self.view_rows("ways", &[Value::Ent(PLAYER)]).unwrap_or_default();
+        let ways = self
+            .view_rows("ways", &[Value::Ent(PLAYER)])
+            .unwrap_or_default();
         let mut dirs: Vec<String> = ways.iter().map(|(t, _)| text_at(t, 0)).collect();
         dirs.sort();
         println!(
             "Exits: {}.",
-            if dirs.is_empty() { "none".into() } else { dirs.join(", ") }
+            if dirs.is_empty() {
+                "none".into()
+            } else {
+                dirs.join(", ")
+            }
         );
     }
 
@@ -540,7 +223,11 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         // Where the cat prowls (name if you've met it, else 'the cat').
         if let Ok(Some(catroom)) = self.room_of(CAT) {
             let known = self.known_by(PLAYER);
-            let who = if known.contains(&CAT) { self.name_of(CAT) } else { "The cat".into() };
+            let who = if known.contains(&CAT) {
+                self.name_of(CAT)
+            } else {
+                "The cat".into()
+            };
             println!("  · {who} prowls the {}.", self.name_of(catroom));
         }
         let passages = self.count(self.r.exits);
@@ -549,7 +236,9 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     }
 
     fn cmd_inventory(&self) {
-        let inv = self.view_rows("inventory", &[Value::Ent(PLAYER)]).unwrap_or_default();
+        let inv = self
+            .view_rows("inventory", &[Value::Ent(PLAYER)])
+            .unwrap_or_default();
         let mut names: Vec<String> = inv.iter().map(|(t, _)| text_at(t, 1)).collect();
         names.sort();
         if names.is_empty() {
@@ -599,7 +288,11 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         for (slot, code) in deck.iter().take(5).enumerate() {
             b.push((
                 self.r.card,
-                Tuple::from([Value::Ent(PLAYER), Value::Int(slot as i64), Value::Int(*code)]),
+                Tuple::from([
+                    Value::Ent(PLAYER),
+                    Value::Int(slot as i64),
+                    Value::Int(*code),
+                ]),
                 1,
             ));
         }
@@ -614,7 +307,9 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
             println!("You have no cards. Type `deal` first.");
             return;
         }
-        let show: Vec<String> = (0..4).filter_map(|s| hand.get(&s).map(|c| card_name(*c))).collect();
+        let show: Vec<String> = (0..4)
+            .filter_map(|s| hand.get(&s).map(|c| card_name(*c)))
+            .collect();
         print!("Hand: {}", show.join(" "));
         if let Some(starter) = hand.get(&4) {
             print!("   |   starter: {}", card_name(*starter));
@@ -629,9 +324,18 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
             return;
         }
         // Scoring is the grmpl views; we only COUNT the combos they return.
-        let pairs = self.view_rows("crib_pairs", &[Value::Ent(PLAYER)]).unwrap_or_default().len();
-        let fif2 = self.view_rows("crib_fif2", &[Value::Ent(PLAYER)]).unwrap_or_default().len();
-        let fif3 = self.view_rows("crib_fif3", &[Value::Ent(PLAYER)]).unwrap_or_default().len();
+        let pairs = self
+            .view_rows("crib_pairs", &[Value::Ent(PLAYER)])
+            .unwrap_or_default()
+            .len();
+        let fif2 = self
+            .view_rows("crib_fif2", &[Value::Ent(PLAYER)])
+            .unwrap_or_default()
+            .len();
+        let fif3 = self
+            .view_rows("crib_fif3", &[Value::Ent(PLAYER)])
+            .unwrap_or_default()
+            .len();
         let fifteens = fif2 + fif3;
         let total = 2 * pairs + 2 * fifteens;
         self.cmd_cards();
@@ -649,15 +353,18 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     fn cmd_turn(&mut self, line: &str) -> Result<(), String> {
         // The player's verb, through the compiled behavior.
         let before = self.store.current();
-        enqueue(self.store, self.r.inbox, PLAYER, self.player_seq, tokens(line)).map_err(err)?;
-        self.player_seq += 1;
-        self.player.run_to_idle(self.store, self.store).map_err(err)?;
+        self.world.enqueue(PLAYER, line).map_err(err)?;
+        self.player
+            .run_to_idle_retrying(self.store, self.store, self.world.runtime().policy())
+            .map_err(err)?;
 
         let told = self.drain_tell(before)?;
         let verb = line.split_whitespace().next().unwrap_or("");
         if verb == "greet" {
             match told.last() {
-                Some(name) => println!("You introduce yourself. You are now acquainted with {name}."),
+                Some(name) => {
+                    println!("You introduce yourself. You are now acquainted with {name}.")
+                }
                 None => println!("There's no one like that here to greet."),
             }
         } else if told.is_empty() {
@@ -712,12 +419,22 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         let ante = Entity(VAULT_ANTE.0.wrapping_add(shift as u64));
         self.store
             .commit(&[
-                (self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]), -1),
-                (self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(ante)]), 1),
+                (
+                    self.r.located,
+                    Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]),
+                    -1,
+                ),
+                (
+                    self.r.located,
+                    Tuple::from([Value::Ent(PLAYER), Value::Ent(ante)]),
+                    1,
+                ),
             ])
             .map_err(err)?;
         self.vault = Some((shift, home));
-        println!("You slip into a private instance of the vault — a DSP-relocated copy, yours alone.");
+        println!(
+            "You slip into a private instance of the vault — a DSP-relocated copy, yours alone."
+        );
         self.pump_watch()?;
         self.cmd_look();
         Ok(())
@@ -755,8 +472,16 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
             }
         }
         // Walk the player home.
-        b.push((self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(cur)]), -1));
-        b.push((self.r.located, Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]), 1));
+        b.push((
+            self.r.located,
+            Tuple::from([Value::Ent(PLAYER), Value::Ent(cur)]),
+            -1,
+        ));
+        b.push((
+            self.r.located,
+            Tuple::from([Value::Ent(PLAYER), Value::Ent(home)]),
+            1,
+        ));
         self.store.commit(&b).map_err(err)?;
         self.vault = None;
         println!("You climb back out. The instance fades — it was only ever yours.");
@@ -770,13 +495,18 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     fn tick_cat(&mut self) -> Result<(), String> {
         let player_room = self.room_of(PLAYER).ok().flatten();
         let before = self.room_of(CAT).ok().flatten();
-        enqueue(self.store, self.r.inbox, CAT, self.cat_seq, tokens("tick")).map_err(err)?;
-        self.cat_seq += 1;
-        self.cat.run_to_idle(self.store, self.store).map_err(err)?;
+        self.world.enqueue(CAT, "tick").map_err(err)?;
+        self.cat
+            .run_to_idle_retrying(self.store, self.store, self.world.runtime().policy())
+            .map_err(err)?;
         let after = self.room_of(CAT).ok().flatten();
 
         let known = self.known_by(PLAYER);
-        let catname = if known.contains(&CAT) { self.name_of(CAT) } else { "The cat".into() };
+        let catname = if known.contains(&CAT) {
+            self.name_of(CAT)
+        } else {
+            "The cat".into()
+        };
         if before == player_room && after != player_room && player_room.is_some() {
             println!("{catname} pads out of the room.");
         } else if after == player_room && before != player_room && player_room.is_some() {
@@ -792,14 +522,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
             println!("Already watching the world.");
             return Ok(());
         }
-        let auth = Authority::new(
-            DomainId(1),
-            vec![Scope::whole(self.r.wmail), Scope::whole(self.r.wcursor), Scope::whole(self.r.wseq)],
-        );
-        let (ow, _) = self
-            .prog
-            .install_watch("world", &[], PLAYER, PLAYER, auth, self.store, self.store)
-            .map_err(err)?;
+        let ow = self.world.install_world_watch(PLAYER, PLAYER)?;
         ow.pump(self.store, self.store).map_err(err)?;
         self.delivered = self.count_for(self.r.wmail, PLAYER);
         self.watch = Some(ow);
@@ -838,8 +561,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     // --- small query helpers ---------------------------------------------
 
     fn view_rows(&self, name: &str, args: &[Value]) -> Result<Vec<(Tuple, Diff)>, String> {
-        let q = self.prog.view(name, args)?;
-        q.find(&Snapshot::at_current(self.store)).map_err(err)
+        self.world.runtime().view(name, args)
     }
 
     /// The entities sharing the viewer's room (via the `contents` view).
@@ -930,7 +652,12 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
 
     fn count(&self, rel: RelId) -> usize {
         let at = self.store.current();
-        self.store.read_at(rel, at).unwrap_or_default().iter().filter(|(_, d)| *d > 0).count()
+        self.store
+            .read_at(rel, at)
+            .unwrap_or_default()
+            .iter()
+            .filter(|(_, d)| *d > 0)
+            .count()
     }
 
     fn count_for(&self, rel: RelId, key: Entity) -> usize {
@@ -946,7 +673,11 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     fn drain_tell(&mut self, since: Edition) -> Result<Vec<String>, String> {
         let to = self.store.current();
         let mut out = Vec::new();
-        for u in self.store.scan_updates(self.r.tell, since, to).map_err(err)? {
+        for u in self
+            .store
+            .scan_updates(self.r.tell, since, to)
+            .map_err(err)?
+        {
             let s = u.tuple.as_slice();
             if u.diff > 0 && s.first() == Some(&Value::Ent(PLAYER)) {
                 if let Some(Value::Text(text)) = s.get(1) {
@@ -972,10 +703,6 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
 // Free helpers
 // ===========================================================================
 
-fn tokens(line: &str) -> Tuple {
-    Tuple::new(line.split_whitespace().map(Value::text).collect::<Vec<_>>())
-}
-
 /// Render one thing through the fog of identity: objects by name; people by name
 /// once you know them, else by their public label.
 fn render_identity(
@@ -986,14 +713,21 @@ fn render_identity(
     known: &HashSet<Entity>,
 ) -> String {
     if persons.contains(&thing) && !known.contains(&thing) {
-        labels.get(&thing).cloned().unwrap_or_else(|| "someone".into())
+        labels
+            .get(&thing)
+            .cloned()
+            .unwrap_or_else(|| "someone".into())
     } else {
-        names.get(&thing).cloned().unwrap_or_else(|| "something".into())
+        names
+            .get(&thing)
+            .cloned()
+            .unwrap_or_else(|| "something".into())
     }
 }
 
-const RANKS: [&str; 13] =
-    ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+const RANKS: [&str; 13] = [
+    "A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K",
+];
 const SUITS: [&str; 4] = ["♠", "♥", "♦", "♣"];
 
 /// A card code's display name (pure formatting — the scoring lives in grmpl).
