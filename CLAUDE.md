@@ -15,8 +15,8 @@ cargo test           # suite is green
 cargo clippy --all-targets
 ```
 
-The `iroh` transport feature is off by default and must stay off for the core
-build/test path (see `DESIGN.md` §13, the iroh version note).
+Distribution is deferred: `grmpl-transport` has only an in-process net, and no
+networked transport (iroh is the designed-for one) is built.
 
 ## Invariants
 
@@ -26,8 +26,7 @@ The semantic core (`grmpl-core`, `-diff`, `-proc`, `-lang`, `-pattern`) is
 *above the line*: pure value types and the substrate **traits**
 (`TraceStore`, `EditionStore`, `Catalog`, `Transport`). It names no storage or
 network technology. Only `grmpl-ent` names `fjall` (as the granfilade's node
-store); only `grmpl-transport` names `iroh`. Substrate crates depend on the
-traits, never the reverse. The language observes **opaque `Edition`s**, never
+store). Substrate crates depend on the traits, never the reverse. The language observes **opaque `Edition`s**, never
 physical sequence numbers.
 
 ### One serialization, versioned (`grmpl-core::wire`)
@@ -136,7 +135,7 @@ grmpl-core ── grmpl-diff ── grmpl-proc ── grmpl-lang
      │            │              │
      ├── grmpl-ent (the Ent; fjall as the granfilade node store)
      ├── grmpl-pattern ──────────┴── grmpl-lang
-     └── grmpl-transport (iroh, feature-gated)
+     └── grmpl-transport (in-process net between domains)
 
 grmpl (public runtime facade: compiled worlds, sessions, and TCP adapter;
        source remains under crates/grmpl-session during the migration)

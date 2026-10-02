@@ -4,7 +4,8 @@
 //! (DESIGN.md §4.2).
 
 use grmpl_core::{DomainId, EditionStore, Entity, Message, RelId, TraceStore, Tuple, Transport, Value};
-use grmpl_transport::{decode_message, encode_message, InProcessNet};
+use grmpl_core::wire::{decode_message, encode_message};
+use grmpl_transport::InProcessNet;
 
 const A: DomainId = DomainId(1);
 const B: DomainId = DomainId(2);

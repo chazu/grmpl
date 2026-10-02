@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 
 use grmpl_core::{
-    Authority, Diff, DomainId, Edition, Error, Message, Patch, RelId, Result, SchemaCatalog,
-    TraceStore, Transport, Tuple, Value,
+    Authority, Diff, DomainId, Edition, Error, Message, NoBehaviorCheck, Patch, RelId, Result,
+    SchemaCatalog, TraceStore, Transport, Tuple, Value,
 };
 
-use crate::commit::{check_schema, CommitOutcome};
+use crate::commit::{check_patch, CommitOutcome};
 use crate::SeqAlloc;
 
 /// Envelope on the wire: `seq(i64, BE) || encoded_message`.
@@ -118,65 +118,13 @@ impl<'a> Domain<'a> {
         authority: &Authority,
         schemas: &dyn SchemaCatalog,
     ) -> Result<CommitOutcome> {
-        // Scheduled timers land as durable world writes in this same commit.
-        let sched: Vec<grmpl_core::Fact> = patch
-            .scheduled
-            .iter()
-            .map(|s| grmpl_core::Fact::new(s.timers, crate::schedule::timer_row(s)))
-            .collect();
-
-        // Authority law: world writes must be owned.
-        for f in patch
-            .asserts
-            .iter()
-            .chain(patch.retracts.iter())
-            .chain(sched.iter())
-        {
-            if !authority.permits(f) {
-                return Err(Error::Authority(format!(
-                    "write to relation {:?} outside authority domain {:?}",
-                    f.rel, authority.domain
-                )));
-            }
-        }
-
-        // Schema law (P1): world writes must conform to their registered schema.
-        check_schema(
-            schemas,
-            patch
-                .asserts
-                .iter()
-                .chain(patch.retracts.iter())
-                .chain(sched.iter()),
-        )?;
-
-        let base_preconditions: Vec<(RelId, Tuple)> = patch
-            .preconditions
-            .iter()
-            .map(|f| (f.rel, f.tuple.clone()))
-            .collect();
-
-        // Seq-independent effects: world writes, the cursor move, timers, and any
-        // *local* emits all ride every commit attempt unchanged.
-        let mut base_updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
-        for f in &patch.asserts {
-            base_updates.push((f.rel, f.tuple.clone(), 1));
-        }
-        for f in &patch.retracts {
-            base_updates.push((f.rel, f.tuple.clone(), -1));
-        }
-        if let Some(cm) = &patch.cursor_advance {
-            if let Some(old) = &cm.retract {
-                base_updates.push((cm.rel, old.clone(), -1));
-            }
-            base_updates.push((cm.rel, cm.assert.clone(), 1));
-        }
-        for f in &sched {
-            base_updates.push((f.rel, f.tuple.clone(), 1));
-        }
+        // The Authority and Schema laws, exactly as `commit_patch` enforces them.
+        let checked = check_patch(schemas, &NoBehaviorCheck, patch, authority)?;
+        let base_preconditions = checked.preconditions;
 
         // Partition emits: local inbox writes ride the base updates; remote emits
         // become durable outbox rows whose seqs come from the guarded `SeqAlloc`.
+        let mut base_updates = checked.writes;
         let mut remotes: Vec<(DomainId, RelId, Tuple)> = Vec::new();
         for m in &patch.emits {
             match self.is_remote(m.inbox) {
@@ -184,6 +132,7 @@ impl<'a> Domain<'a> {
                 Some(target) => remotes.push((target, m.inbox, m.body.clone())),
             }
         }
+        base_updates.extend(checked.rest);
 
         // No remote emit: no outbox seq to allocate — commit exactly as before,
         // in one atomic `commit_if`.

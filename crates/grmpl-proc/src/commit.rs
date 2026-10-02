@@ -77,6 +77,41 @@ pub fn commit_patch_checked(
     patch: &Patch,
     authority: &Authority,
 ) -> Result<CommitOutcome> {
+    let checked = check_patch(schemas, checker, patch, authority)?;
+
+    // Emits append to inbox relations in the same atomic commit.
+    let mut updates = checked.writes;
+    for m in &patch.emits {
+        updates.push((m.inbox, m.body.clone(), 1));
+    }
+    updates.extend(checked.rest);
+
+    match store.commit_if(&checked.preconditions, &updates)? {
+        Some(edition) => Ok(CommitOutcome::Committed(edition)),
+        None => Ok(CommitOutcome::Rejected),
+    }
+}
+
+/// A patch that passed the commit-boundary laws, translated into the store's
+/// preconditions and signed updates. Emits are left to the caller to route:
+/// [`commit_patch`] writes every one locally, while [`Domain`](crate::Domain)
+/// sends remote ones through its durable outbox.
+pub(crate) struct CheckedPatch {
+    pub preconditions: Vec<(RelId, Tuple)>,
+    /// The asserted (`+1`) and retracted (`-1`) world facts.
+    pub writes: Vec<(RelId, Tuple, Diff)>,
+    /// Timer rows and the cursor move, which follow the emits in the commit.
+    pub rest: Vec<(RelId, Tuple, Diff)>,
+}
+
+/// Enforce the Authority, Schema and stored-code laws on `patch`, and translate
+/// everything but its emits into store updates.
+pub(crate) fn check_patch(
+    schemas: &dyn SchemaCatalog,
+    checker: &dyn BehaviorChecker,
+    patch: &Patch,
+    authority: &Authority,
+) -> Result<CheckedPatch> {
     // Scheduled timers land as durable world writes (timer rows) in this same
     // commit, so they are subject to the Authority and Schema laws too.
     let sched: Vec<Fact> = patch
@@ -127,30 +162,28 @@ pub fn commit_patch_checked(
         .collect();
 
     // Translate the patch into signed updates. Asserts/retracts are world
-    // facts; emits append to inbox relations; the cursor advance is a
-    // retract-then-assert — all in the one atomic commit.
-    let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
+    // facts; the cursor advance is a retract-then-assert.
+    let mut writes: Vec<(RelId, Tuple, Diff)> = Vec::new();
     for f in &patch.asserts {
-        updates.push((f.rel, f.tuple.clone(), 1));
+        writes.push((f.rel, f.tuple.clone(), 1));
     }
     for f in &patch.retracts {
-        updates.push((f.rel, f.tuple.clone(), -1));
+        writes.push((f.rel, f.tuple.clone(), -1));
     }
-    for m in &patch.emits {
-        updates.push((m.inbox, m.body.clone(), 1));
-    }
+    let mut rest: Vec<(RelId, Tuple, Diff)> = Vec::new();
     for f in &sched {
-        updates.push((f.rel, f.tuple.clone(), 1));
+        rest.push((f.rel, f.tuple.clone(), 1));
     }
     if let Some(cm) = &patch.cursor_advance {
         if let Some(old) = &cm.retract {
-            updates.push((cm.rel, old.clone(), -1));
+            rest.push((cm.rel, old.clone(), -1));
         }
-        updates.push((cm.rel, cm.assert.clone(), 1));
+        rest.push((cm.rel, cm.assert.clone(), 1));
     }
 
-    match store.commit_if(&preconditions, &updates)? {
-        Some(edition) => Ok(CommitOutcome::Committed(edition)),
-        None => Ok(CommitOutcome::Rejected),
-    }
+    Ok(CheckedPatch {
+        preconditions,
+        writes,
+        rest,
+    })
 }
