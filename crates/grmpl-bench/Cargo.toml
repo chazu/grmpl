@@ -16,5 +16,3 @@ grmpl-proc = { path = "../grmpl-proc" }
 grmpl-ent = { path = "../grmpl-ent" }
 tempfile = "3"
 
-[dev-dependencies]
-tempfile = "3"

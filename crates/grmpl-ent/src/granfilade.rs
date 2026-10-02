@@ -1,7 +1,7 @@
 //! **The granfilade: content-addressed node persistence.**
 //!
 //! An enfilade [`Tree`] is made durable by storing each node under its **content
-//! key** — the [`sha256`](crate::hash::sha256) of its frame, which closes over
+//! key** — the [`sha256`](grmpl_core::hash::sha256) of its frame, which closes over
 //! the node's entries and its children's content keys. Because the key is a pure
 //! function of *content* (never `phys_id` or allocation order), **equal subtrees
 //! store once**: two versions of a tree that differ by one edited path share
@@ -44,7 +44,7 @@ use grmpl_core::{wire, Error, Result, Tuple, Value};
 use crate::measure::Measure;
 use crate::tree::{NodeRef, Tree};
 
-pub use crate::hash::ContentKey;
+pub use grmpl_core::hash::Sha256Digest as ContentKey;
 
 /// The width of a [`ContentKey`] on the wire.
 const CK_LEN: usize = 32;
@@ -571,7 +571,7 @@ where
             }
         }
     }
-    let ck = crate::hash::sha256(&bytes);
+    let ck = grmpl_core::hash::sha256(&bytes);
     let _ = cell.set(ck);
     out.push((ck, bytes));
     Some(ck)

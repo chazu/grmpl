@@ -29,7 +29,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::hash::ContentKey;
+use grmpl_core::hash::Sha256Digest as ContentKey;
 use crate::measure::Measure;
 
 /// One entry difference between two tree versions: `(key, left_value,

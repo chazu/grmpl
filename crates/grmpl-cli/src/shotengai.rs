@@ -31,60 +31,27 @@ const WORLD: Entity = Entity(2);
 
 // Surface rooms.
 const EAST_GATE: Entity = Entity(10);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const ARCADE: Entity = Entity(11);
 const KISSATEN: Entity = Entity(12);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const REPAIR_SHOP: Entity = Entity(13);
 const SENTO: Entity = Entity(14);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const COOPERATIVE: Entity = Entity(15);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const SHRINE_ALLEY: Entity = Entity(16);
 const CINEMA: Entity = Entity(17);
 const ROOFTOP: Entity = Entity(18);
 
 // Surface things and residents.
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const RED_UMBRELLA: Entity = Entity(20);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const BRASS_TOKEN: Entity = Entity(21);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const OLD_RADIO: Entity = Entity(22);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const TEA_TIN: Entity = Entity(23);
-#[allow(dead_code)] // used by the headless time-driver regression
 const CAT: Entity = Entity(30);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const PROPRIETOR: Entity = Entity(31);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const REPAIRER: Entity = Entity(32);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const CARETAKER: Entity = Entity(33);
 #[cfg(test)]
 const COMBAT: Entity = Entity(34);
 
 // Jobs and their signature abilities.
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const COURIER: Entity = Entity(100);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const COOK: Entity = Entity(101);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const REPAIRER_JOB: Entity = Entity(102);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const SHRINE_ATTENDANT: Entity = Entity(103);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const NIGHT_WATCH: Entity = Entity(104);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const QUICK_STEP: Entity = Entity(200);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const SEARING_PAN: Entity = Entity(201);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const LIVE_WIRE: Entity = Entity(202);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const PAPER_WARD: Entity = Entity(203);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const LANTERN_WALL: Entity = Entity(204);
 
 // The self-contained dungeon template. Every template fact is keyed by an
 // entity in this block, allowing `instance_template` to relocate all entity
@@ -92,28 +59,16 @@ const LANTERN_WALL: Entity = Entity(204);
 const DUNGEON_BASE: u64 = 1_000;
 const DUNGEON_SPAN: u64 = 100;
 const DUNGEON_ENTRY: Entity = Entity(1_000);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const FLOODED_STORE: Entity = Entity(1_001);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const FORGOTTEN_ARCADE: Entity = Entity(1_002);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const LEDGER_VAULT: Entity = Entity(1_003);
 const MIRROR_CHAMBER: Entity = Entity(1_004);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const MANNEQUIN_STOCKROOM: Entity = Entity(1_005);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const RECEIPT_MOTH: Entity = Entity(1_010);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const SHUTTER_MAW: Entity = Entity(1_011);
 const LAST_CUSTOMER: Entity = Entity(1_012);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
+#[cfg(test)]
 const MANNEQUIN_SHELL: Entity = Entity(1_013);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const DUNGEON_COIN: Entity = Entity(1_020);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const RED_THREAD: Entity = Entity(1_021);
-#[allow(dead_code)] // mirrors the package's stable source-level entity id
-const COPYING_MIRROR: Entity = Entity(1_022);
 const INSTANCE_BASE: u64 = 100_000;
 const INSTANCE_STRIDE: u64 = 1_000;
 

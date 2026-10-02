@@ -28,7 +28,7 @@
 use std::io::Write;
 
 use grmpl_core::{
-    Authority, CursorMove, Edition, Entity, Error, Fact, Patch, RelId, Result, Tuple, Value,
+    Authority, CursorMove, Entity, Error, Fact, Patch, RelId, Result, Tuple, Value,
     WorldStore,
 };
 use grmpl_diff::Query;
@@ -291,22 +291,4 @@ impl Subscription {
             CommitOutcome::Rejected => Ok(None),
         }
     }
-}
-
-/// The edition the on-watch pump has delivered through, for observers/tests.
-pub fn watch_cursor(
-    store: &dyn WorldStore,
-    cursor_rel: RelId,
-    watch: Entity,
-) -> Result<Option<Edition>> {
-    let at = store.current();
-    for (t, d) in store.read_at(cursor_rel, at)? {
-        let s = t.as_slice();
-        if d > 0 && s.first() == Some(&Value::Ent(watch)) {
-            if let Some(Value::Int(e)) = s.get(1) {
-                return Ok(Some(Edition((*e).max(0) as u64)));
-            }
-        }
-    }
-    Ok(None)
 }

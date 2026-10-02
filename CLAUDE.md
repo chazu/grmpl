@@ -42,7 +42,7 @@ Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
 * `node frame = version(1) || tag(1) || n_children(u32, BE) || [content_key]*n
                 || count(u32, BE) || payload`
 
-Node content keys are **SHA-256** (`grmpl_ent::hash`), vendored and pinned
+Node content keys are **SHA-256** (`grmpl_core::hash`), vendored and pinned
 against the FIPS vectors: the hash is part of the on-disk format, so it may not
 drift with the toolchain, and world content is player-supplied, so it must be
 collision-resistant against chosen input.

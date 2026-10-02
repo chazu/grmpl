@@ -20,4 +20,3 @@ tempfile = "3"
 
 [dev-dependencies]
 grmpl-conformance = { path = "../grmpl-conformance" }
-tempfile = "3"

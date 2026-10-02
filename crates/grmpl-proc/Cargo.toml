@@ -13,4 +13,3 @@ grmpl-diff = { path = "../grmpl-diff" }
 grmpl-conformance = { path = "../grmpl-conformance" }
 grmpl-pattern = { path = "../grmpl-pattern" }
 grmpl-transport = { path = "../grmpl-transport" }
-tempfile = "3"
