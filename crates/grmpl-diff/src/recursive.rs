@@ -94,13 +94,8 @@ fn subtract_in_place(a: &mut Multiset, remove: &Multiset) {
     a.retain(|t, _| !remove.contains_key(t));
 }
 
-/// `new − old` as signed set deltas (`+1` added, `-1` removed).
-///
-/// Generic in the key so the *one* definition serves both maintainers: the
-/// recursive view diffs its fixpoint (`K = Tuple`), and the parse stream diffs
-/// its match-set (`K = Value`, see [`crate::parse_stream`]). Both are
-/// boundary-recompute strategies whose emitted delta is exactly this set
-/// difference — the composition P9c §6 calls for — so neither reimplements it.
+/// `new − old` as signed set deltas (`+1` added, `-1` removed): the delta the
+/// recursive view emits when it diffs its recomputed fixpoint.
 pub(crate) fn set_difference<K: Clone + Eq + std::hash::Hash>(
     new: &HashMap<K, Diff>,
     old: &HashMap<K, Diff>,

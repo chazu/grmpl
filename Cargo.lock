@@ -1123,7 +1123,6 @@ version = "0.0.1"
 dependencies = [
  "grmpl-core",
  "grmpl-ent",
- "grmpl-pattern",
  "tempfile",
 ]
 
