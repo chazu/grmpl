@@ -378,27 +378,6 @@ fn form_ir_exposes_ctor_specs() {
     );
 }
 
-#[test]
-fn reduce_view_ir_wraps_the_view_plan() {
-    let prog = Program::compile(
-        "rel score(team, pts)\nview scored() { score(t, p) yield t, p }",
-        1,
-    )
-    .unwrap();
-    let ir = prog
-        .reduce_view_ir("scored", &[], &["t"], grmpl_lang::NamedAgg::Count)
-        .unwrap();
-    // The reduce sits atop the view's own plan.
-    match ir {
-        QueryIr::Reduce { input, key, agg } => {
-            assert_eq!(key, vec![0]);
-            assert_eq!(agg, grmpl_diff::Agg::Count);
-            assert!(matches!(*input, QueryIr::Distinct(_)));
-        }
-        other => panic!("expected Reduce, got {other:?}"),
-    }
-}
-
 // ---- the computation layer ----
 
 #[test]

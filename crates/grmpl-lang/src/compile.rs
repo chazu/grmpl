@@ -42,18 +42,6 @@ use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
 use crate::package::ResolvedGrantSet;
 use crate::parser::parse;
 
-/// An aggregate named by *column* — the P1 named-column surface for
-/// [`Program::reduce_view`]. `Sum`/`Min`/`Max` name a yielded column; `Count`
-/// ignores values. Resolved to a positional [`grmpl_diff::Agg`] against the
-/// view's `yield` list.
-#[derive(Clone, PartialEq, Debug)]
-pub enum NamedAgg {
-    Count,
-    Sum(String),
-    Min(String),
-    Max(String),
-}
-
 struct RelInfo {
     id: RelId,
     columns: Vec<Column>,
@@ -550,8 +538,7 @@ impl Program {
     /// If the `yield` clause carries an aggregate (`yield t, sum(pts)`), the
     /// projection is instead wrapped in a [`QueryIr::Reduce`]: the plain
     /// `yield` identifiers become the grouping key and the aggregate folds its
-    /// column. This is the text-surface counterpart of
-    /// [`reduce_view`](Self::reduce_view) and lowers to the same `Query::Reduce`.
+    /// column.
     pub fn view_ir(&self, name: &str, args: &[Value]) -> Result<QueryIr, String> {
         let v = self
             .views
@@ -675,10 +662,7 @@ impl Program {
         let base = acc.ok_or_else(|| format!("view `{name}` has no atoms"))?;
         // Project the grouping columns, then (for an aggregate yield) the
         // aggregate's column. This lays the group keys in positions
-        // `0..yields.len()` and the folded value at `yields.len()`, exactly the
-        // layout `reduce_view` produces over a plain view yielding
-        // `[group…, col]` — so the text surface and the programmatic
-        // `reduce_view`/`NamedAgg` surface lower to the same `Query::Reduce`.
+        // `0..yields.len()` and the folded value at `yields.len()`.
         let mut proj: Vec<&str> = v.yields.iter().map(|s| s.as_str()).collect();
         if let Some(AggYield { col: Some(c), .. }) = &v.agg {
             proj.push(c.as_str());
@@ -714,59 +698,6 @@ impl Program {
                 })
             }
         }
-    }
-
-    /// Aggregate over a view's yielded columns *by name*: instantiate `view`
-    /// with `args`, group by the named `group` columns, and fold `agg` over its
-    /// (optional) named column. The resulting `Query` yields the grouping
-    /// columns followed by the aggregate. This is the P1 named-column surface for
-    /// aggregates — column names resolve against the view's `yield` list, so it
-    /// depends on P1's named columns. Errors if any name is not yielded.
-    pub fn reduce_view(
-        &self,
-        view: &str,
-        args: &[Value],
-        group: &[&str],
-        agg: NamedAgg,
-    ) -> Result<Query, String> {
-        Ok(self.reduce_view_ir(view, args, group, agg)?.lower())
-    }
-
-    /// [`reduce_view`](Self::reduce_view) as inspectable IR: the view's
-    /// [`QueryIr`] wrapped in a [`QueryIr::Reduce`].
-    pub fn reduce_view_ir(
-        &self,
-        view: &str,
-        args: &[Value],
-        group: &[&str],
-        agg: NamedAgg,
-    ) -> Result<QueryIr, String> {
-        let base = self.view_ir(view, args)?;
-        let yields = self
-            .view_yields(view)
-            .ok_or_else(|| format!("no view `{view}`"))?
-            .to_vec();
-        let idx = |col: &str| -> Result<usize, String> {
-            yields
-                .iter()
-                .position(|y| y == col)
-                .ok_or_else(|| format!("view `{view}` yields no column `{col}`"))
-        };
-        let mut key = Vec::with_capacity(group.len());
-        for g in group {
-            key.push(idx(g)?);
-        }
-        let agg = match agg {
-            NamedAgg::Count => Agg::Count,
-            NamedAgg::Sum(c) => Agg::Sum(idx(&c)?),
-            NamedAgg::Min(c) => Agg::Min(idx(&c)?),
-            NamedAgg::Max(c) => Agg::Max(idx(&c)?),
-        };
-        Ok(QueryIr::Reduce {
-            input: Box::new(base),
-            key,
-            agg,
-        })
     }
 
     /// Build a runnable parser from a declared `form`. This is
