@@ -1,13 +1,11 @@
-//! **The context enfilade (G-5): DSPative inherited context — and the durable
-//! catalog and schema registry that ride on it.**
+//! **The context enfilade (G-5): the durable catalog and schema registry.**
 //!
-//! Context — namespace, schema, authority, placement, simulation parameters —
-//! flows **down** a scope cover: a child scope inherits its ancestors' context
-//! unless it overrides a key (Xanadu's *dsp*-inherited context, `idea.md` §3/§10).
-//! A scope is a path of ids (an enclosing namespace/zone/actor); resolving a key
-//! at a scope returns the value set at the **nearest enclosing** scope.
+//! In the design (`idea.md` §1, §10) context — namespace, schema, authority,
+//! placement, simulation parameters — flows **down** a scope cover as
+//! DSP-inherited context. That inheritance is not built yet: today every binding
+//! lives at the root scope, and the scope column is reserved for it.
 //!
-//! This is a real enfilade, not a map beside one: bindings live in a persistent,
+//! The bindings themselves are a real enfilade, not a map beside one: bindings live in a persistent,
 //! measured [`Tree`] over the granfilade, versioned and structurally shared like
 //! the Fact and Edition enfilades, and reachable from GC as a live root.
 //!
@@ -24,7 +22,6 @@
 //! Key layout, all under one ordered tree:
 //!
 //! ```text
-//! (scope, NS_USER,    name)            -> the binding's value
 //! (scope, NS_CATALOG, name)            -> Int(rel id)
 //! (scope, NS_SCHEMA,  rel, edition)    -> Bytes(wire::encode_schema)
 //! ```
@@ -41,8 +38,8 @@ pub type Scope = Vec<u64>;
 /// The context enfilade: one persistent measured tree of scoped bindings.
 pub type ContextEnf = Tree<Tuple, Value, Count>;
 
-/// Ordinary inherited context (namespace, placement, simulation parameters).
-pub const NS_USER: i64 = 0;
+// Namespace 0 is reserved for scope-inherited context bindings.
+
 /// The relation-name catalog.
 pub const NS_CATALOG: i64 = 1;
 /// The edition-versioned schema registry.
@@ -53,11 +50,6 @@ pub const ROOT_SCOPE: &[u64] = &[];
 
 fn scope_value(scope: &[u64]) -> Value {
     Value::Tuple(scope.iter().map(|s| Value::Int(*s as i64)).collect())
-}
-
-/// `(scope, NS_USER, name)`.
-pub fn user_key(scope: &[u64], name: &str) -> Tuple {
-    Tuple::from([scope_value(scope), Value::Int(NS_USER), Value::text(name)])
 }
 
 /// `(root, NS_CATALOG, name)`.
@@ -110,64 +102,16 @@ pub fn schema_all_span(rel: RelId) -> (Tuple, Tuple) {
     )
 }
 
-/// The value bound to `key` as-of `scope` in `enf`: the binding at the **nearest
-/// enclosing** scope (the longest prefix of `scope`, including `scope` itself),
-/// or `None`. `O(depth · log n)` — one enfilade probe per enclosing scope.
-pub fn resolve<'a>(enf: &'a ContextEnf, scope: &[u64], key: &str) -> Option<&'a Value> {
-    for len in (0..=scope.len()).rev() {
-        if let Some(v) = enf.get(&user_key(&scope[..len], key)) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// Bind `key = val` at `scope`, returning the new enfilade version (persistent —
-/// the prior version is unchanged and shares every untouched node).
-pub fn bind(enf: &ContextEnf, scope: &[u64], key: &str, val: Value) -> ContextEnf {
-    enf.insert(user_key(scope, key), val)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn context_inherits_down_scopes_and_overrides() {
-        let mut c = ContextEnf::new();
-        c = bind(&c, &[], "namespace", Value::text("root"));
-        c = bind(&c, &[], "schema", Value::Int(1));
-        c = bind(&c, &[1], "namespace", Value::text("zone-1")); // override in zone 1
-
-        // A deep scope inherits the nearest enclosing binding.
-        assert_eq!(resolve(&c, &[1, 2, 3], "namespace"), Some(&Value::text("zone-1")));
-        // …and still inherits root for keys zone-1 didn't override.
-        assert_eq!(resolve(&c, &[1, 2, 3], "schema"), Some(&Value::Int(1)));
-        // A sibling scope not under zone 1 sees the root namespace.
-        assert_eq!(resolve(&c, &[9], "namespace"), Some(&Value::text("root")));
-        // The overriding scope itself sees its own value.
-        assert_eq!(resolve(&c, &[1], "namespace"), Some(&Value::text("zone-1")));
-        // An unbound key is None everywhere.
-        assert_eq!(resolve(&c, &[1, 2], "placement"), None);
-    }
-
-    /// Binding is persistent: an older version of the context is unaffected by a
-    /// later override, exactly as an older edition of the world is.
-    #[test]
-    fn bindings_are_persistent_versions() {
-        let v0 = bind(&ContextEnf::new(), &[], "namespace", Value::text("root"));
-        let v1 = bind(&v0, &[], "namespace", Value::text("moved"));
-        assert_eq!(resolve(&v0, &[], "namespace"), Some(&Value::text("root")));
-        assert_eq!(resolve(&v1, &[], "namespace"), Some(&Value::text("moved")));
-    }
-
-    /// The three namespaces never collide, and each one's span is contiguous —
+    /// The namespaces never collide, and each one's span is contiguous —
     /// which is what makes `entries` and `schema_at` range walks rather than
     /// scans.
     #[test]
     fn namespaces_are_disjoint_contiguous_spans() {
         let mut c = ContextEnf::new();
-        c = bind(&c, &[], "namespace", Value::text("root"));
         c = c.insert(catalog_key("located"), Value::Int(1));
         c = c.insert(catalog_key("named"), Value::Int(2));
         c = c.insert(schema_key(RelId(1), 5), Value::Bytes(vec![9].into()));

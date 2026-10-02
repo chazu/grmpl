@@ -30,17 +30,13 @@ use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::{Dsp, DspEnf};
 use crate::granfilade::{ContentKey, Granfilade, StagedWrite};
-use crate::measure::{Count, SumDiff};
+use crate::measure::Count;
 use crate::tree::Tree;
 
-/// The Fact enfilade: `tuple → net Σdiff` (nonzero only).
-///
-/// It carries **two** upward measures (plan v5 §G-3): the entry [`Count`], and
-/// the [`SumDiff`] of the weights beneath each node. A product of monoids is a
-/// monoid, so this needs no tree machinery — and it means "how many rows" and
-/// "what is their total weight" over any key span are both `O(log n)` folds of
+/// The Fact enfilade: `tuple → net Σdiff` (nonzero only), measured by the entry
+/// [`Count`], so "how many rows" over any key span is an `O(log n)` fold of
 /// cached summaries, materializing nothing.
-type FactMeasure = (Count, SumDiff);
+type FactMeasure = Count;
 type FactTree = Tree<Tuple, Diff, FactMeasure>;
 /// The Edition enfilade: `(edition, submit_index) → (tuple, diff)` raw log.
 type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
@@ -331,20 +327,7 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("count_at", at.0, inner.watermark));
         }
-        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).0 .0).unwrap_or(0))
-    }
-
-    /// **WID weight measure (G-3).** The total net weight of `rel`'s tuples in
-    /// `[lo, hi)` as-of `at` — folded from cached subtree summaries in
-    /// `O(log n)`, without materializing a single row. Where `count_at` answers
-    /// "how many", this answers "how much": the aggregate reads the tree's shape
-    /// rather than its contents.
-    pub fn weight_at(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<i64> {
-        let inner = self.inner.lock().unwrap();
-        if at.0 < inner.watermark {
-            return Err(door("weight_at", at.0, inner.watermark));
-        }
-        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).1 .0).unwrap_or(0))
+        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).0).unwrap_or(0))
     }
 
     /// **Arrangements (G-9).** Ensure `rel` has an ordering led by column `col`,
@@ -1293,7 +1276,7 @@ impl TraceStore for EntStore {
     /// **Subtree-pruned version compare (E6).** The Ent's override of the
     /// substrate's state-difference primitive: two editions that share a Fact
     /// root compare in `O(1)`, and below that the descent prunes on shared
-    /// content keys and disjoint `KeyBounds`, so the cost is the size of the
+    /// content keys, so the cost is the size of the
     /// difference rather than the size of the relation — where the default must
     /// read both ends in full.
     ///

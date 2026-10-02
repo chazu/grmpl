@@ -1,15 +1,13 @@
 //! # grmpl-ent
 //!
-//! The **Ent**: grmpl's authoritative substrate as a coordinated family of
-//! persistent, measured, versioned *enfilades* over a shared granfilade — the
-//! goal being parity with Xanadu Gold's `Ent`
-//! (see [`docs/ENT-MIGRATION-PLAN.md`](../../../docs/ENT-MIGRATION-PLAN.md) and
-//! [`docs/ENT-AND-XANADU.md`](../../../docs/ENT-AND-XANADU.md)).
+//! The **Ent**: grmpl's authoritative substrate as a family of persistent,
+//! measured, versioned trees over a shared content-addressed node store (the
+//! [`granfilade`]), modeled on Xanadu Gold's `Ent`.
 //!
-//! This crate is being built bottom-up. Present: the enfilade primitive — a
-//! persistent measured weight-balanced [`tree::Tree`] with WID range measures.
-//! Next: the granfilade (content-interned node store on fjall), then the Edition
-//! and Fact enfilades implementing the `grmpl-core` store traits.
+//! The trees ([`tree::Tree`]) are path-copied B+trees keyed by absolute tuples,
+//! with monoidal subtree measures. They are not yet enfilades in the Udanax
+//! sense: nodes carry no displacements, so relocation and virtual copy are not
+//! `O(1)`. See `docs/ENT-AND-XANADU.md` for the gap.
 
 pub mod canopy;
 pub mod context;

@@ -19,8 +19,8 @@
 //!
 //! It is an enfilade rather than an array-plus-segment-tree (G-4) so that
 //! registering an interest is an `O(log n)` persistent insert instead of an
-//! `O(n log n)` rebuild, and so the canopy **versions, persists and GCs with the
-//! rest of the world** rather than sitting beside it in memory.
+//! `O(n log n)` rebuild. It is **not persisted**: `EntStore` rebuilds it empty on
+//! open and on fork, and watchers re-register their interests.
 //!
 //! Each interest carries an **endorsement** (a monotone flag-lattice element);
 //! [`route_endorsed`] gates delivery on an interest holding every required flag —
