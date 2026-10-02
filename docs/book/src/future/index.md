@@ -22,10 +22,11 @@ here, because each one was on this page as future work and is now load-bearing:
   *trailing*-column equality prunes at the source too, not just a lead-column
   one. It was, as predicted, purely "more measured trees."
 - **Subtree-pruned version-compare** — backfollow now prunes at every node, on
-  shared content keys and on disjoint `KeyBounds`, so comparing two editions
-  costs the size of the difference.
+  shared content keys, so comparing two editions costs the size of the
+  difference.
 - **Persistent Derived enfilades** — a materialized view is an ordinary relation
-  in the Fact enfilade, so it survives a reopen and is carried by a fork.
+  in the Fact enfilade, so it survives a reopen and is carried by a fork. Built
+  and tested, but nothing in the runtime maintains one yet.
 - **The canopy on the reactive path** — the canopy is an enfilade, and the pump
   routes through the substrate instead of re-evaluating on every pump.
 
@@ -76,8 +77,8 @@ edition in `O(depth)`:
   deterministic by law.
 - **Lag compensation** — resolve an action against the edition the client saw.
 - **Forked instances and instanced worlds** — `fork_edition` is an `O(edit)`
-  virtual copy of the *whole world*; the MOO's `enter vault` already does this at
-  room scale.
+  virtual copy of the *whole world*. The MOO's `enter vault` instances a room
+  by copying a template's facts (`O(template)`), not yet by virtual copy.
 - **Speculative NPC planning** — fork, simulate ahead, discard or commit.
 - **Undoable construction** — building is patching; undo is an older root.
 - **Client snapshots** — hand a client an opaque edition; deltas bring it
@@ -108,8 +109,8 @@ cheap enough to be interactive.
 ## Parsing and transformation over measured sequences
 
 The **Pattern law** says parsing is matching over ordered data, and the pattern
-engine already uses content-keyed match arrangements and windowed measured
-matching over sequences. Pushing this further — representing token streams, ASTs,
+engine already matches over ordered inputs, including finite windows of signed
+deltas (`DeltaInput`). Pushing this further — representing token streams, ASTs,
 and byte streams as **measured enfilades** — lets parsing reuse the very same
 split/search/summary/incremental-update machinery as the rest of the system:
 incremental reparse of a huge input touches only the edited span, ambiguous
@@ -122,7 +123,8 @@ becomes one more enfilade.
 The through-line: grmpl already earns the name `Ent` by its laws and by an
 implementation with every distinctive structural component present *and on the
 running system's path*. The building phase is over; the persistent derived layer
-that used to head this chapter is now in the Fact enfilade with everything else.
+that used to head this chapter is now in the Fact enfilade with everything else,
+though not yet wired into the runtime.
 What is left is to **spend** that structure — turning `O(depth)` search,
 `O(edit)` copy, upward interest summaries, and downward inherited context into a
 provenance surface, a parser, and, ultimately, a distributed world that migrates

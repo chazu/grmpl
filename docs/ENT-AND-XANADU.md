@@ -2,22 +2,25 @@
 
 grmpl's `ent` is **not** short for "entity." It is named for, and consciously
 derived from, the **`Ent`** at the heart of Project Xanadu's "Gold" design —
-K. Eric Drexler's versioning enfilade. grmpl's own founding note
+K. Eric Drexler's versioning enfilade. grmpl's founding note
 ([`idea.md`](../idea.md)) opens the whole project as a thought experiment on *"how
 to 'complete' the ent data structure plex,"* with the explicit design criterion
 that the language *"should use the ent (or the set of data structures we settle
 on as our version of the ent) as its backbone."*
 
-So the right question is not "is this a coincidence?" (it isn't) but: **how much
-of Xanadu's `Ent` does grmpl actually implement today?** This note answers that by
-reading both sides directly — the Udanax Gold Smalltalk source (`udanax-top.st`)
-and grmpl's design note and store.
+This note answers: **how much of Xanadu's `Ent` does `grmpl-ent` actually
+implement?** It was rewritten after `grmpl-store` (the fjall LSM stand-in) was
+deleted and `grmpl-ent` became the only substrate; the previous version assessed
+the LSM.
 
-**The headline:** grmpl faithfully implements the `Ent`'s **semantic contract and
-design laws**, but runs them today on an **LSM log that is a stand-in for the
-`Ent`'s data structure**, not the measured, WID/DSP-summarized persistent tree
-the design names. The vision is deeply Xanadu; the current storage layer is not
-yet an enfilade.
+**The headline:** the *design* is faithful to the Ent, and `grmpl-ent` realizes
+its most important ideas — never overwrite, path-copied structural sharing,
+versions as roots, version compare that costs the size of the change, content-
+addressed persistence, interest routing. But the tree itself is a
+**content-addressed persistent B+tree keyed by absolute tuples**, with cached
+monoid summaries. It has no displacements in its nodes, so it is not an
+enfilade in the Udanax sense, and the Xanadu mechanisms that depend on relative
+coordinates — `O(1)` virtual copy, DSP-inherited context — are not built.
 
 ---
 
@@ -106,93 +109,117 @@ dataflow** (Derived enfilades, `watch` = the maintained derivative of `find`).
 
 ---
 
-## 3. What grmpl actually *implements* today
+## 3. What `grmpl-ent` implements
 
-Here is the honest part. The shipping backbone is
-[`grmpl-store`](../crates/grmpl-store) — a **fjall LSM** (log-structured merge
-tree), described in [`docs/PERFORMANCE.md`](PERFORMANCE.md). It delivers the
-`Ent`'s **semantics** but not its **data structure**:
+`grmpl-ent` builds every structure on one primitive, `tree::Tree<K, V, M>`, and
+persists all of them through one node store, the `granfilade`.
 
-* **Facts** are an **append-only log per relation** (`key = edition‖counter`),
-  consolidated on read — **not** a measured tree. There are **no WIDative subtree
-  summaries and no secondary index**. Consequences, straight from the perf notes:
-  a precondition check (`holds_at`) is **O(relation history)** linear scan, and
-  every join **re-reads whole relations**. This is *precisely* the cost a wid/dsp
-  measured tree exists to avoid (`O(depth)` range/containment).
-* **Editions** are a global monotonic clock over the log, with **checkpoints**
-  (consolidation) to bound history — a real *edition* model, but a *flat log*, not
-  an Edition enfilade with a branch/ancestry DAG. There is no `fulltrace`-style
-  causal DAG in the store yet (branches exist only as separately-forked stores).
-* **Copies** (`fork`) are a **verbatim `O(state)` copy** of the keyspaces — the
-  opposite of structural sharing. A Xanadu virtual copy is `O(edit)`; grmpl's is
-  `O(everything live)`.
-* **DSPative context** is **not propagated through a tree**. Authority/schema are
-  real (checked at the commit boundary via `Authority` scopes and the schema
-  catalog), but they are looked up, not inherited down an enfilade's dsps. There
-  is no Context enfilade.
-* **The canopy is real but not enfilade-indexed.** `on watch` is a genuine
-  maintained-query pump with exactly-once durable delivery (the Attention law
-  holds), but interest routing is per-watcher, not compiled into wid-summarized
-  scope covers — the `idea.md` "sensor canopy" is semantics-complete and
-  structure-incomplete.
-* **Derived enfilades** exist as behavior, not storage: `grmpl-diff` maintains
-  views incrementally (`eval_delta`, arrangements), but arrangements are an
-  in-memory per-eval memo, not a persistent derived tree.
+**The primitive is a persistent B+tree, not an enfilade.**
 
-The one place grmpl already reaches the `Ent`'s *data-structure* idea is the
-**pattern engine**: `grmpl-pattern`/`grmpl-diff` P9c uses a content-keyed
-`MatchArrangement` and windowed measured matching over sequences — "sequence data
-… represented by measured enfilades" (`idea.md` §6) is partially real there,
-including a **stable, content-addressed** arrangement identity (the fix for the
-`Arc::as_ptr` memo hazard). That is the closest the codebase comes to an actual
-measured/summarized tree.
+* Nodes hold up to 64 entries or children (`tree::B`), are immutable and
+  `Arc`-held, and an insert path-copies only the root-to-leaf spine
+  (`Tree::insert`). A new version costs `O(log n)` new nodes and shares
+  everything else. **This is genuine Ent-style structural sharing.**
+* Keys are **absolute**: a node is located by its separator keys, and a range
+  read prunes by passing absolute bounds down the descent (`Tree::fold_range`).
+  No node stores a displacement and nothing composes on the way down. In an
+  enfilade, a subtree's position is relative to its parent (the *dsp*), which is
+  what lets a subtree be relocated or virtually copied by changing one number.
+* Each node caches a monoid **measure** of its subtree (`measure::Measure`). This
+  is a classic augmented tree. The only measure in use is `Count` (entry count),
+  which answers "how many rows in this span" and "did anything change in this
+  edition range" in `O(log n)`.
+* Shape depends on the order of operations, so a content key identifies a
+  *shape*, not a logical value. Sharing is within one version lineage.
+
+**Structures built on it:**
+
+| Structure | What it is | Persisted how |
+|---|---|---|
+| Fact trees | one `Tree<Tuple, Diff, Count>` per relation per live edition | nodes in the granfilade; the root pointer per edition in fjall's `meta` keyspace |
+| Edition log | `(edition, index) → (tuple, diff)` | granfilade; root pointer in `meta` |
+| Version / relation directories | `edition → Fact root`, the live-relation set | **in memory**, rebuilt from the `meta` root pointers on open |
+| Context tree | the name→`RelId` catalog and edition-versioned schemas, at the root scope | granfilade; root pointer in `meta` |
+| Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs | **in memory**, rebuilt empty on open and fork; watchers re-register |
+| Branch DAG | branches with at most one parent (a tree; no merges), and common-ancestor lookup | a hand-encoded blob in `meta` |
+| Granfilade | `SHA-256(frame) → frame`, with mark-and-sweep GC | fjall `nodes` keyspace; loaded **eagerly** on open, so the world is RAM-resident |
+
+Everything the language stores goes through these trees: world relations,
+inboxes, cursors, timers, counters, outboxes and materialized views are all
+ordinary relations in the Fact trees. The edition clock, watermark and root
+pointers are raw values in fjall's `meta` keyspace.
+
+**Operations:**
+
+* **Version compare** (`Tree::diff`, used by `EntStore::compare` and the
+  differential engine) skips any subtree the two versions share, by pointer or
+  content key, so it costs the size of the difference. This is the Ent's
+  version-comparison idea, realized.
+* **Fork** (`EntStore::fork_at`) shares every fact node and writes none, but
+  rebuilds each relation's version directory, so it costs
+  `O(relations × versions)`, not `O(1)`.
+* **DSP instancing** (`EntStore::instance_template`) reads a template block
+  through a shifted view (`dsp::DspEnf`) and then **commits copied facts**, so an
+  instance costs `O(template)`. A `Dsp` here is one shift of a whole query's
+  entity coordinates, not a per-node displacement.
+
+**Outside the Ent entirely:** the differential engine's working state —
+arrangements and multisets in `grmpl-diff` — is plain in-memory hash maps. The
+one persistent derived structure, `grmpl_proc::Materialized`, writes a view's
+output into an ordinary relation, so it does live in the Ent, but nothing in the
+runtime uses it yet.
 
 ---
 
-## 4. Scorecard: `Ent` property → in grmpl's vision? in its implementation?
+## 4. Scorecard
 
-| `Ent` / enfilade property                         | grmpl design (`idea.md`) | grmpl implementation (today)                        |
-|---------------------------------------------------|--------------------------|-----------------------------------------------------|
-| Never overwrite; historical editions retained     | ✅ core law              | ✅ append log + editions + as-of reads              |
-| Opaque edition/snapshot identity                   | ✅ explicit law          | ✅ `Edition` opaque; replay/forks proven identical  |
-| Patch = guarded, atomic next-edition               | ✅ semantic center       | ✅ `commit_if`, one authority domain per commit     |
-| Watch = maintained derivative of find              | ✅ Attention law         | ✅ `on watch`, exactly-once durable canopy pump     |
-| Persistent **measured tree** (Loaf/Crum)           | ✅ "measured action tree" | ❌ LSM append-log per relation                      |
-| **WIDative** upward summaries (range/measure index) | ✅ "WIDative summaries"  | ❌ none → O(history) preconds, O(relation) joins    |
-| **DSPative** inherited context down scopes         | ✅ "Context enfilades"   | ⚠️ authority/schema checked, not tree-propagated    |
-| **Structural sharing** / cheap virtual copy        | ✅ "cheap split/join"    | ❌ `fork` is O(state) verbatim copy                 |
-| Branch/ancestry DAG (`fulltrace`)                  | ✅ "Edition enfilades"   | ⚠️ editions are linear; branches = separate forks   |
-| Canopy interest compiled to scope covers           | ✅ "Canopy enfilades"    | ⚠️ per-watcher pump, not wid-indexed routing        |
-| Differential derived state                         | ✅ "Derived enfilades" (extends Xanadu) | ⚠️ in-memory arrangements, not persistent |
-| Measured trees for **sequences/parsing**           | ✅ §6                    | ⚠️ partial: P9c content-keyed `MatchArrangement`    |
+| Ent / enfilade property | In the design (`idea.md`) | In `grmpl-ent` |
+|---|---|---|
+| Never overwrite; historical editions retained | ✅ core law | ✅ versions are roots; as-of reads |
+| Opaque edition identity | ✅ explicit law | ✅ `Edition` is opaque to the language |
+| Patch = guarded, atomic next edition | ✅ semantic center | ✅ `commit_if`, group-committed |
+| Structural sharing / path copy | ✅ | ✅ `O(log n)` new nodes per commit |
+| Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees |
+| Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd; eager load |
+| Measured tree with upward summaries | ✅ "WIDative summaries" | ⚠️ augmented B+tree; `Count` only |
+| **DSP displacements composing down the tree** | ✅ "DSPative inherited context" | ❌ absolute keys; no dsp in nodes |
+| **`O(1)` virtual copy / relocation** | ✅ "cheap split/join" | ❌ instancing is `O(template)` |
+| DSP-inherited context down scopes | ✅ Context enfilades | ❌ catalog and schemas only, at the root scope |
+| Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ branch tree, no merges; stored as a blob |
+| Canopy indexing interest | ✅ Canopy enfilades | ⚠️ real interval routing, but in memory |
+| Derived state in the Ent | ✅ Derived enfilades | ⚠️ `Materialized` exists, unwired; engine state in memory |
+| Sequences as measured enfilades (§6 parsing) | ✅ | ❌ |
+| Udanax Green 2D enfilades (poom/span) | — | ❌ |
 
 ---
 
 ## 5. Verdict
 
-grmpl is, by intent and by its laws, **a reconstruction of Xanadu's `Ent`** — and
-a genuine generalization of it, from a hypertext-document engine to a relational,
-differential, versioned world substrate. Everything the `Ent` is *for* — a world
-that is never overwritten, permanent opaque identity, cheap history, maintained
-interest — is present and load-bearing in grmpl, encoded as explicit design laws
-(`idea.md` §12) rather than lore.
+The design is a faithful, ambitious generalization of the Ent, and the
+implementation has the Ent's **versioning** right: immutable versions, path
+copying, cheap history, comparison that costs the change, content-addressed
+persistence. What it does not have is the Ent's **coordinate system**. Its tree
+is a Merkle B+tree over absolute tuple keys — closer to Datomic or Dolt than to
+Udanax — with Xanadu vocabulary on some of its parts.
 
-What grmpl has **not yet built** is the `Ent`'s actual *data structure*. The
-current store is a pragmatic LSM that provides the enfilade's **semantics** over a
-flat append log — no measured tree, no WID summaries, no DSP-inherited context, no
-structural sharing. That gap is exactly why the perf notes flag O(history)
-preconditions and O(relation) joins as the open problem: those are the costs a
-wid/dsp measured tree makes `O(depth)`. In other words, **the distance between
-grmpl-today and Xanadu's `Ent` is precisely the distance `idea.md` already
-names** — replace "append log + linear scan + verbatim fork" with a "persistent
-measured action tree + WIDative summaries + DSPative context + structural
-sharing." The roadmap's P13 statefulness / indexed-lookup work is the first step
-of that migration; the P9c content-addressed match arrangements are a first
-foothold on the other side.
+Making it a true enfilade means changing the primitive, not adding modules:
 
-So: **semantically, a close and faithful implementation of the Ent; structurally,
-an LSM stand-in that has not yet become an enfilade.** The name is earned by the
-contract, not (yet) by the tree.
+1. **Relative positions in nodes.** Each child carries a displacement relative
+   to its parent, and a descent accumulates them. Widths become the extent of a
+   subtree in that coordinate space, not just a cached count.
+2. **`O(1)` relocation and virtual copy** fall out of (1): a template instance
+   becomes a new parent node that points at the template's subtree with a
+   different displacement, and diverges copy-on-write.
+3. **Context inheritance** becomes a DSP down a scope tree rather than repeated
+   point lookups.
+4. **Persist what is now rebuilt:** the version and relation directories, the
+   canopy, and the branch DAG as trees in the granfilade, and load lazily
+   rather than eagerly.
+
+`store.rs` and everything above it — the `TraceStore` contract, the language,
+the laws — can stay as they are while the primitive changes underneath, and the
+conformance suite (`grmpl-conformance`) is the place to run the current B+tree
+as an oracle against the new one.
 
 ---
 
@@ -204,6 +231,6 @@ contract, not (yet) by the tree.
   `Arrangement`/`Dsp` coordinate spaces. Background:
   [Enfilade (Xanadu)](https://en.wikipedia.org/wiki/Enfilade_(Xanadu)),
   [xanadu.com/tech](https://xanadu.com/tech/).
-* grmpl read directly: [`idea.md`](../idea.md) (the founding design note — the
-  "completed Ent plex," §1, §5, §6, §10, §12), `crates/grmpl-core/src/value.rs`,
-  `crates/grmpl-store/src/lib.rs`, and [`docs/PERFORMANCE.md`](PERFORMANCE.md).
+* grmpl read directly: [`idea.md`](../idea.md) and `crates/grmpl-ent/src/`
+  (`tree.rs`, `granfilade.rs`, `store.rs`, `dsp.rs`, `context.rs`, `canopy.rs`,
+  `dag.rs`, `measure.rs`).

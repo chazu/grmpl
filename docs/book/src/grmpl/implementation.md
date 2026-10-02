@@ -10,17 +10,16 @@ the Part I mechanism it realizes.
 ```text
 crates/grmpl-ent/src/
   tree.rs         the enfilade primitive — persistent measured tree
-  measure.rs      the WID monoid family (Measure; Count, SumDiff, KeyBounds)
-  hash.rs         SHA-256, vendored and pinned — the content-key hash
+  measure.rs      the WID monoid (Measure; Count)
   granfilade.rs   content-addressed node store; structural sharing on disk
   store.rs        the enfilades that make an EntStore (the store traits)
   dsp.rs          DSP coordinate transforms (Dsp, DspEnf)
   dag.rs          the branch/edition DAG (DagWood: Branch, BranchId, Dag)
   canopy.rs       interest routing (interval enfilade + endorsement flag-lattice)
-  context.rs      the context enfilade (inherited scopes)
+  context.rs      the context enfilade (catalog + schema registry, root scope)
 
 crates/grmpl-proc/src/
-  derived.rs      the Derived enfilade — materialized views that survive reopen
+  derived.rs      the Derived enfilade — materialized views (tests only)
 ```
 
 ## The enfilade primitive — `tree.rs`, `measure.rs`
@@ -36,29 +35,16 @@ sit under the language at all. A node holding a run of crums is, in Gold's terms
 a **loaf**.
 
 `measure.rs` defines the `Measure` trait (an associative fold with identity) and
-a small **family** of measures, because a product of monoids is a monoid — a tree
-can carry several upward summaries at once with no new tree machinery:
-
-- **`Count`** — the entry count. Every enfilade carries at least this; it is what
-  makes "how many" a read of cached summaries.
-- **`SumDiff`** — the Σ of entry *weights* beneath a node. The Fact enfilade's
-  values *are* net weights, so this makes "what is the total weight over this key
-  span" an `O(log n)` fold rather than a materialize-then-sum: the difference
-  between an aggregate reading the tree's *shape* and reading its *rows*.
-- **`KeyBounds`** — the least and greatest key beneath a node. This is not what
-  prunes an ordinary range read (a B+ node's separators already carry that); it
-  earns its place in comparisons *between two versions*, where a subtree whose
-  key span is disjoint from the other side's cannot contribute a difference and
-  so can be dismissed without descent.
-
-The Fact enfilade carries the pair `(Count, SumDiff)`; the canopy carries its own
-`Reach`. Adding a measure is adding a monoid, not a tree.
+**`Count`** — the entry count, which is what makes "how many" a read of cached
+summaries. Every enfilade carries at least this; the Fact enfilade carries only
+this. The canopy carries its own `Reach`. Adding a measure is adding a monoid,
+not a tree.
 
 The primitive already delivers the two Part I superpowers in miniature:
 
 - `t.measure()` is the whole-tree fold; `t.measure_range(&lo, &hi)` is the
   **WID-pruned** range fold — it reads node summaries and skips whole subtrees to
-  answer "how much lies in `[lo, hi)`" in `O(log n)`.
+  answer "how many lie in `[lo, hi)`" in `O(log n)`.
 - Old versions are immutable and cheap: a retained snapshot is unaffected by
   later edits, and the edit that produced the new version allocated only
   `O(log n)` nodes.
@@ -96,7 +82,8 @@ This is the mechanism behind cheap history *on disk*, not just in memory: a
 commit grows the store by only the edited path, and reachability GC from retained
 roots reclaims what no live edition points at.
 
-> The hash is part of the on-disk format, so it is pinned: SHA-256, vendored and
+> The hash is part of the on-disk format, so it is pinned: SHA-256
+> (`grmpl_core::hash`), vendored and
 > checked against the FIPS vectors. The previous `DefaultHasher` had neither
 > property it needed — `std` does not specify its algorithm across releases (a
 > granfilade could hash differently under a new toolchain), and its fixed known
@@ -123,7 +110,7 @@ The two that carry the semantics:
   consolidation, and GC. `assert; retract; assert` is three entries, not a net.
 - **The Fact enfilade** (`tuple → net Σdiff`) serves `read_at`/`holds`/joins —
   the net-per-tuple state, tuple-keyed and measured, delivered tuple-sorted with
-  zero-weight tuples absent. It carries the `(Count, SumDiff)` measure pair.
+  zero-weight tuples absent. It carries the `Count` measure.
 
 And the four directories that hold them, each an enfilade in its own right:
 
@@ -147,11 +134,12 @@ And the four directories that hold them, each an enfilade in its own right:
 Beside them sit the **context enfilade** — carrying the durable catalog and the
 edition-versioned schema registry as bindings at the root scope, so `schema_at`
 is a WID range walk over the relation's `(rel, edition)` span rather than a scan
-— the **canopy**, and the **branch enfilade** of the `DagWood`. All of them are
-live GC roots.
+— the **canopy**, and the **branch enfilade** of the `DagWood`. The context and
+branch enfilades are persisted and are live GC roots; the canopy and the
+fired-interest enfilade are in memory only, rebuilt empty on open and on fork.
 
 A single commit opens one transaction over the granfilade, writes the touched
-nodes of every one of them plus the edition bump, and issues one durable sync —
+nodes of the relation's enfilades plus the edition bump, and issues one durable sync —
 the Patch–edition law realized as one atomic batch. A commit writes only the
 version it created, not every live one. The store contract this satisfies —
 determinism, the patch–edition law, history and consolidation, fork identity — is
@@ -190,22 +178,22 @@ mechanism but the same primitive replicated per order — more measured trees.
 
 ## DSP coordinate transforms — `dsp.rs`
 
-`Dsp` and `DspEnf` implement the displacement algebra: `DspNode(child,
-displacement)` shares the child subtree and composes the displacement on the way
-down. This is `O(1)` relocation and the `O(edit)` virtual copy — the one thing
-content-hashing *alone* cannot do, because it relocates shared content rather
-than duplicating it.
+`Dsp` and `DspEnf` implement a minimal displacement: a `Dsp` is an invertible
+shift of a key's entity coordinate, and `DspEnf::relocate` wraps a shared Fact
+tree as a displaced *read view* without copying it. Gold's dsps live in the
+nodes and compose down the descent, which is what makes relocation and virtual
+copy `O(1)`; that is **not built** here.
 
-The subtle part landed in `E6c`: the dsp is **threaded through the WID walk**.
-`DspEnf` answers a displaced `range` / `measure_range` by transforming the
-*query* into the shared tree's own coordinates and pruning there — so a virtual
-copy is still searched in `O(result + log n)` with no materialization. Relocation
-and fast search compose instead of fighting.
+The dsp is **threaded through the WID walk**: `DspEnf::range_all` answers a
+displaced range by transforming the *query* into the shared tree's own
+coordinates and pruning there, so reading a relocated span costs
+`O(result + log n)` with no materialization of the whole tree.
 
-In the playable world this is *instancing*: the MOO's `enter vault` / `leave`
-verbs spin up a private, disjoint sub-world as a DSP virtual copy of a template
-and tear it down again — each party's dungeon sharing the template's structure
-until it diverges.
+In the playable world this is *instancing*: `grmpl run`'s `enter vault` /
+`leave` verbs spin up a private, disjoint sub-world from a template and tear it
+down again. `EntStore::instance_template` reads the template through the
+displaced view and **commits the relocated facts**, so an instance costs
+`O(template)` — a real copy, not a virtual one.
 
 ## The branch/edition DAG — `dag.rs`
 
@@ -232,12 +220,12 @@ base) — and reachability GC roots from every branch.
 **Backfollow / version-compare** is subtree-pruned at every level. `compare`
 short-circuits when two editions share a Fact root — but it also does so at
 *every node beneath* the root, because two versions that share a subtree share it
-by content key, and a subtree whose `KeyBounds` are disjoint from the other
-side's cannot contribute a difference. So comparing two editions costs the size
-of the *difference*, not the size of the relation: structural sharing, which
-makes history cheap to store, is the same thing that makes history cheap to
-compare. This is Gold's `HistoryCrum inTrace:` in grmpl's terms — trace
-membership answered as an upward measure rather than a walk.
+by content key, so the walk dismisses it without descent. Comparing two
+editions therefore costs the size of the *difference*, not the size of the
+relation: structural sharing, which makes history cheap to store, is the same
+thing that makes history cheap to compare. Gold's `HistoryCrum inTrace:` (trace
+membership as an upward measure) has no counterpart here; the pruning is on
+shared content only.
 
 ## The canopy — `canopy.rs`
 
@@ -260,8 +248,9 @@ negative would be a lost update, and the lattice makes that unrepresentable.
 
 It is a real enfilade: interests live in the same persistent measured tree as
 everything else, keyed `(rel, lo, id)` so one relation's interests are a
-contiguous low-endpoint-ordered span, and it round-trips through the granfilade.
-Registering is an `O(log n)` persistent insert.
+contiguous low-endpoint-ordered span. Registering is an `O(log n)` persistent
+insert. It is **not persisted**: the store rebuilds it empty on open and on
+fork, and watchers re-register their interests.
 
 **Routing is load-bearing, but by a coarser mechanism than the canopy.** The
 reactive pump no longer re-evaluates its view on every pump: it asks the
@@ -286,10 +275,12 @@ never a false negative.
 
 ## The context enfilade — `context.rs`
 
-The context enfilade carries inherited scope down: namespace, schema, placement.
-It is the DSPative-context generalization of dsps from "displacement" to
-"everything a subtree should receive from where it sits." Authority itself lives
-in the canopy's endorsement lattice (Gold-faithful — authority was never a dsp).
+In the design, the context enfilade carries inherited scope down: namespace,
+schema, placement — the DSPative-context generalization of dsps from
+"displacement" to "everything a subtree should receive from where it sits."
+**That inheritance is not built**: there is no scoped lookup, and every binding
+lives at the root scope. Authority itself lives in the canopy's endorsement
+lattice (Gold-faithful — authority was never a dsp).
 
 It is a real enfilade — a persistent measured tree over the granfilade, versioned
 and GC-rooted like the others — and it is load-bearing: the **durable catalog**
@@ -323,6 +314,9 @@ by a lock. It is gated by the same `touched_since` routing as everything else, s
 a refresh over an interval that could not have touched the view does no
 differential work at all.
 
+**It is not wired in.** Nothing in the runtime maintains a `Materialized` view
+yet; only its own tests drive it.
+
 ## Where the LSM stood, and why it is gone
 
 `grmpl-store` — the fjall LSM that stood in for the Ent while the language was
@@ -354,8 +348,8 @@ system's path: measured enfilade, granfilade, WID pruning on lead *and* trailing
 columns, DSP transforms (on the instancing path), durable structural-sharing
 forks, the Fact / Edition / Version / Rel / Arrangement / context / canopy /
 branch enfilades, the `DagWood`, an interval-enfilade canopy the pump routes
-through, subtree-pruned backfollow, and a persistent Derived enfilade. No module
-in `grmpl-ent` has zero callers.
+through, and subtree-pruned backfollow. No module in `grmpl-ent` has zero
+callers. The Derived enfilade exists but is not yet on that path.
 
-What remains is not wiring but *reach*: the enhancements the structure makes
+Beyond that, what remains is *reach*: the enhancements the structure makes
 newly possible. Part IV describes them.

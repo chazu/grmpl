@@ -111,7 +111,6 @@ is additive rather than a rewrite.
 | 2 | Authority: one commit touches one domain; cross-domain effects are messages | `DESIGN.md` §2.3 #6, §5.2; checked in `grmpl-proc::commit` | ✅ enforced |
 | 3 | Exactly-once cross-domain apply, no 2PC | `grmpl-proc/src/domain.rs` | ✅ implemented, single-node transport |
 | 4 | A durable causal DAG with `≼` as a measure | `grmpl-ent/src/dag.rs`; `grmpl-ent/tests/durable_fork.rs` | ✅ implemented |
-| 5 | CALM classification — which reads are coordination-free | `grmpl-type/src/calm/`; `DESIGN.md` §10 risk 4 | ✅ implemented (P8c) |
 
 **(1) The option was reserved.** `Edition`'s doc comment says outright: *"In the
 distributed future this becomes a causal frontier; the language treats it as
@@ -137,33 +136,28 @@ atomic commit** as the local effects. `flush_outbox` ships them at-least-once
 and retracts on success; `receive` applies each into the local inbox,
 deduplicating by `(sender, seq)` via the `seen` relation. That is exactly-once
 apply without a distributed transaction — working today over an in-process
-transport. Swapping in `grmpl-transport`'s iroh is a transport change, not a
-semantics change.
+transport. Adding a networked transport (an iroh one was built and then
+removed) is a transport change, not a semantics change.
 
 **(4) The DAG and the routing measure exist.** `grmpl-ent/src/dag.rs` is the
 `DagWood` — the fulltrace's branch structure, durable, encoded/decoded with the
 store. `is_ancestor` *is* `≼`, the question consistent cuts ask constantly;
 `common_ancestor` gives the merge base. `durable_fork.rs` proves ancestry
-survives a reopen and that forks share nodes structurally. Ancestry is answered
-as a **WID upward measure** — subtree-pruned, `O(measure)` — not a DAG walk. And
+survives a reopen and that forks share nodes structurally. Ancestry is a walk
+up the branch lineage, costing the fork depth rather than the history length. And
 the same measure family that answers `touched_since` for local `watch` routing
 is what would tell a cluster where an update must be delivered:
 [`future/index.md`](book/src/future/index.md) — *"canopy interest summaries tell
 the cluster where updates must be routed."*
 
-**(5) The cross-domain read rule is already typed.** `grmpl-type::calm`
-classifies a `QueryIr` monotone iff it contains no `Negate` and no `Reduce`, and
-CALM's theorem says a monotone query reads coordination-free across a domain
-boundary. This is the answer `DESIGN.md` §10 risk 4 reserved — *"the principled
-answer is CALM monotonicity typing; noted now so the effect rows are designed to
-carry it, not retrofitted"* — and P8c delivered it. It substantially discounts
-bill item 2 (Part 3), which is why that item has two treatments rather than one.
+**Not among them: a typed cross-domain read rule.** P8c built a CALM
+classifier (a `QueryIr` is monotone iff it contains no `Negate` and no
+`Reduce`), but nothing called it and it was **removed**. The rule is still the
+answer `DESIGN.md` §10 risk 4 reserved, and bill item 2 (Part 3) leans on it,
+but it would have to be rebuilt.
 
-> **A note on one document.** `docs/ENT-AND-XANADU.md` says there is "no
-> fulltrace-style causal DAG in the store yet" and that `fork` is an `O(state)`
-> verbatim copy. That is a gap analysis of the **deleted** `grmpl-store` LSM,
-> written before the Ent migration; both gaps are closed. Read it as history,
-> not as current state.
+> **A note on one document.** `docs/ENT-AND-XANADU.md` assesses the current
+> `grmpl-ent`. Its earlier version assessed the deleted `grmpl-store` LSM.
 
 ### 3. Four things that are not true yet — the honest ledger
 
@@ -185,7 +179,7 @@ part of the system least disturbed by the change — but the derived `Ord` would
 have to become an explicit lattice (`join`/`meet`) rather than a comparison.
 Encouragingly, an audit shows `Time`'s ordering is barely load-bearing: call
 sites overwhelmingly project `u.time.edition` as a `u64`
-(`grmpl-diff/src/window.rs:334,475`, `grmpl-proc/src/replay.rs:116`), and the
+(`grmpl-proc/src/replay.rs:116`), and the
 `sort()` calls in `grmpl-diff` are over tuples and multisets, not times.
 
 And the largest gap, which is not about ordering at all:
@@ -358,8 +352,9 @@ Covered as bill item 2 in Part 3; it is a stage because it must land with C.
 ### Stage E — the network
 
 At this point a "remote domain" differs from a local shard only in which
-`Transport` its `Domain` holds. `grmpl-transport` (iroh, feature-gated) already
-implements the trait; `domain.rs` already tolerates at-least-once delivery,
+`Transport` its `Domain` holds. `grmpl-transport` implements the trait
+in-process only (its iroh impl was removed), so this stage needs a networked
+transport; `domain.rs` already tolerates at-least-once delivery,
 reordering, and redelivery by construction. Migration of a domain between nodes
 is `fork_edition` plus relocate — `O(edit)`, per
 [`future/index.md`](book/src/future/index.md): *"relation slices and actors
@@ -424,9 +419,9 @@ conservative universal answer, and this document reached for it before checking
 what the project already owns. `DESIGN.md` §10 risk 4 designated the answer to
 this exact question years ago — *"a query may read across authority domains even
 though writes are single-domain; the principled answer is CALM monotonicity
-typing"* — and **P8c implemented it**: `grmpl-type::calm::classify` reads
-monotonicity straight off the `QueryIr`, with a plan monotone **iff it contains
-no `Negate` and no `Reduce`**.
+typing"* — and the test is structural: a plan is monotone **iff it contains no
+`Negate` and no `Reduce`**. (P8c built this classifier; it had no caller and was
+removed, so it must be rebuilt before this treatment is available.)
 
 CALM's result is that a monotone query has a coordination-free evaluation: no
 later input can retract a row the reader already saw, so **a monotone
@@ -437,22 +432,22 @@ domain's growing state directly and still be consistent. Only non-monotone reads
 So the routing rule is a classification, not a policy:
 
 ```text
-classify(plan) == Monotone      → read cross-domain uncoordinated
-classify(plan) == NonMonotone   → pin the cut (first pass)
+no Negate, no Reduce   → read cross-domain uncoordinated
+otherwise              → pin the cut (first pass)
 ```
 
 Three properties make this safe to lean on. The classification is **structural**
 — plan shape only, no schemas, no data, no run, so it costs nothing at
-evaluation time. It is **sound by over-approximation** — a `Monotone` verdict is
-a guarantee proven by that module's falsification oracle, while `NonMonotone` is
-a conservative *may*, so the asymmetry always errs toward asking for
+evaluation time. It is **sound by over-approximation** — a monotone verdict is
+a guarantee (the removed module checked it with a falsification oracle), while
+non-monotone is a conservative *may*, so the asymmetry always errs toward asking for
 coordination we could have skipped, never toward skipping coordination we
-needed. And it is **already tested**, which means this bill item is closer to
+needed. And it was built and tested once, which means this bill item is closer to
 paid than the rest of them.
 
 The practical consequence for staging: the monotone path is available as soon as
 domains are sharded (stage B), *before* frontiers exist (stage C). Reads that
-classify `Monotone` need neither. That makes stage B more useful on its own than
+are monotone need neither. That makes stage B more useful on its own than
 this document first claimed.
 
 ### 3. Watch cursors become frontiers
@@ -513,7 +508,7 @@ the repo. Divergent branches can be *detected* (`common_ancestor`) but not
 *reconciled*. A partition that heals leaves two frontiers and no defined way to
 produce one.
 
-And the easy answer is explicitly closed off: `DESIGN.md:387` — **do not use
+And the easy answer is explicitly closed off: `DESIGN.md` §4.2 — **do not use
 iroh-docs (CRDT sync) — wrong consistency model.** grmpl is not last-write-wins
 and not automatically convergent; it is a world with authority and invariants,
 where silently merging two divergent histories can produce a state neither

@@ -366,12 +366,11 @@ pub trait Transport: Send + Sync {
 - **Retention caveat (superseded by P6).** This paragraph imagined leaning on
   fjall's MVCC — lazy GC of stale versions during compaction, time-travel via
   pinned snapshots, "only the latest edition live." **P6 does not.** Because
-  `grmpl-store` owns an append-only `(edition, counter)` row per update (not one
+  the store owns an append-only `(edition, counter)` log of every update (not one
   shadowing KV version per key), as-of reads are exact *by construction* at every
   surviving edition, and retention is an **explicit consolidation watermark** the
   store manages — `consolidate` folds history ≤ the watermark into a per-relation
-  checkpoint and discards the raw rows, turning the as-of read into
-  `O(checkpoint + tail)`. Reads/scans below the watermark are a hard `Error`
+  checkpoint and retires the history below it. Reads/scans below the watermark are a hard `Error`
   (the four *edition doors*), and the GC policy (`grmpl-proc::gc`) never advances
   the watermark past the minimum durable watch cursor. See ROADMAP "P6 —
   History".
@@ -543,18 +542,18 @@ grmpl/
 ├── crates/
 │   ├── grmpl-core/       # Value, Tuple, Entity, Time, Edition, the 7 types, laws
 │   ├── grmpl-diff/       # the differential engine: operators, arrangements, iterate
-│   ├── grmpl-store/      # TraceStore/EditionStore traits + fjall impl
+│   ├── grmpl-ent/        # the Ent: TraceStore/EditionStore impl (fjall node store)
 │   ├── grmpl-proc/       # Process, Authority, commit protocol, process loop
-│   ├── grmpl-transport/  # Transport/MessageLog trait + in-proc impl (iroh later)
+│   ├── grmpl-transport/  # in-proc Transport impl (networked transport deferred)
 │   ├── grmpl-pattern/    # Pattern algebra (parse = match)
 │   └── grmpl-lang/       # surface: rel/view/form/on → core lowering
 └── DESIGN.md
 ```
 
 `grmpl-core` depends on nothing below the line. `grmpl-diff` depends on
-`grmpl-core` and the `TraceStore` *trait* (not fjall). Only `grmpl-store`
-names fjall; only `grmpl-transport` will name iroh. This is the bright line as
-a dependency graph.
+`grmpl-core` and the `TraceStore` *trait* (not fjall). Only `grmpl-ent`
+names fjall; only `grmpl-transport` would name a network stack. This is the
+bright line as a dependency graph.
 
 ---
 
@@ -622,32 +621,22 @@ joining each atom on shared variables, then projecting `yield` and de-duplicatin
 `Pattern`/`Form` parser. `on` remains programmatic (it needs an action
 sublanguage). Syntax errors surface at parse; unbound-yield/arity at instantiate.
 
-**iroh `Transport`** (`grmpl-transport`, feature `iroh`). `grmpl_core::Transport`
-is a bytes-level cross-domain boundary (opaque above the line). Two impls: an
-in-process net (the v1 default and reference, with the durable cross-domain
-message loop proven — emit → serialize → deliver → persist into the receiver's
-inbox), and an iroh-backed QUIC transport where a `DomainId` maps to an endpoint;
-`send` opens a bi-stream and waits for an ack. A real two-endpoint QUIC loopback
-test passes.
+**`Transport`** (`grmpl-transport`). `grmpl_core::Transport` is a bytes-level
+cross-domain boundary (opaque above the line). Its one impl is an in-process net
+(the reference, with the durable cross-domain message loop proven — emit →
+serialize → deliver → persist into the receiver's inbox). An iroh-backed QUIC
+transport was built behind an `iroh` feature and then **removed**; a networked
+transport is deferred (§4.2 is still the design for it).
 
-> **iroh version note.** iroh **0.95** currently hard-pins the pre-release
-> `ed25519-dalek 3.0.0-pre.1`, which fails to compile against `pkcs8 0.11` on the
-> Rust 1.95 toolchain (an upstream `KeyMalformed` variant change). The transport
-> is therefore built against iroh **0.92** (stable `ed25519-dalek 2.2.0`), whose
-> API is `NodeAddr`/`node_addr()`/`Watcher` rather than 0.95's
-> `EndpointAddr`/`EndpointId`. Revisit the pin when iroh unpins the broken
-> pre-release. The `iroh` feature is off by default, so this never affects the
-> core build or test suite.
-
-Crate graph now (bright line intact — only `grmpl-store` names fjall, only
-`grmpl-transport` names iroh):
+Crate graph now (bright line intact — only `grmpl-ent` names fjall;
+`grmpl-transport` is in-process only):
 
 ```
 grmpl-core ── grmpl-diff ── grmpl-proc ── grmpl-lang
      │            │              │
-     ├── grmpl-store (fjall)     │
+     ├── grmpl-ent (fjall)       │
      ├── grmpl-pattern ──────────┴── grmpl-lang
-     └── grmpl-transport (iroh, feature-gated)
+     └── grmpl-transport (in-process)
 ```
 
 ## 14. Follow-ons (implemented)
@@ -664,8 +653,10 @@ guarantee is exactly-once *apply* without a distributed transaction. The
 `Message` wire codec was hoisted into `grmpl-core::wire` (pure value
 serialization) so the transport and the router share one encoding.
 
-**Incremental recursion** (`grmpl-diff::IncrementalFixpoint`). Replaces
-recompute-from-∅ for recursive views with a maintained materialized fixpoint:
+**Incremental recursion** (`grmpl-diff::IncrementalFixpoint`). An alternative
+to recompute-from-∅ for recursive views — **not wired in**: `Query::Iterate`
+still recomputes from scratch, and only its own test drives the maintainer. It
+keeps a materialized fixpoint:
 **monotone** (insertion) changes are applied incrementally by semi-naïve
 iteration warm-started from the previous fixpoint (cheap — only the growing
 frontier drives derivations; the linear-recursion case such as `implements`),

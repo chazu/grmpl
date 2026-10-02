@@ -1,7 +1,7 @@
 # What the Ent is good at, and what it is not
 
 Measured on the ent-native substrate after the v5 gap work
-([`ENT-GAPS-PLAN.md`](ENT-GAPS-PLAN.md)), with `grmpl-store` deleted — the Ent is
+([`archive/ENT-GAPS-PLAN.md`](archive/ENT-GAPS-PLAN.md)), with `grmpl-store` deleted — the Ent is
 now the only substrate, so these numbers are the system's numbers, not one leg's.
 
 > **Method.** `cargo run -p grmpl-bench --release --bin entbench` measures the
@@ -30,7 +30,7 @@ full scan costs about twice a flat array — a constant, not an asymptotic loss.
 | The Ent is good at | Measured |
 |---|---|
 | Forking a whole world | **0 node frames**, ~2.4 ms, flat from 1k to 100k rows |
-| Answering "how many / how much" over a span | **1.3 µs** at 100k rows — **2,050×** cheaper than the scan |
+| Answering "how many" over a span | **1.3 µs** at 100k rows — **2,050×** cheaper than the scan |
 | Reading a key span instead of a relation | **24.5 µs** for 1% of 100k — **109×** cheaper than the scan |
 | Proving a watcher is unaffected | **162 ns**, vs a ≥2.7 ms re-evaluation |
 | Reading the deep past | **89 ns** at edition 1 of 10,000 |

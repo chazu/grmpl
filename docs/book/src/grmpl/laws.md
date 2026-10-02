@@ -15,7 +15,8 @@ The semantic core — `grmpl-core`, `-diff`, `-proc`, `-lang`, `-pattern`,
 
 - Only `grmpl-ent` names `fjall`, as the granfilade's node store — and the
   enfilade/granfilade implementation generally.
-- Only `grmpl-transport` names `iroh`.
+- Only `grmpl-transport` would name a network stack. Today it is in-process
+  only; an iroh transport was built and then removed.
 
 Substrate crates depend on the traits; the traits never depend on the substrate.
 **The language observes opaque `Edition`s, never physical sequence numbers.**

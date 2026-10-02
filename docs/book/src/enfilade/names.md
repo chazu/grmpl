@@ -125,7 +125,7 @@ And Gold's, more directly:
 | `Crum` | a `Tree` node |
 | `Loaf` | a node's 64-entry run — one granfilade record |
 | `CanopyCrum` / `SensorCrum` | `canopy.rs` — `InterestKey`, `Endorsement` |
-| `HistoryCrum inTrace:` | trace membership as a WID measure — `KeyBounds`, used by version-compare |
+| `HistoryCrum inTrace:` | *not implemented* — version-compare prunes on shared content keys instead |
 | `Dsp` | `dsp.rs` — `Dsp`, `DspEnf` |
 | `DagWood` | `dag.rs` — `Dag`, `Branch`, `BranchId` |
 | `GrandNode` | `granfilade.rs` — content-addressed nodes |

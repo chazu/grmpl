@@ -95,7 +95,7 @@ The whole `Ent` rests on two moves you have now seen from several angles:
    and virtual copy are one key change).
 
 Around these sit the specializations the Gold source names, and which Part III
-rebuilds:
+rebuilds (all but `HistoryCrum`):
 
 - **`CanopyCrum`** — nodes of the *canopy*, an enfilade of standing *interest*
   rather than content. Where a content enfilade indexes "what is here," the

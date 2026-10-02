@@ -17,12 +17,13 @@ base rather than migrating a moving one.
 ### Work
 
 * **One versioned codec.** Collapse the two duplicated value/tuple encodings
-  (`grmpl-core::wire`, `grmpl-store::codec`) into a single canonical codec in
+  (`grmpl-core::wire` and the codec of the since-deleted `grmpl-store`) into a
+  single canonical codec in
   `grmpl-core::wire`, shared by the message wire and the store record. Prefix
   every serialized artifact with a `FORMAT_VERSION` byte; decoders reject other
   versions loudly.
-* **Durable catalog.** Persist the name→`RelId` catalog in the store's `__meta`
-  keyspace, exposed through a `Catalog` trait in `grmpl-core` (the store-API
+* **Durable catalog.** Persist the name→`RelId` catalog in the store (the Ent
+  keeps it as root-scope bindings in the context enfilade), exposed through a `Catalog` trait in `grmpl-core` (the store-API
   boundary decision: the *contract* is core, the *durable map* is a store
   concern). Append-only — a name's id never silently changes.
 * **Determinism.** `read_at` returns tuple-sorted rows; `scan_updates` returns
@@ -41,8 +42,8 @@ base rather than migrating a moving one.
 
 ### Start here
 
-`crates/grmpl-core/src/wire.rs` and `crates/grmpl-store/src/codec.rs` (the two
-codecs), `crates/grmpl-store/src/lib.rs` (`read_at`, `scan_updates`, `__meta`),
+`crates/grmpl-core/src/wire.rs` (the codec), `crates/grmpl-ent/src/store.rs`
+(`read_at`, `scan_updates`, the durable catalog),
 `crates/grmpl-lang/src/compile.rs` (`find`/`resolve` binding). Commit `docs/`
 and `CLAUDE.md` as part of this phase.
 
@@ -71,8 +72,8 @@ relations rather than bare tuples.
 * **Durable schema registry.** A `SchemaCatalog` trait in `grmpl-core` (the
   store-API boundary decision again — contract in core, durable map in the
   store) mapping `RelId → Schema`, **versioned by the edition** at which each
-  version took effect. `grmpl-store` persists each version in `__meta` under
-  `sch:{rel}{edition}` keys; `schema_at` answers as-of queries (needed before
+  version took effect. `grmpl-ent` persists each version in the context
+  enfilade under a `(rel, edition)` key; `schema_at` answers as-of queries (needed before
   P6 exposes as-of reads). Evolution is **additive only** — a new version may
   append columns but never remove, reorder, retype, or rename an existing one.
 * **Commit-boundary enforcement.** Beside the Authority check in
@@ -102,7 +103,7 @@ relations rather than bare tuples.
 `crates/grmpl-core/src/schema.rs` (the schema types + invariants),
 `crates/grmpl-core/src/store.rs` (`SchemaCatalog`, `NoSchemas`),
 `crates/grmpl-core/src/wire.rs` (`encode_schema`/`decode_schema`),
-`crates/grmpl-store/src/lib.rs` (`__meta` `sch:` keyspace),
+`crates/grmpl-ent/src/store.rs` + `context.rs` (the durable schema registry),
 `crates/grmpl-proc/src/commit.rs` + `domain.rs` (enforcement beside authority),
 `crates/grmpl-lang/{lexer,parser,ast,compile}.rs` (typed grammar + named cols).
 
@@ -139,16 +140,15 @@ columns (P1).
   (Shared + Recur contexts), and `eval_delta` all handle `Reduce`. Aggregates
   are **rejected inside `Iterate`** (`Error::Query`): a recursive fixpoint over a
   non-monotone operator has no monotone semi-naïve maintenance.
-* **Named-column yield surface (language).** `Program::reduce_view` groups and
-  folds a view's *yielded columns by name* (`NamedAgg`), lowering to
-  `Query::Reduce`. This waits on P1's named columns.
 * **Aggregate yield grammar (language, TKT-106).** The text surface now spells
   the same reduce directly in a view's `yield` clause: `view team_totals() {
   score(p,t,pts) yield t, sum(pts) }`. The plain `yield` identifiers become the
   grouping key and the single `count()`/`sum(c)`/`min(c)`/`max(c)` aggregate
   folds its column, so an aggregate-carrying `view` lowers to a `Query::Reduce`
   through the ordinary `Program::view`/`view_ir` path — observationally
-  identical to the programmatic `reduce_view`/`NamedAgg` surface. (Lexer needed
+  identical to an engine `Query::reduce` over the equivalent plain view. This is
+  the only aggregate surface; an earlier programmatic `Program::reduce_view` /
+  `NamedAgg` API was removed. (Lexer needed
   no change; parser `yield_clause`, `ast::{AggFunc,AggYield}`, and `view_ir`
   carry it.) At most one aggregate per view; malformed aggregates are compile
   errors. Known limitation inherited from the set-valued reduce: a bare
@@ -164,10 +164,8 @@ columns (P1).
   model that recomputes each aggregate from the present base directly (a genuine
   law oracle, not self-consistency).
 * A `Reduce` placed inside an `Iterate` is rejected at evaluation (tested).
-* `reduce_view` folds named columns and errors on unknown column/view names
-  (tested).
 * The `yield` aggregate grammar (TKT-106) lowers to *exactly* the same result
-  as the programmatic `reduce_view`/`NamedAgg` surface, and its output is
+  as an engine `Query::reduce` over the equivalent plain view, and its output is
   independent of source-commit order — both checked each round by a seeded
   randomized-churn law oracle (`crates/grmpl-lang/tests/aggregate_yield.rs`).
 
@@ -176,7 +174,7 @@ columns (P1).
 `crates/grmpl-diff/src/query.rs` (`Agg`, `Reduce`, `reduce_snapshot`,
 `eval_delta`), `crates/grmpl-diff/src/recursive.rs` (`collect_rels`),
 `crates/grmpl-core/src/error.rs` (`Error::Query`),
-`crates/grmpl-lang/src/compile.rs` (`NamedAgg`, `reduce_view`).
+`crates/grmpl-lang/src/compile.rs` (`view_ir`, aggregate yield lowering).
 Oracle template: `crates/grmpl-diff/tests/reduce_stream.rs`.
 
 ### Not in this phase
@@ -348,19 +346,16 @@ side effect of the KV engine's GC.
 
 ### Work
 
-* **Consolidation watermark** (`grmpl-store`, persisted in `__meta` under
-  `watermark`). `TraceStore::consolidate(up_to)` folds each relation's history
-  at editions ≤ the new watermark (clamped to `current`) into a **checkpoint**
-  — the consolidated `(tuple, diff)` state stored in the reserved `edition = 0`
-  key range of the relation's own keyspace (disjoint from every real update,
-  which starts at edition 1) — **deletes** the folded raw rows, and bumps the
-  watermark, all in **one atomic `batch()`** (crash-safe: old horizon or new,
-  never half-cut). Monotonic: a horizon at or below the current watermark is a
-  no-op.
-* **O(history) → O(checkpoint + tail).** An as-of `read_at(at)` is now
-  `checkpoint + tail(watermark, at]`, and `scan_updates(from, ..)` is just the
-  tail — the collapsed history is physically gone, not scanned. (Proven
-  white-box by counting keyspace rows after a consolidate.)
+* **Consolidation watermark** (`grmpl-ent`, persisted beside the clock).
+  `TraceStore::consolidate(up_to)` folds each relation's Fact versions at
+  editions ≤ the new watermark (clamped to `current`) into one **checkpoint**
+  root at the watermark, drops the commit log below it, retires the older roots,
+  and bumps the watermark, all in **one atomic batch** (crash-safe: old horizon
+  or new, never half-cut). Monotonic: a horizon at or below the current
+  watermark is a no-op.
+* **Bounded history.** Below the watermark only the checkpoint remains, and
+  `scan_updates(from, ..)` is just the tail — the collapsed history is
+  physically gone, not scanned.
 * **The watermark as an ERROR at all four edition doors.** `read_at` *at* an
   edition below the watermark, and `scan_updates` *from* below it, return
   `Error::Store` — the intermediate state has been discarded, so they answer
@@ -381,14 +376,12 @@ side effect of the KV engine's GC.
 
 ### Acceptance
 
-`crates/grmpl-store/tests/history.rs`: a randomized-churn law oracle (32 seeds)
-interleaves random commits with random consolidations and, after every step,
-checks against an independent full-history model that every `read_at`/
-`scan_updates` at or above the watermark is byte-identical to un-GC'd history,
-that both doors **error** below the watermark, and that the watermark is
-monotonic and ≤ `current`; plus corner tests for reopen durability (watermark +
-checkpoint persist) and the clamp/no-op cases. A white-box unit test counts
-keyspace rows to prove `consolidate` truncates to checkpoint + tail.
+`crates/grmpl-ent/tests/store_laws.rs`: a randomized-churn law oracle (16
+seeds) interleaves random commits with random consolidations and checks against
+an independent full-history model that every `read_at` at or above the
+watermark is untouched by the cut, that the door **errors** below it, and that
+the watermark is monotonic and ≤ `current`; plus a corner test for reopen
+durability (watermark + checkpoint persist) and the clamp/no-op cases.
 `crates/grmpl-proc/tests/gc.rs`: `consolidate_to` never passes the minimum
 durable watch cursor and keeps watches pumpable; consolidating past a cursor
 trips the edition door; a randomized oracle (24 seeds) confirms the clamp over
@@ -411,12 +404,16 @@ Sequenced from the backlog; each builds on P0/P1's stable formats. See the
 corresponding tickets for detail.
 
 * **P7 — Core IR** (CBPV split reified).
-* **P8 — Typing:** value/row types (P8a, landed — `grmpl-type::check_query`),
-  effect rows + relation-level Authority check (P8b, landed —
-  `grmpl-type::effect`: infer an `on`-handler's write set and check it against a
-  process `Authority` at relation granularity; key-ranges stay checked at
-  commit), CALM (P8c).
-* **P9 — Pattern algebra:** inputs, printing, streams.
+* **P8 — Typing:** value/row types (P8a, landed — `grmpl-type::check_query`;
+  only its own tests call it, the runtime does not), effect rows +
+  relation-level Authority check (P8b, landed — `grmpl-type::effect`: infer an
+  `on`-handler's write set and check it against a process `Authority` at
+  relation granularity; key-ranges stay checked at commit; the runtime calls
+  `check_handler_authority`). CALM (P8c): a monotonicity classifier was built,
+  had no caller, and was removed — not built.
+* **P9 — Pattern algebra:** inputs, printing. Streams (P9c: windowing and
+  parsing over delta streams) were built, had no caller, and were removed; the
+  design is archived in [`archive/p9c-delta-stream-patterns.md`](archive/p9c-delta-stream-patterns.md).
 * **P10 — Replay & forks.**
 * **P11 — Concatenative surface.**
 * **P12 — Behaviors as relations** (live code, landed — the defining MOO
@@ -429,12 +426,14 @@ corresponding tickets for detail.
   version byte in a third IR tag namespace. Dispatch is a query: `implements_ir`
   is the recursive `implements(entity, behavior)` view (`idea.md` §3), and
   `select_behavior` picks the least matching behavior — so redefinition is an
-  ordinary `Patch` and the next dispatch follows (the live-code law). Committing
-  a behavior re-runs the P8b effect/authority check at the commit boundary via
-  the core `BehaviorChecker` hook (`grmpl_type::EffectChecker`, wired through
-  `grmpl_proc::commit_patch_checked`; `commit_patch` = the `NoBehaviorCheck`
-  variant). Law oracles: behavior-codec round-trip, dispatch-equals-model under
-  churn, and commit-boundary-recheck ⇔ static verdict + runtime soundness.
+  ordinary `Patch` and the next dispatch follows (the live-code law). The P8b
+  effect/authority re-check of a committed behavior exists as the core
+  `BehaviorChecker` hook (`grmpl_type::EffectChecker`) and is tested at the
+  `grmpl_proc::commit_patch_checked` boundary, but **no runtime path uses it
+  yet**: runtime commits go through `commit_patch` (the `NoBehaviorCheck`
+  variant), and stored behaviors are reachable only from the `showcase` demo.
+  Law oracles: behavior-codec round-trip, dispatch-equals-model under churn,
+  and commit-boundary-recheck ⇔ static verdict + runtime soundness.
 * **P13 — Benchmarks,** then engine statefulness. **Partly landed:**
   `TraceStore::compare` (version compare / backfollow) is now a substrate
   primitive — default: read both ends and difference; the Ent: prune shared

@@ -1,6 +1,8 @@
 # DRed — incremental deletion for recursive views
 
-Status: **implemented** (`grmpl-diff::recursive`, `IncrementalFixpoint`). This
+Status: **implemented but not wired** (`grmpl-diff::recursive`,
+`IncrementalFixpoint`): `Query::Iterate` still recomputes from scratch, and only
+`IncrementalFixpoint`'s own tests use it. This
 document explains what DRed is, why grmpl needs it, how the implementation works,
 and the one precondition it rests on — **linear recursion** — including whether we
 should add a guard/diagnostic that enforces that precondition. It complements the

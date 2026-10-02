@@ -29,7 +29,7 @@
 //!   `Value::Tuple([sign, tuple, edition])` so retraction is first-class data the
 //!   same literal/capture/guard patterns match on. A pattern never runs over a
 //!   live stream — only over a materialized finite window (see
-//!   `docs/design/p9c-delta-stream-patterns.md` §3, §4b).
+//!   `docs/archive/p9c-delta-stream-patterns.md` §3, §4b).
 //!
 //! The measure is what makes `Repeat` terminate: every iteration must strictly
 //! lower it, so an empty match can never loop forever.

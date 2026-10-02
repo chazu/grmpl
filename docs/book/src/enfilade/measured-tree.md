@@ -8,7 +8,7 @@ adjectives, each load-bearing.
 The leaves hold the actual content — characters, tuples, whatever the enfilade is
 indexing — in order. Internal nodes hold no content; they exist only to keep the
 tree shallow. Because the tree is kept balanced (Gold uses a B-tree-like family
-of `Loaf`/`Crum` nodes; grmpl uses a weight-balanced tree), the path from the
+of `Loaf`/`Crum` nodes; grmpl uses a B+ tree with wide nodes), the path from the
 root to any leaf has length `O(log n)`. Every fundamental operation — find a
 position, split the tree at a point, join two trees — touches only nodes along
 such a path, so each is `O(log n)`.

@@ -151,11 +151,12 @@ The frontier machinery is not free-floating theory; it rides directly on the
 - The `fulltrace` **DagWood** *is* the causal DAG — branches are edges, and a
   `fork_edition(at)` is a new tip sharing structure (an `O(edit)` virtual copy of
   the world) rather than a deep copy.
-- **Branch/trace membership is a WID upward measure** (Gold's `HistoryCrum
-  inTrace:`), so "is commit `e` in this frontier's history?" — the core question
-  `≼` and consistent cuts ask constantly — is `O(measure)`, subtree-pruned, not a
-  DAG walk. Reading the world *at* a frontier is folding in the commits under its
-  downward closure, and the enfilade prunes that fold by measure.
+- **Branch/trace membership** — "is commit `e` in this frontier's history?",
+  the core question `≼` and consistent cuts ask constantly — is answered by
+  `is_ancestor`, a walk up the branch lineage: it costs the fork depth, not the
+  length of history. (Gold answers it as a WID upward measure, `HistoryCrum
+  inTrace:`; grmpl does not build that measure.) Reading the world *at* a
+  frontier is folding in the commits under its downward closure.
 
 And this is the whole reason to keep `Edition` opaque. Because the language only
 ever holds the *handle* — never a number it computes on — the substrate is free to

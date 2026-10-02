@@ -16,7 +16,7 @@ and their entries record what the doing changed about the plan.
 > **Sources.** The model is specified in [`DESIGN.md`](../DESIGN.md) §2.3 #6,
 > §2.4, §5.2, §5.3 and implemented in `grmpl-proc`, `grmpl-ent`, and
 > `grmpl-session`. Every measurement quoted below comes from
-> [`PERFORMANCE.md`](PERFORMANCE.md) §5 and
+> [`archive/PERFORMANCE.md`](archive/PERFORMANCE.md) §5 and
 > [`PERFORMANCE-ENT.md`](PERFORMANCE-ENT.md) §3–5 — single-run figures on a
 > shared 4-core VM, so ratios within an axis are the signal, absolute
 > wall-clock is not portable.
@@ -102,7 +102,7 @@ exists.*
 | Layer | Reality |
 |---|---|
 | Threads | Plain `std::thread`. `grmpl-session::net` spawns one thread per TCP connection. |
-| Async | **None in the core.** `tokio` appears only under the off-by-default `iroh` feature of `grmpl-transport`. |
+| Async | **None.** No crate depends on `tokio`. |
 | Store | `EntStore` is `Send + Sync` behind a single `Mutex<Inner>`. **Group commit (landed):** the lock covers allocation, apply and encoding; the batch + `SyncAll` happen outside it, shared across a group. |
 | Actor loop | Pull-based and caller-driven: `Process::step` / `run_to_idle` / `run_to_idle_retrying`. Nothing spins it — a real scheduler is still item 3. |
 | Reads | **Lock-free (landed).** A `Snapshot` holds an `EditionReader` captured once; on the Ent that is a versioned Fact root, so reads never contend with committers. |
@@ -117,7 +117,7 @@ This section used to end the document's descriptive half with a flat statement:
 plus fsync, so racing writers added rejects rather than throughput.
 
 ```
-race x1   221 commits/s   retry_rate 0.00        (PERFORMANCE.md §5)
+race x1   221 commits/s   retry_rate 0.00        (archive/PERFORMANCE.md §5)
 race x8   170/s           retry_rate 0.85
 ```
 

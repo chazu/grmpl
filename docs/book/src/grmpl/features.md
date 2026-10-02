@@ -51,9 +51,10 @@ commit boundary. Schemas evolve **additively only** (append columns, never
 remove/reorder/retype) and are **versioned by the edition** they took effect, so
 `schema_at` answers as-of queries.
 
-*Ent property:* schemas live in the **Context enfilade** — inherited context,
-versioned along history. An as-of read at edition E sees the typing in force *at
-E*, because history is retained, not overwritten.
+*Ent property:* schemas live in the **Context enfilade**, at the root scope
+(scope inheritance is not built), versioned along history. An as-of read at
+edition E sees the typing in force *at E*, because history is retained, not
+overwritten.
 
 ## P2 — reduce / aggregates
 
@@ -65,6 +66,7 @@ A `Reduce` operator groups by key and folds each group (`Count`/`Sum`/`Min`/
 that is `find`'s derivative. Grouping is a fold, the same monoidal shape as a WID
 measure. That enfilade is now persistent: a materialized view is an ordinary
 relation in the Fact enfilade, so it survives a reopen and is carried by a fork.
+It is built and tested, but nothing in the runtime maintains one yet.
 
 ## P3 — client sessions and world construction
 
@@ -110,7 +112,7 @@ have touched it, and on the Ent that question is answered by a measure — relat
 As-of reads are exact by construction because every update is a durable
 `(edition, counter)` row. Retention is an explicit **consolidation watermark**:
 `consolidate(up_to)` folds history at or below the watermark into a checkpoint,
-deletes the folded rows, and bumps the watermark — one atomic batch. Reads below
+retires the roots below it, and bumps the watermark — one atomic batch. Reads below
 the watermark *error* loudly rather than answer wrongly; GC never consolidates
 past the least live watch cursor.
 
@@ -123,7 +125,9 @@ unreachable nodes.
 
 Value/row typing (`check_query`) and effect rows: an `on`-handler's write set is
 inferred and checked against a process `Authority` at relation granularity, with
-key-ranges still checked at the commit boundary.
+key-ranges still checked at the commit boundary. The runtime uses only the
+effect check (`check_handler_authority`); row typing is exercised only by its
+own tests.
 
 *Ent property:* the **Authority law** — one commit, one authority domain. Effects
 tell the runtime exactly what a handler touches, which is also what a future
@@ -135,8 +139,10 @@ The defining MOO capability: **code is ordinary data**. A behavior is a
 `Value::Code` (opaque serialized IR) stored in a relation; dispatch is the
 recursive `implements(entity, behavior)` view, and `select_behavior` picks the
 least matching behavior. So *redefining a behavior is an ordinary `Patch`*, and
-the next dispatch follows it — the live-code law. Committing a behavior re-runs
-the P8 effect/authority check at the commit boundary.
+the next dispatch follows it — the live-code law. A checker that re-runs the P8
+effect/authority check on a committed behavior exists and is tested at the
+commit boundary, but no runtime path uses it yet; stored behaviors are reachable
+only from the `showcase` demo.
 
 *Ent property:* the deepest expression of the **Object law** and of cheap
 history. Code lives in the Fact enfilade like any other fact, is versioned like

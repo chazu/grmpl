@@ -11,7 +11,7 @@ committed atomically together. This is the "completed Ent plex."
 |---|---|---|
 | **Fact** | Stored relations and their indexes — net-per-tuple world state. | orgl content trees (`OrglRoot`) |
 | **Edition** | The commit-ordered delta log: patches, and (via the DAG) branches and causal ancestry. | `fulltrace` + versioned roots |
-| **Context** | DSPative context carried down scopes: namespace, schema, placement. | `Dsp`-inherited context |
+| **Context** | DSPative context carried down scopes: namespace, schema, placement. (Built: the catalog and schema registry at the root scope; scope inheritance is not.) | `Dsp`-inherited context |
 | **Canopy** | Standing interest: watches, subscriptions, sensors. | `CanopyCrum` |
 | **Derived** | Materialized views and incremental query state. | *(grmpl's own addition)* |
 
@@ -56,8 +56,8 @@ persistent measured action tree over a shared granfilade
 Every line of that list is a chapter of Part I. The plex is just five instances of
 it, specialized by which measure they carry and what they hold, sharing one
 granfilade so that structural sharing works *across* the family — an edit touches
-the Fact tree, the Edition log, maybe the Canopy, and writes new roots for all of
-them in a single atomic batch.
+the Fact tree, the Edition log, maybe stabs the in-memory Canopy, and writes new
+roots for the persisted ones in a single atomic batch.
 
 > **Five is a taxonomy, not a node count.** These five name the *jobs*. The
 > running store subdivides further, because the directories that hold the
