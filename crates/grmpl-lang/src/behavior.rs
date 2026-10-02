@@ -278,7 +278,7 @@ const OP_EMIT: u8 = 8;
 const OP_CAPABILITY: u8 = 9;
 
 /// Serialize the guard, message bindings, and canonical executable IR under
-/// the one shared v4 format byte. Literal cells reuse the core value codec.
+/// the one shared format byte. Literal cells reuse the core value codec.
 pub fn encode_behavior(behavior: &StoredBehavior) -> Vec<u8> {
     let mut out = Vec::new();
     wire::push_version(&mut out);

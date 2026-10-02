@@ -41,6 +41,7 @@ use std::sync::Mutex;
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
 
+use crate::dsp::Displace;
 use crate::measure::Measure;
 use crate::tree::{NodeRef, Tree};
 
@@ -49,9 +50,9 @@ pub use grmpl_core::hash::Sha256Digest as ContentKey;
 /// The width of a [`ContentKey`] on the wire.
 const CK_LEN: usize = 32;
 
-/// Node frames ride the one workspace format version. The v4 Float/behavior-IR
-/// cutover is deliberately fresh-store-only, so a v4 binary rejects every v3
-/// (and older) persisted node before attempting to interpret its payload.
+/// Node frames ride the one workspace format version. v5 added each internal
+/// node's child dsps; like v4 before it the cutover is fresh-store-only, so a v5
+/// binary rejects every older persisted node before interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// A type that can be (de)serialized into a node frame. Payloads reuse the one
@@ -212,14 +213,18 @@ impl Granfilade {
         tree: &Tree<K, V, M>,
     ) -> (Option<ContentKey>, Vec<(ContentKey, Vec<u8>)>)
     where
-        K: Persist + Ord + Clone,
+        K: Persist + Ord + Displace,
         V: Persist + Clone,
         M: Measure<K, V>,
     {
         let mut out = Vec::new();
+        // A root pointer is a bare content key, so a displaced root is written in
+        // its normalized form: the root node opened into this frame, every
+        // subtree beneath it shared. Below the root, dsps ride the edges.
+        let root = tree.normalized();
         let ck = {
             let present = self.present.lock().unwrap();
-            collect_nodes(tree, &mut out, &present)
+            collect_nodes(&root, &mut out, &present)
         };
         self.encoded.fetch_add(out.len() as u64, Ordering::Relaxed);
         (ck, out)
@@ -319,7 +324,7 @@ impl Granfilade {
     /// the store grows by only the edited path. One atomic batch + `SyncAll`.
     pub fn persist<K, V, M>(&self, tree: &Tree<K, V, M>) -> Result<Option<ContentKey>>
     where
-        K: Persist + Ord + Clone,
+        K: Persist + Ord + Displace,
         V: Persist + Clone,
         M: Measure<K, V>,
     {
@@ -332,7 +337,7 @@ impl Granfilade {
     /// eager load; lazy paging is a later refinement.
     pub fn load<K, V, M>(&self, ck: Option<ContentKey>) -> Result<Tree<K, V, M>>
     where
-        K: Persist + Ord + Clone,
+        K: Persist + Ord + Displace,
         V: Persist + Clone,
         M: Measure<K, V>,
     {
@@ -370,7 +375,10 @@ impl Granfilade {
                 }
                 let mut children = Vec::with_capacity(child_keys.len());
                 for c in child_keys {
-                    children.push(self.load(Some(c))?);
+                    let (dsp, p) = i64::decode(bytes, pos)?;
+                    pos = p;
+                    let child: Tree<K, V, M> = self.load(Some(c))?;
+                    children.push(child.relocate(dsp));
                 }
                 if keys.len() + 1 != children.len() {
                     return Err(Error::Codec("granfilade: malformed internal node".into()));
@@ -387,7 +395,7 @@ impl Granfilade {
     /// memoize both, so re-persisting a reloaded tree writes nothing.
     fn note_loaded<K, V, M>(&self, tree: &Tree<K, V, M>, ck: ContentKey)
     where
-        K: Persist + Ord + Clone,
+        K: Persist + Ord + Displace,
         V: Persist + Clone,
         M: Measure<K, V>,
     {
@@ -467,7 +475,8 @@ impl Granfilade {
 
 /// A leaf frame: a run of `(key, value)` entries, no children.
 const TAG_LEAF: u8 = 0;
-/// An internal frame: child content keys plus the separators dividing them.
+/// An internal frame: child content keys, the separators dividing them (in the
+/// node's local frame), then each child's dsp.
 const TAG_INTERNAL: u8 = 1;
 
 /// The child content keys of a node frame, read **without decoding the payload**
@@ -488,7 +497,7 @@ fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
         Some(v) => {
             return Err(Error::Codec(format!(
                 "granfilade: unsupported node format version {v} (expected {}; \
-                 v4 requires a fresh store and has no migrator)",
+                 v5 requires a fresh store and has no migrator)",
                 NODE_FORMAT_VERSION
             )))
         }
@@ -523,7 +532,8 @@ fn encode_header(out: &mut Vec<u8>, tag: u8, children: &[ContentKey]) {
 
 /// Recurse the tree, appending each node's `(content_key, frame_bytes)` and
 /// returning the root key. Children first, so a node's frame carries its
-/// children's content keys.
+/// children's content keys. Collects the *node* under `tree`; the handle's own
+/// dsp belongs to the edge that points at it.
 ///
 /// One frame is one **node**, and a node holds a whole run of entries
 /// ([`grmpl_ent::tree::B`](crate::tree::B) of them), so the store keeps one
@@ -534,7 +544,7 @@ fn collect_nodes<K, V, M>(
     present: &HashSet<ContentKey>,
 ) -> Option<ContentKey>
 where
-    K: Persist + Ord + Clone,
+    K: Persist + Ord + Displace,
     V: Persist + Clone,
     M: Measure<K, V>,
 {
@@ -568,6 +578,9 @@ where
             bytes.extend_from_slice(&(keys.len() as u32).to_be_bytes());
             for k in keys {
                 k.encode(&mut bytes);
+            }
+            for c in children {
+                c.dsp().encode(&mut bytes);
             }
         }
     }
@@ -627,10 +640,10 @@ mod tests {
     }
 
     #[test]
-    fn pre_v4_node_is_rejected_with_fresh_store_guidance() {
-        let old = [3, TAG_LEAF, 0, 0, 0, 0];
+    fn pre_v5_node_is_rejected_with_fresh_store_guidance() {
+        let old = [4, TAG_LEAF, 0, 0, 0, 0];
         let err = decode_header(&old).unwrap_err().to_string();
-        assert!(err.contains("unsupported node format version 3"));
+        assert!(err.contains("unsupported node format version 4"));
         assert!(err.contains("fresh store"));
         assert!(err.contains("no migrator"));
     }

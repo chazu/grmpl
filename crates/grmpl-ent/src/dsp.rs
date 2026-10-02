@@ -1,100 +1,135 @@
-//! **DSP — coordinate transforms (E6).**
+//! **DSP — displacements of the key coordinate space.**
 //!
-//! A [`Dsp`] is a displacement: an **invertible** transform of the key
-//! coordinate space (Gold's `Dsp` — "necessarily invertable and composable").
-//! In Gold, dsps live in the nodes and compose down the descent, which is what
-//! makes relocation and virtual copy `O(1)`. That is not built yet: here a
-//! displacement is a single shift of the *entity coordinates* of a whole query,
-//! and [`DspEnf`] is a displaced read view over a shared Fact enfilade.
-//! `EntStore::instance_template` reads through it and commits the relocated
-//! facts, so an instance still costs `O(template)`.
+//! In Xanadu Gold every pointer to a subtree carries a *dsp*: the subtree's
+//! position relative to its parent. A node's keys are stored in its own local
+//! frame, and a descent accumulates the dsps on the way down to recover absolute
+//! positions. That is what makes relocation and virtual copy cheap: moving a
+//! subtree, or pointing a second parent at it, changes one number on one edge
+//! and shares every node beneath.
+//!
+//! [`Tree`](crate::tree::Tree) carries a dsp on every handle. This module says
+//! what a displacement *does* to a key: [`Displace`]. grmpl's displacements are
+//! entity shifts — a sub-world relocated into a fresh id block moves every
+//! entity it mentions by the same amount, so its rooms, exits and items stay
+//! connected while its text and numbers are preserved.
 
-use grmpl_core::{Diff, Entity, Tuple, Value};
+use std::cmp::Ordering;
 
-use crate::measure::{Count, Measure};
-use crate::tree::Tree;
+use grmpl_core::{Entity, Tuple, Value};
 
-/// A coordinate displacement: shift the entity id in a key's column 0 by `shift`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Dsp {
-    shift: i64,
-}
+/// A key coordinate space that displacements act on.
+///
+/// Laws, which the tree relies on:
+///
+/// * **Identity:** `k.displace(0) == k`.
+/// * **Additive:** `k.displace(a).displace(b) == k.displace(a + b)` (wrapping).
+/// * **Order-preserving** over the keys of any subtree that carries a non-zero
+///   dsp: `a < b` implies `a.displace(d) < b.displace(d)`. The tree keeps its
+///   separators in local frames and compares there, so a displacement that
+///   reordered keys would corrupt the search.
+///
+/// A key type with no meaningful displacement implements it as the identity.
+/// Grafting such a tree by a non-zero amount is then refused, because the
+/// target span is the source span and is already occupied.
+///
+/// The tree only ever moves *stored* keys up into a query's frame, never a
+/// query down into a subtree's: the order law holds over the keys a subtree
+/// holds, not over arbitrary keys, and an entity id below a block's offset would
+/// wrap if moved down.
+pub trait Displace: Ord + Clone {
+    /// This key moved by `by`.
+    fn displace(&self, by: i64) -> Self;
 
-impl Dsp {
-    /// Displace the entity coordinate by `shift`.
-    pub fn by(shift: i64) -> Dsp {
-        Dsp { shift }
-    }
-
-    /// Apply the displacement to a key: entity in column 0 is shifted; other
-    /// shapes pass through unchanged.
-    pub fn apply(&self, key: &Tuple) -> Tuple {
-        match key.as_slice().first() {
-            Some(Value::Ent(e)) => {
-                let shifted = Value::Ent(Entity(e.0.wrapping_add(self.shift as u64)));
-                let mut cols: Vec<Value> = key.as_slice().to_vec();
-                cols[0] = shifted;
-                Tuple::new(cols)
-            }
-            _ => key.clone(),
+    /// `self.displace(by).cmp(other)`. Types that can compare without building
+    /// the displaced key override it; the tree calls it on every comparison
+    /// below a displaced subtree.
+    fn cmp_displaced(&self, by: i64, other: &Self) -> Ordering {
+        if by == 0 {
+            self.cmp(other)
+        } else {
+            self.displace(by).cmp(other)
         }
     }
+}
 
-    /// Relocate a whole relational tuple: shift **every** entity column together,
-    /// leaving non-entity columns (names, directions, weights) untouched. This is
-    /// the cluster relocation `located(thing, place)` / `exits(from, way, to)` need
-    /// — both endpoints move by the same displacement so the sub-world stays
-    /// internally connected, while its text and numbers are preserved. (For a
-    /// single-entity-column key this is exactly [`apply`](Self::apply).)
-    pub fn apply_all(&self, tuple: &Tuple) -> Tuple {
-        let cols: Vec<Value> = tuple
-            .as_slice()
-            .iter()
-            .map(|v| match v {
-                Value::Ent(e) => Value::Ent(Entity(e.0.wrapping_add(self.shift as u64))),
-                other => other.clone(),
-            })
-            .collect();
-        Tuple::new(cols)
+/// A tuple moves by shifting **every** entity cell together; other cells (names,
+/// directions, weights, nested tuples) are untouched.
+///
+/// Order-preserving as long as no entity cell wraps the id space: lexicographic
+/// order compares cell by cell, an entity shifted by `d` stays below another
+/// shifted by `d`, and the variant order between an entity and a non-entity cell
+/// does not change.
+impl Displace for Tuple {
+    fn displace(&self, by: i64) -> Self {
+        if by == 0 {
+            return self.clone();
+        }
+        Tuple::new(
+            self.as_slice()
+                .iter()
+                .map(|v| match v {
+                    Value::Ent(e) => Value::Ent(Entity(e.0.wrapping_add(by as u64))),
+                    other => other.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
-    /// The inverse displacement (`apply` then `inverse().apply` is the identity).
-    pub fn inverse(&self) -> Dsp {
-        Dsp { shift: self.shift.wrapping_neg() }
+    /// Cell by cell, exactly as the derived lexicographic order compares: two
+    /// entity cells compare by shifted id, and any other pair by the ordinary
+    /// order — a displacement cannot change the variant order between them.
+    fn cmp_displaced(&self, by: i64, other: &Self) -> Ordering {
+        if by == 0 {
+            return self.cmp(other);
+        }
+        let (a, b) = (self.as_slice(), other.as_slice());
+        for (x, y) in a.iter().zip(b) {
+            let o = match (x, y) {
+                (Value::Ent(x), Value::Ent(y)) => x.0.wrapping_add(by as u64).cmp(&y.0),
+                _ => x.cmp(y),
+            };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        a.len().cmp(&b.len())
     }
 }
 
-/// A displaced view of a Fact enfilade: the underlying `inner` tree is **shared**
-/// (an `Arc` clone), and the displacement is applied lazily on read — so a
-/// relocation costs `O(1)` and shares every node with the original.
-pub struct DspEnf<M = Count> {
-    inner: Tree<Tuple, Diff, M>,
-    dsp: Dsp,
+/// Coordinates with no displacement: edition numbers, relation ids, interest and
+/// branch ids.
+macro_rules! fixed_coordinate {
+    ($($t:ty),*) => {
+        $(impl Displace for $t {
+            fn displace(&self, _by: i64) -> Self {
+                *self
+            }
+        })*
+    };
 }
 
-impl<M: Measure<Tuple, Diff>> DspEnf<M> {
-    /// Relocate `inner` by `dsp` — `O(1)`, sharing all of `inner`'s nodes.
-    pub fn relocate(inner: Tree<Tuple, Diff, M>, dsp: Dsp) -> DspEnf<M> {
-        DspEnf { inner, dsp }
-    }
+fixed_coordinate!(u64, u32, i64);
 
-    /// **Displaced *cluster* range read `[lo, hi)`.** The query is transformed
-    /// back into the shared tree's coordinates (the inverse dsp) and pruned there,
-    /// so nothing is materialized that the span does not cover; each result is
-    /// relocated with [`Dsp::apply_all`], moving **every** entity column together.
-    ///
-    /// That is what a self-contained sub-world needs: `located(thing, place)` and
-    /// `exits(from, way, to)` must move both endpoints by the same displacement
-    /// or the instance comes back internally disconnected, while its text and
-    /// weights are preserved. The key order is set by the lead column alone, so
-    /// transforming the *query* by the lead column stays exact.
-    pub fn range_all(&self, lo: &Tuple, hi: &Tuple) -> Vec<(Tuple, Diff)> {
-        let inv = self.dsp.inverse();
-        self.inner
-            .range_collect(&inv.apply(lo), &inv.apply(hi))
-            .into_iter()
-            .map(|(k, v)| (self.dsp.apply_all(&k), v))
-            .collect()
+impl<A: Displace, B: Displace> Displace for (A, B) {
+    fn displace(&self, by: i64) -> Self {
+        (self.0.displace(by), self.1.displace(by))
+    }
+    fn cmp_displaced(&self, by: i64, other: &Self) -> Ordering {
+        self.0
+            .cmp_displaced(by, &other.0)
+            .then_with(|| self.1.cmp_displaced(by, &other.1))
+    }
+}
+
+impl<A: Displace, B: Displace, C: Displace> Displace for (A, B, C) {
+    fn displace(&self, by: i64) -> Self {
+        (self.0.displace(by), self.1.displace(by), self.2.displace(by))
+    }
+    fn cmp_displaced(&self, by: i64, other: &Self) -> Ordering {
+        self.0
+            .cmp_displaced(by, &other.0)
+            .then_with(|| self.1.cmp_displaced(by, &other.1))
+            .then_with(|| self.2.cmp_displaced(by, &other.2))
     }
 }
 
@@ -102,62 +137,67 @@ impl<M: Measure<Tuple, Diff>> DspEnf<M> {
 mod tests {
     use super::*;
 
-    fn ent(n: u64) -> Tuple {
-        Tuple::from([Value::Ent(Entity(n)), Value::Int(1)])
+    fn ent(n: u64) -> Value {
+        Value::Ent(Entity(n))
     }
 
     #[test]
-    fn apply_all_relocates_every_entity_column() {
-        let d = Dsp::by(1000);
-        // located(thing=2, place=10): both entity columns shift, together.
-        let located = Tuple::from([Value::Ent(Entity(2)), Value::Ent(Entity(10))]);
-        assert_eq!(
-            d.apply_all(&located),
-            Tuple::from([Value::Ent(Entity(1002)), Value::Ent(Entity(1010))])
-        );
+    fn a_tuple_moves_every_entity_column_together() {
         // exits(from=10, way="north", to=11): endpoints shift, the direction text
-        // and any non-entity column are preserved.
-        let exit = Tuple::from([Value::Ent(Entity(10)), Value::text("north"), Value::Ent(Entity(11))]);
+        // is preserved.
+        let exit = Tuple::from([ent(10), Value::text("north"), ent(11)]);
         assert_eq!(
-            d.apply_all(&exit),
-            Tuple::from([Value::Ent(Entity(1010)), Value::text("north"), Value::Ent(Entity(1011))])
+            exit.displace(1000),
+            Tuple::from([ent(1010), Value::text("north"), ent(1011)])
         );
-        // value(thing=20, coins=5): entity shifts, the Int weight does not.
-        let value = Tuple::from([Value::Ent(Entity(20)), Value::Int(5)]);
-        assert_eq!(d.apply_all(&value), Tuple::from([Value::Ent(Entity(1020)), Value::Int(5)]));
-        // Relocation is invertible column-wise.
-        assert_eq!(d.inverse().apply_all(&d.apply_all(&exit)), exit);
+        // value(thing=20, coins=5): the Int weight does not move.
+        let value = Tuple::from([ent(20), Value::Int(5)]);
+        assert_eq!(value.displace(1000), Tuple::from([ent(1020), Value::Int(5)]));
     }
 
     #[test]
-    fn dsp_is_invertible() {
-        let d = Dsp::by(1000);
-        let k = ent(7);
-        assert_eq!(d.inverse().apply(&d.apply(&k)), k);
+    fn displacement_is_additive_with_identity_zero() {
+        let k = Tuple::from([ent(7), Value::text("x"), ent(9)]);
+        assert_eq!(k.displace(0), k);
+        assert_eq!(k.displace(5).displace(-2), k.displace(3));
+        assert_eq!(k.displace(1000).displace(-1000), k);
     }
 
     #[test]
-    fn displaced_range_threads_the_dsp_through_the_walk() {
-        // Entities 0..20 → value n; relocate into the 1000-block.
-        let mut inner: Tree<Tuple, Diff, Count> = Tree::new();
-        for n in 0..20u64 {
-            inner = inner.insert(ent(n), n as i64);
+    fn cmp_displaced_agrees_with_displacing_first() {
+        let keys = [
+            Tuple::from([ent(1)]),
+            Tuple::from([ent(1), Value::Int(3)]),
+            Tuple::from([ent(1), ent(4)]),
+            Tuple::from([ent(900), Value::text("a")]),
+            Tuple::from([ent(1001), ent(2)]),
+            Tuple::from([Value::Int(0), ent(1)]),
+            Tuple::from([ent(1)]).displace(-5),
+        ];
+        for a in &keys {
+            for b in &keys {
+                for by in [0, 3, 1000, -1000] {
+                    assert_eq!(a.cmp_displaced(by, b), a.displace(by).cmp(b), "{a:?} +{by} vs {b:?}");
+                }
+            }
         }
-        let d = Dsp::by(1000);
-        let all: Vec<(Tuple, Diff)> = inner.iter().map(|(k, v)| (d.apply_all(k), *v)).collect();
-        let moved = DspEnf::relocate(inner, d);
+    }
 
-        // A displaced range query is answered by transforming the query, walking
-        // the shared tree's range, and re-displacing — it must equal the eager
-        // "materialize then filter" over the displaced contents, for every span.
-        // Spans stay within the relocated block (bounds ≥ the displaced origin),
-        // the non-wrapping regime the transform is defined over.
-        for (a, b) in [(1000u64, 1000), (1003, 1010), (1015, 1025), (1000, 1019), (1000, 1020)] {
-            let lo = ent(a);
-            let hi = ent(b);
-            let want: Vec<(Tuple, Diff)> =
-                all.iter().filter(|(k, _)| lo <= *k && *k < hi).cloned().collect();
-            assert_eq!(moved.range_all(&lo, &hi), want, "displaced range [{a},{b})");
-        }
+    #[test]
+    fn displacement_preserves_order() {
+        let keys = [
+            Tuple::from([ent(1)]),
+            Tuple::from([ent(1), Value::Int(3)]),
+            Tuple::from([ent(1), ent(4)]),
+            Tuple::from([ent(2), Value::text("a")]),
+            Tuple::from([ent(2), Value::text("b")]),
+            Tuple::from([Value::Int(0), ent(1)]),
+        ];
+        let mut sorted = keys.to_vec();
+        sorted.sort();
+        let moved: Vec<Tuple> = sorted.iter().map(|k| k.displace(500)).collect();
+        let mut resorted = moved.clone();
+        resorted.sort();
+        assert_eq!(moved, resorted);
     }
 }

@@ -28,7 +28,7 @@ use grmpl_core::{
 use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
-use crate::dsp::{Dsp, DspEnf};
+use crate::dsp::Displace;
 use crate::granfilade::{ContentKey, Granfilade, StagedWrite};
 use crate::measure::Count;
 use crate::tree::Tree;
@@ -259,7 +259,7 @@ impl Inner {
 
     /// Every live relation, in id order — deterministic, unlike a `HashMap`.
     fn rel_ids(&self) -> Vec<RelId> {
-        self.rels.iter().map(|(r, _)| RelId(*r)).collect()
+        self.rels.iter().map(|(r, _)| RelId(r)).collect()
     }
 }
 
@@ -341,7 +341,7 @@ impl EntStore {
         let mut arr = FactTree::new();
         if let Some(primary) = roots.versions.last_le(&inner.current) {
             for (k, v) in primary.1.iter() {
-                if let Some(key) = rotate(k, col) {
+                if let Some(key) = rotate(&k, col) {
                     arr = arr.insert(key, *v);
                 }
             }
@@ -483,7 +483,7 @@ impl EntStore {
             if !versions.is_empty() || !log.is_empty() {
                 // Arrangements are derived from the primary order, so a fork
                 // rebuilds them on demand rather than carrying them.
-                rels = rels.insert(*rel, RelRoots { versions, log, orders: OrderTree::new() });
+                rels = rels.insert(rel, RelRoots { versions, log, orders: OrderTree::new() });
             }
         }
         let child = EntStore {
@@ -634,10 +634,9 @@ impl EntStore {
     /// must be otherwise unused.
     pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
         let at = self.current();
-        let dsp = Dsp::by(shift);
-        // The *target* block: the instance's own coordinates.
-        let lo = Tuple::from([Value::Ent(Entity(block_lo.wrapping_add(shift as u64)))]);
-        let hi = Tuple::from([Value::Ent(Entity(block_hi.wrapping_add(shift as u64)))]);
+        // The *source* block: the template's own coordinates.
+        let src_lo = Tuple::from([Value::Ent(Entity(block_lo))]);
+        let src_hi = Tuple::from([Value::Ent(Entity(block_hi))]);
         let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
         {
             let inner = self.inner.lock().unwrap();
@@ -646,15 +645,8 @@ impl EntStore {
             }
             for &rel in rels {
                 let Some(facts) = inner.fact_at(rel, at.0) else { continue };
-                // **The DSP overlay (E6/G-7).** Relocating the relation is `O(1)`
-                // and shares every node — no copy is made here. The instance's
-                // rows are then read *out of the displaced view*, which
-                // transforms the query back into the shared tree's coordinates
-                // and prunes there (the `DspLoaf` discipline), rather than
-                // materializing the template and mapping over it.
-                let moved = DspEnf::relocate(facts.clone(), dsp);
-                for (tuple, diff) in moved.range_all(&lo, &hi) {
-                    updates.push((rel, tuple, diff));
+                for (tuple, diff) in facts.range_collect(&src_lo, &src_hi) {
+                    updates.push((rel, tuple.displace(shift), diff));
                 }
             }
         }
@@ -742,12 +734,12 @@ impl EntStore {
             // checkpoint and retire the roots below it.
             if let Some(roots) = inner.roots(*rel) {
                 let versions: Vec<(u64, FactTree)> = if write_all_versions {
-                    roots.versions.iter().map(|(e, t)| (*e, t.clone())).collect()
+                    roots.versions.iter().map(|(e, t)| (e, t.clone())).collect()
                 } else {
                     roots
                         .versions
                         .last_le(&inner.current)
-                        .map(|(e, t)| vec![(*e, t.clone())])
+                        .map(|(e, t)| vec![(e, t.clone())])
                         .unwrap_or_default()
                 };
                 for (edition, tree) in versions {
@@ -937,7 +929,7 @@ impl Inner {
         let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
         roots.versions = roots.versions.insert(e, root);
         // Keep every existing Arrangement in step with the primary order.
-        let cols: Vec<u32> = roots.orders.iter().map(|(c, _)| *c).collect();
+        let cols: Vec<u32> = roots.orders.iter().map(|(c, _)| c).collect();
         for col in cols {
             let arr = roots.orders.get(&col).cloned().unwrap_or_default();
             if let Some(key) = rotate(tuple, col as usize) {

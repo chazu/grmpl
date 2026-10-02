@@ -95,6 +95,11 @@ impl Measure<InterestKey, InterestVal> for Reach {
         };
         Reach { max_hi, endorse: Endorsement(self.endorse.0 | right.endorse.0) }
     }
+    /// Reach summarizes values (the `hi` endpoints and endorsements), which
+    /// displacement never moves.
+    fn displace(&self, _by: i64) -> Self {
+        self.clone()
+    }
 }
 
 /// The canopy enfilade: standing interests as a persistent measured tree.

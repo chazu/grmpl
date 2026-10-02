@@ -36,7 +36,7 @@ use crate::value::{Entity, RelId, Tuple, Value};
 /// The wire/on-disk format version. Prefixes every serialized artifact. Bump
 /// on any change to the tag set or framing so stale bytes are rejected rather
 /// than misread. All framings (`message`, store `record`) share this byte.
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -357,8 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_the_v4_fresh_store_cutover() {
-        assert_eq!(FORMAT_VERSION, 4);
+    fn format_version_is_the_v5_displaced_node_cutover() {
+        assert_eq!(FORMAT_VERSION, 5);
     }
 
     #[test]

@@ -19,6 +19,9 @@ pub trait Measure<K, V>: Clone {
     fn entry(key: &K, val: &V) -> Self;
     /// Associative combination of two adjacent subtree measures (left ∘ right).
     fn combine(&self, right: &Self) -> Self;
+    /// The measure of the same subtree with every **key** displaced by `by`
+    /// (values never move). A measure that ignores keys returns itself.
+    fn displace(&self, by: i64) -> Self;
 }
 
 /// Tuple measures compose: a tree may carry several upward summaries at once
@@ -32,6 +35,9 @@ impl<K, V, A: Measure<K, V>, B: Measure<K, V>> Measure<K, V> for (A, B) {
     }
     fn combine(&self, right: &Self) -> Self {
         (self.0.combine(&right.0), self.1.combine(&right.1))
+    }
+    fn displace(&self, by: i64) -> Self {
+        (self.0.displace(by), self.1.displace(by))
     }
 }
 
@@ -49,5 +55,8 @@ impl<K, V> Measure<K, V> for Count {
     }
     fn combine(&self, right: &Self) -> Self {
         Count(self.0 + right.0)
+    }
+    fn displace(&self, _by: i64) -> Self {
+        *self
     }
 }
