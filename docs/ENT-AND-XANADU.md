@@ -328,6 +328,9 @@ unchanged.
 
 ---
 
+The step-by-step results of this work, with what each step taught about the
+structure, are in [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md).
+
 ### Sources & method
 
 * Xanadu Gold read directly: [`dotmpe/udanax-mpe`](https://github.com/dotmpe/udanax-mpe)
