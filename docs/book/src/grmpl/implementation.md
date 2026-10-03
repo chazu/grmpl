@@ -17,10 +17,11 @@ crates/grmpl-ent/src/
   dag.rs          the branch/edition DAG (DagWood: Branch, BranchId, Dag)
   canopy.rs       interest routing (interval enfilade + endorsement flag-lattice)
   context.rs      the context enfilade (catalog + schema registry, root scope)
+                  (scopes over entity blocks are relations; see below)
   spanfilade.rs   every graft, indexed by source and by target (provenance)
 
 crates/grmpl-proc/src/
-  derived.rs      the Derived enfilade — materialized views (tests only)
+  derived.rs      the Derived enfilade — maintains `materialized view`s
 ```
 
 ## The enfilade primitive — `tree.rs`, `measure.rs`
@@ -323,9 +324,22 @@ never a false negative.
 In the design, the context enfilade carries inherited scope down: namespace,
 schema, placement — the DSPative-context generalization of dsps from
 "displacement" to "everything a subtree should receive from where it sits."
-**That inheritance is not built**: there is no scoped lookup, and every binding
-lives at the root scope. Authority itself lives in the canopy's endorsement
-lattice (Gold-faithful — authority was never a dsp).
+Authority itself lives in the canopy's endorsement lattice (Gold-faithful —
+authority was never a dsp).
+
+**Scopes over entity blocks are built.** The scope the language has is a span of
+entity ids — the coordinate the dsps act on — so that is where inheritance
+lives. A world declares a scope relation (`context scopes`, rows `(first, last,
+key, value)` over the inclusive span `first..=last`), and a view atom
+`inherit scopes(e, "key", v)` binds `v` to the binding of the most specific span
+containing `e`. The relation is an ordinary Fact tree keyed by span start, so it
+needs no machinery of its own: grafting a template block carries the scopes
+inside it, displaced with its rooms, exactly as a dsp carries context down a
+subtree; and finding the spans around an entity is a search on the step-2
+extents, whose bounds on the `first` and `last` columns are an interval tree's
+min-low and max-high. The catalog and schema registry stay where they were, at
+the root scope of `context.rs`; scopes that would carry namespace or authority
+down nested packages are not built, because packages do not nest.
 
 It is a real enfilade — a persistent measured tree over the granfilade, versioned
 and GC-rooted like the others — and it is load-bearing: the **durable catalog**
@@ -359,8 +373,16 @@ by a lock. It is gated by the same `touched_since` routing as everything else, s
 a refresh over an interval that could not have touched the view does no
 differential work at all.
 
-**It is not wired in.** Nothing in the runtime maintains a `Materialized` view
-yet; only its own tests drive it.
+**It is wired in as `materialized view`.** What it stores is the view's open
+*linear* form — parameters as leading columns, no final `distinct`, each row
+weighted by its number of derivations — because those weights are exactly the
+state `distinct` needs to be maintained from its changes. Without them, a view's
+delta is two full recomputes: `distinct` over a join cannot be read off the
+join's delta. With them, a read of a current copy is a range read, a watch's
+delta is `compare` on the copy (the size of the edit), and a refresh folds a
+linear delta whose join reads only the matching rows of the unchanged side. A
+read uses the copy only when it can prove the view's inputs have not moved since
+the copy's cursor, so the answer never depends on whether a refresh has run.
 
 ## Where the LSM stood, and why it is gone
 
@@ -394,7 +416,7 @@ columns, DSP transforms (on the instancing path), durable structural-sharing
 forks, the Fact / Edition / Version / Rel / Arrangement / context / canopy /
 branch enfilades, the `DagWood`, an interval-enfilade canopy the pump routes
 through, and subtree-pruned backfollow. No module in `grmpl-ent` has zero
-callers. The Derived enfilade exists but is not yet on that path.
+callers, and the Derived enfilade is on that path as `materialized view`.
 
 Beyond that, what remains is *reach*: the enhancements the structure makes
 newly possible. Part IV describes them.

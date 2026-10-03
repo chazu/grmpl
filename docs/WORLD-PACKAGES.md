@@ -28,7 +28,9 @@ bootstrap {
 }
 ```
 
-Bootstrap facts and a package-private marker commit together as edition 1.
+Bootstrap facts and a package-private marker commit together as edition 1,
+with a zero refresh cursor for each `materialized view`, so the first refresh
+materializes each view whole.
 Opening the exact package is an edition-preserving no-op. A changed or corrupt
 marker, or an unmarked nonzero store, fails closed. Format bumps (v4, then v5
 for displaced tree nodes, then v6 for the single root record, then v7 for extents and the

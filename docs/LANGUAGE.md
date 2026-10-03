@@ -163,6 +163,76 @@ column; `count()` takes none.
 > `sum` over a value column (see how `moo.grmpl` scores treasure), or count rows
 > host-side.
 
+### Materialized views — `materialized view`
+
+Prefix a view with `materialized` and the world keeps a stored copy of it:
+
+```grmpl
+materialized view here(viewer) {
+    located(viewer, room)
+    located(thing, room)
+    named(thing, name)
+    yield thing, name
+}
+```
+
+The copy holds the view for **every** argument at once — its parameters become
+leading columns, so every parameter must appear in the body — and it holds the
+rows *before* the final de-duplication, each weighted by how many ways it is
+derived. Those weights are what let the copy be kept current by changes alone.
+
+* **Reading** a current copy is a range read of the rows that start with the
+  arguments, not an evaluation. A copy whose inputs have moved since it was last
+  refreshed is not read; the view is evaluated as usual. So `materialized` never
+  changes an answer, only what it costs.
+* **Refreshing** folds the changes since the last refresh into the copy, as one
+  commit. Hosts call `Runtime::refresh_views()` where they pump watches; a
+  driven runtime refreshes whenever its actors go idle.
+* **Watching** a materialized view (without an aggregate) takes its changes from
+  the copy, comparing it between two editions — the size of the edit, not of
+  the view.
+* A package installs its materialized views in its bootstrap edition. The copy
+  lives in a relation named `view:<name>`; the shared refresh cursor is
+  `view:cursor`.
+
+Materialize the views you read or watch often. Each costs a stored relation and
+a commit per refresh that changes it, and a view whose parameters join widely
+(`here`'s open form pairs every two things in a room) stores that whole join.
+
+### Scopes — `context` and `inherit`
+
+A **scope** binds a key to a value across a block of entity ids, and an entity
+inherits from the innermost scope around it:
+
+```grmpl
+context scopes                     // scopes(first: Ent, last: Ent, key: Text, value: Any)
+
+bootstrap {
+    scopes(DUNGEON_ENTRY, DUNGEON_LAST, "ambient", "The air tastes of old receipts.")
+    scopes(MIRROR_CHAMBER, MIRROR_CHAMBER, "ambient", "Your reflection is a half-step late.")
+}
+
+view ambience(viewer) {
+    located(viewer, room)
+    inherit scopes(room, "ambient", mood)
+    yield mood
+}
+```
+
+* `context NAME` declares a scope relation. Its rows are ordinary facts: assert
+  and retract them like any other.
+* `inherit NAME(entity, "key", value)` binds `value` to what `entity` inherits
+  for `key`: the binding from the **most specific** span containing it (the one
+  starting latest, then ending earliest). An inner scope overrides an outer one;
+  retract the inner one and the outer shows through. An entity no span covers
+  drops out of the view.
+* The entity must be bound by an earlier atom, and the key must be a string.
+* Spans are entity coordinates, so **instancing carries them**: copy a template
+  block that contains its own scopes (include the scope relation in the
+  template's relations) and the instance gets its own copy, shifted with its
+  rooms. A scope that names an entity outside the block makes the block
+  ineligible for instancing, as any outside reference does.
+
 ---
 
 ## 5. Command grammars — `form`
@@ -321,7 +391,7 @@ bootstrap {
 
 `Runtime::load_package` resolves relation IDs through the durable catalog,
 checks host grants, and commits the sorted bootstrap facts plus an installation
-marker as edition 1. The exact package reopens without allocating an edition;
+marker (and a zero cursor for each materialized view) as edition 1. The exact package reopens without allocating an edition;
 a mismatch or unmarked nonzero store is rejected. The shared format (now v7) is
 a fresh-store cutover with no migration path from older versions.
 
@@ -511,13 +581,14 @@ operation.
 ```
 program   := decl*
 decl      := "rel"  Ident "(" collist ")"
-           | "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
+           | "context" Ident
+           | "materialized"? "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
            | "form" Ident "{" rule* "}"
            | "on" Ident "parse" Ident "{" arm* "}"
            | "on" "watch" Ident ("including" "current")? "{" watchbind* "}"
 
 col       := Ident (":" Ident)?
-atom      := Ident "(" arg ("," arg)* ")"
+atom      := "inherit"? Ident "(" arg ("," arg)* ")"
 arg       := Ident | Str | Int
 yielditem := Ident | Ident "(" Ident? ")"          // group col | agg(col) / count()
 

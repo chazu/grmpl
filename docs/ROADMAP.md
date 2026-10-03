@@ -477,6 +477,14 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   instance came from (6→7, a fresh-store cutover). Laws:
   `grmpl-ent/tests/extents.rs`, `grmpl-ent/tests/provenance.rs`, and the
   displaced-tree oracle, which now checks extents and search.
+* **Landed:** context and derived enfilades (Ent-fidelity step 3). `context`
+  relations bind values across nested entity spans and `inherit` atoms read the
+  innermost binding; grafts carry a block's scopes, and stabbing is an extent
+  search. `materialized view` keeps a view's open linear form in the Ent,
+  maintained per commit; reads and watches use the copy when it is provably
+  current. Join maintenance reads the unchanged side by key
+  (`TraceStore::lookup`). Laws: `grmpl-ent/tests/{join_maintenance,scopes}.rs`,
+  `grmpl-session/tests/{materialized,scopes}.rs`.
 * **Open, in order:** version compare across a graft without the merge fallback
   (the spanfilade knows the source; `diff` does not consult it yet); a
   transactional graft effect in a patch (phase 3A of the world-package plan);

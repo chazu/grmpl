@@ -104,6 +104,25 @@ The spanfilade records every graft by source span and by target span, per
 branch. It is **append-only** — retraction and consolidation leave it alone — and
 a fork into the past keeps only the grafts made by the fork edition.
 
+### Context and derived enfilades (`context`/`inherit`, `materialized view`)
+
+* **A materialized view never changes an answer.** `Query::Materialized` means
+  its plan. A read uses the stored copy only when the reader proves
+  (`EditionReader::touched_since`) that no input moved since the copy's cursor;
+  a delta uses the copy only when it is current at both ends. Anything else
+  evaluates the plan.
+* **The copy is the view's open linear form**: parameters as leading columns,
+  no final `distinct` or aggregate, each row weighted by its derivations. Store
+  the distinct set instead and `distinct`'s delta can no longer be read off it.
+* **A refresh advances its cursor even over an empty delta**, or an unchanged
+  copy becomes unprovably current and every read evaluates.
+* **Scope spans are inclusive** (`first..=last`), so a block's own scope lies
+  inside the block and survives `instance_template`'s self-containment check.
+  The most specific span wins: latest start, then earliest end, then least
+  value.
+* `TraceStore::lookup` and `read_containing` default to read-and-filter, so a
+  store without indexes is never slower for being asked; the Ent probes.
+
 ### Determinism
 
 Reads and deltas are deterministic regardless of the store's physical scan

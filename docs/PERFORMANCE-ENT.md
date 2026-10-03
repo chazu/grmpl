@@ -444,3 +444,61 @@ frames per instancing (21 → 23 frames for a 100k-fact template) and nothing
 otherwise. A fork into the past rebuilds it in `O(grafts)`, because it is keyed
 by span rather than edition.
 
+
+---
+
+## 8. Step 3: derived state and scopes in the Ent
+
+`viewbench` (release, same laptop) builds a moo-shaped world of N things, four
+to a room, each named, on a durable store. "`world`" is `located ⋈ named` on the
+thing; "`here(viewer)`" pairs the viewer with everything in its room.
+
+### Maintenance: what a view's delta costs after a one-row move
+
+| N things | bare join, keyed lookup | bare join, snapshot difference | view (`distinct` over the join) | materialized view |
+|---|---|---|---|---|
+| 1k | 4.7 µs | 1.1 ms | 1.4 ms | **3.5 µs** |
+| 10k | 8.3 µs | 10.6 ms | 14.4 ms | **7.2 µs** |
+| 100k | 12.6 µs | 208 ms | 272 ms | **12.0 µs** |
+
+Keyed lookup makes a bare join's delta cost the change: four orders of magnitude
+at 100k. But a compiled view ends in `distinct`, and `distinct` over a join has
+no delta rule that reads only the change. It recomputes both ends, so the plain
+view gains nothing from the cheaper join beneath it. That is the case for
+derived state. The materialized view stores the join's rows with their
+derivation counts, so its delta is a `compare` of the stored copy between two
+editions, which costs the edit.
+
+### Reading `here(viewer)`, and keeping the copy current
+
+| N things | evaluated | materialized, current | materialized, stale | refresh after a move | first incremental refresh | first refresh (whole) |
+|---|---|---|---|---|---|---|
+| 1k | 354 µs | **3.0 µs** | 332 µs | 9.2 ms | 9.5 ms | 50 ms (5k rows) |
+| 10k | 3.0 ms | **3.8 µs** | 3.0 ms | 9.3 ms | 23 ms | 341 ms (50k rows) |
+| 100k | 47 ms | **4.7 µs** | 47 ms | 9.7 ms | 361 ms | 5.3 s (500k rows) |
+
+* A current copy is a range read: flat in the world's size, 10,000× cheaper
+  than evaluating at 100k things.
+* A stale copy costs exactly an evaluation. The read proves the copy current
+  before using it, and falls back when it cannot.
+* A steady refresh is two fsync'd commits (one per view that changed), flat in
+  the world's size. The first incremental refresh builds the Arrangement that
+  `here`'s self-join probes (`located` by room), once.
+* Materializing whole is expensive and grows with the open form: `here` pairs
+  every two things in a room, so 100k things store 400k rows for it. The cost
+  of a materialized view is its open form's size, not the view's.
+
+### Scopes: which spans contain an entity
+
+A scope relation of N disjoint spans, on a reopened store:
+
+| N scopes | cold | warm |
+|---|---|---|
+| 1k | 4 frames paged, 206 µs | 0.66 µs |
+| 10k | 5 frames paged, 32 µs | 0.62 µs |
+| 100k | 7 frames paged, 97 µs | 0.63 µs |
+
+The extents' bounds on the `first` and `last` columns prune like an interval
+tree's, so a stab reads one path. An `inherit` over a view's rows is linear in
+those rows while the scopes are unchanged. A change to a scope recomputes both
+ends, because one binding can change any entity's answer.

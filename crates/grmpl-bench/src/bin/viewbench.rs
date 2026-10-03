@@ -159,5 +159,34 @@ fn main() {
         }
         row("refresh after a one-row move", n, refresh / C as f64, "two views, fsync'd commits");
     }
+    println!("\n── Scopes — which spans contain an entity, on a reopened store");
+    println!("  {:<38} {:>8}  {:>15}", "case", "scopes", "per op");
+    for &n in &sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = grmpl_core::RelId(1);
+        let scope = |a: u64, b: u64| Tuple::from([ent(a), ent(b), Value::text("mood"), Value::text("x")]);
+        {
+            let store = EntStore::open(dir.path()).unwrap();
+            let rows: Vec<_> = (0..n).map(|i| (rel, scope(i * 10, i * 10 + 9), 1)).collect();
+            for chunk in rows.chunks(1_000) {
+                grmpl_core::TraceStore::commit(&store, chunk).unwrap();
+            }
+        }
+        let store = EntStore::open(dir.path()).unwrap();
+        let at = grmpl_core::EditionStore::current(&store);
+        let point = [ent(n * 5 + 3)];
+        let before = store.frames_paged();
+        let start = Instant::now();
+        let hits = grmpl_core::TraceStore::read_containing(&store, rel, at, 0, 1, &point).unwrap();
+        let cold = start.elapsed().as_nanos() as f64;
+        let paged = store.frames_paged() - before;
+        row("read_containing, cold", n, cold, &format!("{} hit, {paged} frames paged", hits.len()));
+        const R: u32 = 1_000;
+        let start = Instant::now();
+        for _ in 0..R {
+            std::hint::black_box(grmpl_core::TraceStore::read_containing(&store, rel, at, 0, 1, &point).unwrap());
+        }
+        row("read_containing, warm", n, start.elapsed().as_nanos() as f64 / R as f64, "");
+    }
     println!();
 }

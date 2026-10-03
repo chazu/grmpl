@@ -1413,7 +1413,7 @@ impl TraceStore for EntStore {
             .collect())
     }
 
-    /// **Span stabbing through the extents** — see [`stab`]. Non-entity points
+    /// **Span stabbing through the extents** (the private `stab`). Non-entity points
     /// read and filter, as the default does.
     fn read_containing(
         &self,

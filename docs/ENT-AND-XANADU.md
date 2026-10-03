@@ -25,9 +25,12 @@ trees beneath it, and nodes page in on demand, so opening a world reads two
 frames whatever its size. Fact trees carry Gold's **wid** — each subtree's
 bounding box in entity space — so a search prunes on any entity column, and a
 **spanfilade** records every graft from both ends, so a template knows its
-instances and an instance its template. What remains short of the Ent is listed
-in §5: DSP-inherited context, version compare across a graft, merges in the
-branch DAG, and Green's 2-D enfilades proper.
+instances and an instance its template. Context is inherited down nested
+entity blocks and travels with a graft, and a materialized view keeps its
+derived state in the Ent, so maintaining it costs the change. What remains
+short of the Ent is listed in §5: version compare across a graft, scopes
+beyond entity blocks, merges in the branch DAG, and Green's 2-D enfilades
+proper.
 
 ---
 
@@ -232,11 +235,37 @@ second copy, and pruning exactly as good as the column's locality — tight when
 the column tracks the key (a room's exits lead to nearby rooms), useless when it
 is scattered.
 
-**Outside the Ent entirely:** the differential engine's working state —
-arrangements and multisets in `grmpl-diff` — is plain in-memory hash maps. The
-one persistent derived structure, `grmpl_proc::Materialized`, writes a view's
-output into an ordinary relation, so it does live in the Ent, but nothing in the
-runtime uses it yet.
+**Context enfilades: scopes over entity blocks.** A world declares a scope
+relation (`context scopes`) whose rows bind a key to a value across an
+inclusive span of entity ids, and a view atom `inherit scopes(e, "key", v)`
+gives an entity the binding of the most specific span containing it — for
+nested spans, the innermost. It is DSP-inherited context in the plain sense:
+the spans are coordinates the dsps move, so grafting a template block carries
+its scopes to the instance, displaced with its rooms, and an inner scope can
+be retracted to let the outer one show through. The scope relation is an
+ordinary Fact tree keyed by span start, and finding the spans that contain an
+entity (`read_containing`) is an extent search: the bounds of the `first` and
+`last` columns are an interval tree's min-low and max-high, so a stab reads a
+few frames however many scopes there are.
+
+**Derived enfilades: materialized views.** A `materialized view` keeps its
+open form — parameters as leading columns, before its final `distinct`, each
+row weighted by its number of derivations — in a relation in the Ent,
+maintained per commit by a durable cursor. Those weights are the state
+`distinct` needs to be maintained by its changes alone. So a read of a current
+copy is a primary-order range read, a watch's delta is `compare` on the copy
+between two editions (the size of the edit), and a refresh folds a linear
+delta in. A read checks whether the view's inputs moved since the copy's cursor
+and evaluates the view if they did, so materializing never changes an answer.
+Under it, join maintenance reads only the rows of the unchanged side that match
+the change's keys (`TraceStore::lookup`): index probes on the primary order,
+or on an Arrangement, which is how the Arrangements became the persisted
+derived state `DESIGN.md` calls them.
+
+**Outside the Ent:** the differential engine's per-evaluation working state —
+multisets in `grmpl-diff` — is still plain in-memory hash maps, rebuilt per
+call. A view that is not materialized pays for that: `distinct` over a join
+recomputes both ends of every interval.
 
 ---
 
@@ -255,11 +284,11 @@ runtime uses it yet.
 | **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
 | **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
 | **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
-| DSP-inherited context down scopes | ✅ Context enfilades | ❌ catalog and schemas only, at the root scope |
+| DSP-inherited context down scopes | ✅ Context enfilades | ✅ over nested entity blocks (`context`, `inherit`), carried by grafts; ⚠️ no other kind of scope |
 | Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ a persisted enfilade, but a tree of branches: no merges |
 | Canopy indexing interest | ✅ Canopy enfilades | ✅ interval routing, persisted with the commits routed to it |
 | Reverse index over virtual copies (Green's spanfilade) | — | ✅ by source and by target; origin follows chains of copies |
-| Derived state in the Ent | ✅ Derived enfilades | ⚠️ `Materialized` exists, unwired; engine state in memory |
+| Derived state in the Ent | ✅ Derived enfilades | ✅ `materialized view`: linear form with derivation counts, maintained per commit, read and watched from the copy |
 | Sequences as measured enfilades (§6 parsing) | ✅ | ❌ |
 | Udanax Green 2D enfilades (poom/span) | — | ⚠️ both directions answered, by two 1-D interval trees rather than one 2-D enfilade |
 
@@ -279,14 +308,18 @@ ordered tuples whose entity cells move, rather than tumbler widths.
 Since v7 it also has the Ent's **summaries**: Fact trees carry each subtree's
 box in entity space, the way Gold's wids carry extents, and a search prunes on
 any entity column. And it has Green's **reverse index**: the spanfilade knows,
-for every virtual copy, where it came from and where it went.
+for every virtual copy, where it came from and where it went. Since step 3 it
+has the last two members of `idea.md`'s family in working form: **context
+enfilades**, scopes inherited down nested entity blocks and carried by grafts,
+and **derived enfilades**, materialized views whose maintenance state lives in
+the Ent.
 
 What is still short of the Ent:
 
-1. **DSP-inherited context.** Context enfilades that carry namespace, authority
-   or placement down a scope tree are not built, and nothing in the language
-   declares scopes yet; building the mechanism first would only produce another
-   unused placeholder.
+1. **Scopes are entity blocks only.** Context is inherited down nested spans
+   of entity ids, which is where the dsps act. Namespace, authority or schema
+   inherited down package or authority scopes are not built: those scopes do
+   not nest in the language.
 2. **Version compare across a graft** still falls back to an in-order merge of
    the subtrees whose separators differ, costing the instance's size rather than
    its node count. The spanfilade knows where a copy came from, but `diff` does
@@ -302,6 +335,15 @@ What is still short of the Ent:
    with 2-D wids. The Fact trees' extents are n-dimensional boxes, but they ride
    a tree ordered by its whole key, so they prune only as well as each column
    tracks that order.
+
+Step 3's structures have costs too (`docs/PERFORMANCE-ENT.md` §8). A
+materialized view is paid for in storage — its open form, which for a view
+whose parameter joins widely (`here` pairs every two things in a room) is that
+whole join — and in a commit per refresh that changes it; the first refresh
+materializes it whole. A refresh probes the Arrangements it needs, which are
+built on first use. A change to a scope makes every view that inherits through
+it recompute both ends of the interval, because one binding can change any
+entity's answer.
 
 The extents and the spanfilade have costs of their own (measured in
 `docs/PERFORMANCE-ENT.md` §7). A search on a scattered column prunes nothing: it
@@ -329,7 +371,8 @@ unchanged.
 ---
 
 The step-by-step results of this work, with what each step taught about the
-structure, are in [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md).
+structure, are in [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md) and
+[`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md).
 
 ### Sources & method
 
