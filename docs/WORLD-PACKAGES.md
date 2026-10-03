@@ -31,7 +31,8 @@ bootstrap {
 Bootstrap facts and a package-private marker commit together as edition 1.
 Opening the exact package is an edition-preserving no-op. A changed or corrupt
 marker, or an unmarked nonzero store, fails closed. Format bumps (v4, then v5
-for displaced tree nodes, then v6 for the single root record) are fresh-store
+for displaced tree nodes, then v6 for the single root record, then v7 for extents and the
+spanfilade) are fresh-store
 cutovers; there is no decoder for an
 older format and no migration command.
 

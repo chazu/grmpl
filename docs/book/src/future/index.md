@@ -107,7 +107,9 @@ between these two editions," "where did this content come from" — is Xanadu's
 original transclusion-and-provenance vision, now over a relational world. This is
 the job Green gave the **spanfilade**: given a span, find everywhere it is
 quoted. Because provenance is a measure rather than a scan, these queries are
-cheap enough to be interactive.
+cheap enough to be interactive. The store half exists for virtual copies:
+`grmpl-ent`'s spanfilade answers where a template was instanced and where an
+instance came from. The language does not ask it anything yet.
 
 ## Parsing and transformation over measured sequences
 

@@ -22,9 +22,12 @@ split/join and an `O(log n)` **virtual copy** that the store uses for template
 instancing. And the whole world is now *in* the Ent: one root record links to
 the branch DAG and to the per-branch state, every directory and the canopy are
 trees beneath it, and nodes page in on demand, so opening a world reads two
-frames whatever its size. What remains short of the Ent is listed in §5:
-summaries richer than a count, DSP-inherited context, a reverse index over
-grafts, merges in the branch DAG, and Green's 2D enfilades.
+frames whatever its size. Fact trees carry Gold's **wid** — each subtree's
+bounding box in entity space — so a search prunes on any entity column, and a
+**spanfilade** records every graft from both ends, so a template knows its
+instances and an instance its template. What remains short of the Ent is listed
+in §5: DSP-inherited context, version compare across a graft, merges in the
+branch DAG, and Green's 2-D enfilades proper.
 
 ---
 
@@ -136,9 +139,15 @@ persists all of them through one node store, the `granfilade`.
 * Persistent **split** and **join** cost `O(log n)` new nodes, and **graft** — the
   virtual copy — splits a span out, relocates it, and joins it back in elsewhere,
   sharing every interior node with the original.
-* Each node caches a monoid **measure** of its subtree (`measure::Measure`). The
-  only measure in use is `Count`, which answers "how many rows in this span" and
-  "did anything change in this edition range" in `O(log n)`.
+* Each node caches a monoid **measure** of its subtree (`measure::Measure`).
+  `Count` answers "how many rows in this span" and "did anything change in this
+  edition range" in `O(log n)`. Fact trees also carry an **`Extent`**: per
+  column, the least and greatest entity id under the subtree. That is Gold's wid
+  in grmpl's coordinates — the subtree's box in the space a dsp moves — and like
+  a wid it is stored in the node's local frame and displaced on the way down.
+  `Tree::search` walks any measure this way, skipping (and never paging in) a
+  subtree whose summary rules it out, so a query on a column the tree is not
+  ordered by still prunes.
 * Shape depends on the order of operations, so a content key identifies a
   *shape*, not a logical value. Sharing is within one version lineage.
 
@@ -155,16 +164,19 @@ root record ──► branch DAG         Tree<BranchId, Branch>          (Gold's
                     │              ─► Edition log       Tree<(edition, i), update | graft>
                     │              ─► Arrangements      Tree<column, Fact tree>
                     ├─► context enfilade   catalog + schemas
-                    └─► canopy, fired-set, interest registry
+                    ├─► canopy, fired-set, interest registry
+                    └─► spanfilade         Tree<(source, target, edition), graft>
+                                           and the same keyed (target, source, edition)
 ```
 
 | Structure | What it is |
 |---|---|
-| Fact trees | one `Tree<Tuple, Diff, Count>` per relation per live edition |
+| Fact trees | one `Tree<Tuple, Diff, (Count, Extent)>` per relation per live edition |
 | Edition log | `(edition, index) → update`, or one `Graft` entry per relation for a virtual copy |
 | Version / relation directories | `edition → Fact root`, `relation → its roots` |
 | Context tree | the name→`RelId` catalog and edition-versioned schemas, at the root scope |
 | Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs; persisted with the commits routed to it |
+| Spanfilade | every graft, keyed by source span and again by target span, measured by the hull of its spans |
 | Branch DAG | branches with at most one parent (a tree; no merges), and common-ancestor lookup |
 | Granfilade | `SHA-256(frame) → frame` in fjall's `nodes` keyspace, one root record in `meta`, mark-and-sweep GC |
 
@@ -195,7 +207,30 @@ ordinary relations in the Fact trees.
 * **Template instancing** (`EntStore::instance_template`) is a **graft** per
   relation: `O(log n)` new nodes and one log entry however large the template is. The edition log records a `Graft` entry
   and `scan_updates` expands it from that edition's Fact root, so watchers and
-  replay see ordinary updates; the canopy routes it by span.
+  replay see ordinary updates; the canopy routes it by span. The template's
+  precondition — every entity it names lies in its block — is checked from the
+  block's extent, reading two spines, and a template that names an outside
+  entity is refused.
+* **Column search** (`EntStore::search_at`) finds the facts whose entity
+  columns fall in a box, at any live edition, by walking the extents. The as-of
+  `read_range_on` uses it; at the current edition, `read_range_on` still uses
+  an Arrangement (below).
+* **Provenance** (`copies_of`, `sources_of`, `origin_of`) answers Green's two
+  questions about a virtual copy from the spanfilade: where a block was copied
+  to, and where a block came from, following a chain of copies back to the
+  entity it started as. The index is the D4M layout — one sparse array,
+  *source × target*, stored beside its transpose — and is append-only, as
+  Green's spanfilade is: retracting an instance does not erase that it was
+  made.
+
+Two ways to answer a question about a column the tree is not ordered by now sit
+side by side, which makes their trade measurable (`docs/PERFORMANCE-ENT.md`
+§7). An **Arrangement** is the D4M answer: a second copy of the facts, rotated
+so the column leads — exact in `O(log n + k)`, paid for with a build on first
+use and a second write on every commit. The **extent** is Gold's answer: no
+second copy, and pruning exactly as good as the column's locality — tight when
+the column tracks the key (a room's exits lead to nearby rooms), useless when it
+is scattered.
 
 **Outside the Ent entirely:** the differential engine's working state —
 arrangements and multisets in `grmpl-diff` — is plain in-memory hash maps. The
@@ -216,16 +251,17 @@ runtime uses it yet.
 | Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees |
 | Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd, paged on demand |
 | One root; every structure a tree beneath it | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
-| Measured tree with upward summaries | ✅ "WIDative summaries" | ⚠️ cached measures over ordered keys; `Count` only |
+| Measured tree with upward summaries | ✅ "WIDative summaries" | ✅ `Count`, and an `Extent` per entity column that `search` prunes on |
 | **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
 | **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
 | **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
 | DSP-inherited context down scopes | ✅ Context enfilades | ❌ catalog and schemas only, at the root scope |
 | Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ a persisted enfilade, but a tree of branches: no merges |
 | Canopy indexing interest | ✅ Canopy enfilades | ✅ interval routing, persisted with the commits routed to it |
+| Reverse index over virtual copies (Green's spanfilade) | — | ✅ by source and by target; origin follows chains of copies |
 | Derived state in the Ent | ✅ Derived enfilades | ⚠️ `Materialized` exists, unwired; engine state in memory |
 | Sequences as measured enfilades (§6 parsing) | ✅ | ❌ |
-| Udanax Green 2D enfilades (poom/span) | — | ❌ |
+| Udanax Green 2D enfilades (poom/span) | — | ⚠️ both directions answered, by two 1-D interval trees rather than one 2-D enfilade |
 
 ---
 
@@ -240,24 +276,41 @@ content-addressed persistence), its **coordinate system** (dsps on pointers,
 paged in on demand). It differs from Udanax in what the coordinates are:
 ordered tuples whose entity cells move, rather than tumbler widths.
 
+Since v7 it also has the Ent's **summaries**: Fact trees carry each subtree's
+box in entity space, the way Gold's wids carry extents, and a search prunes on
+any entity column. And it has Green's **reverse index**: the spanfilade knows,
+for every virtual copy, where it came from and where it went.
+
 What is still short of the Ent:
 
-1. **Summaries are thin.** The only measure is `Count`. Gold's wids also carry a
-   subtree's extent in its coordinate space, which is what prunes a search in
-   more than one dimension; ordered keys get by on separators, two dimensions
-   would not.
-2. **No reverse index.** Nothing answers "which instances share this template's
-   nodes" — Green's spanfilade question. A graft points one way only, and
-   **version compare across a graft** falls back to an in-order merge of the
-   subtrees whose separators differ, costing the instance's size rather than its
-   node count.
-3. **DSP-inherited context.** Context enfilades that carry namespace, authority
+1. **DSP-inherited context.** Context enfilades that carry namespace, authority
    or placement down a scope tree are not built, and nothing in the language
    declares scopes yet; building the mechanism first would only produce another
    unused placeholder.
+2. **Version compare across a graft** still falls back to an in-order merge of
+   the subtrees whose separators differ, costing the instance's size rather than
+   its node count. The spanfilade knows where a copy came from, but `diff` does
+   not consult it.
+3. **Extents cover entity cells only.** Text and number columns are not
+   summarized, so a search on them reads and filters, or uses an Arrangement.
+   That keeps a frame's measures fixed-size; summarizing text would put
+   arbitrary strings in every internal frame.
 4. **The branch DAG has no merges.** It is a tree of branches, each with one
    parent.
-5. **Green's 2D enfilades** (poom/span) have no counterpart.
+5. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
+   but as two 1-D interval trees each measured by a hull, not as one enfilade
+   with 2-D wids. The Fact trees' extents are n-dimensional boxes, but they ride
+   a tree ordered by its whole key, so they prune only as well as each column
+   tracks that order.
+
+The extents and the spanfilade have costs of their own (measured in
+`docs/PERFORMANCE-ENT.md` §7). A search on a scattered column prunes nothing: it
+visits every leaf, and on a cold store pages every leaf in, where an
+Arrangement would read `O(log n)` frames — the wid is only as good as the
+locality of what it bounds. Every Fact frame carries the boxes, so a commit
+writes about a quarter more bytes. And the spanfilade writes every graft twice,
+and a fork into the past rebuilds it in `O(grafts)`, because it is keyed by
+span, not edition.
 
 Three costs of the paged layout are worth naming. A page-in that fails panics:
 a paged node's frame is referenced by a durable parent and protected from GC
@@ -285,4 +338,6 @@ unchanged.
   [xanadu.com/tech](https://xanadu.com/tech/).
 * grmpl read directly: [`idea.md`](../idea.md) and `crates/grmpl-ent/src/`
   (`tree.rs`, `granfilade.rs`, `store.rs`, `dsp.rs`, `context.rs`, `canopy.rs`,
-  `dag.rs`, `measure.rs`).
+  `dag.rs`, `measure.rs`, `spanfilade.rs`).
+* D4M: Kepner et al., *Dynamic Distributed Dimensional Data Model* — associative
+  arrays stored with their transpose so either dimension is a range lookup.

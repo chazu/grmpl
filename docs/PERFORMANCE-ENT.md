@@ -43,6 +43,7 @@ not an asymptotic loss.
 | Proving a watcher is unaffected | **162 ns**, vs a ≥2.7 ms re-evaluation |
 | Reading the deep past | **89 ns** at edition 1 of 10,000 |
 | Commit work independent of relation size † | 7.8 → 11.8 frames as rows go 1k → 100k |
+| Searching an entity column that tracks the key (v7) | **0.9–2.1 µs** warm, 6–11 frames cold — a scan is 2.2 ms at 100k rows |
 
 | The Ent is not good at | Measured |
 |---|---|
@@ -51,6 +52,7 @@ not an asymptotic loss.
 | Opening fjall itself † | grows with the data — 5 ms at 1k rows, 13 ms at 100k; the Ent adds nothing to it |
 | Unconsolidated history † | ~8 nodes per commit; 1,000 commits → 7,896 nodes |
 | Consolidation itself | **89 ms** to fold and collect 5,000 editions |
+| Searching a scattered entity column (v7) | every leaf: **3,228 frames** cold at 100k rows, 181 µs warm — 17× an Arrangement |
 
 ---
 
@@ -373,3 +375,72 @@ cost: each commit copies and writes the directory spines above the edited trees
 — about 3.7 more frames — so unconsolidated history takes twice the nodes, and
 consolidation has twice as many to sweep. Commit latency, which is the fsync, did
 not move. Reads of resident data are unchanged within this run's noise.
+
+---
+
+## 7. Format v7: extents and the spanfilade
+
+v7 gave every Fact tree node an `Extent` — per column, the bounding box of its
+entity cells, Gold's wid — and gave each branch a spanfilade recording every
+graft from both ends (`docs/ENT-AND-XANADU.md` §3). Same laptop as §6, release
+builds of v6 and v7 run alternately, twice each.
+
+### What the wid buys, and where it buys nothing
+
+The extent and an Arrangement are two answers to one question: which facts have
+an entity in a given span in a column the tree is not ordered by. The
+Arrangement is the D4M answer, a second copy of the facts rotated so the column
+leads. The extent is Gold's, a summary on the nodes already there. The axis
+searches `exits(from, way, to)` for exits into a 10-room span, four exits per
+room. In `near`, an exit leads to an adjacent room, so the destination column
+tracks the key. In `far`, it leads anywhere.
+
+| 100k rows | `near` | `far` |
+|---|---|---|
+| `search_at`, cold (frames paged) | 139 µs (**11 frames**) | 8.9 ms (**3,228 frames**, every leaf) |
+| `search_at`, warm | **2.1 µs** | 181 µs |
+| Arrangement, warm | 3.3 µs | 10.8 µs |
+| Arrangement, first call (builds it) | 181 ms | 251 ms |
+| `read_at` + filter | 2.2 ms | 1.5 ms |
+
+At 1k and 10k rows the pattern is the same: `near` searches page in 6 and 9
+frames and take about 1 µs warm, while `far` pages every leaf.
+
+The wid is only as good as the locality of what it bounds. When a column tracks
+the key — as an instanced template's exits do, since its rooms sit in one
+block — the search beats the Arrangement and needs no second copy, no build and
+no second write per commit. When a column is scattered, every leaf's box spans
+the world: the search reads the whole relation, cold from disk if it must, and
+the Arrangement is 17× faster warm. Neither is free: the Arrangement's build
+cost 181–251 ms here, and it doubles every later commit's work on that relation.
+`read_range_on` keeps using the Arrangement at the current edition and uses the
+extent below it, where there is no Arrangement; `search_at` is the extent alone.
+
+### What the extent costs
+
+| | v6 | v7 |
+|---|---|---|
+| Exits commit, frame bytes (1k / 10k / 100k rows) | 13.3 / 18.9 / 23.0 KB | 16.4 / 23.3 / 28.5 KB (**+23–24%**) |
+| Exits load, frame bytes per row | 101 / 114 / 122 B | 102 / 118 / 128 B |
+| Exits commit, frames | 7.8 / 9.8 / 12.1 | unchanged |
+| Exits commit, fsync'd | 4.3–5.0 ms | 4.7–5.0 ms (the fsync) |
+| Exits commit, in memory | 3.0–4.1 µs | 3.5–5.0 µs |
+| `count_at`, 100k rows | 635 ns | 674 ns |
+
+Every internal frame records each child's measure, and the extent is 17 bytes a
+column per child, so commits write about a quarter more bytes. Loading writes
+mostly leaves, which carry no measures, so it grows by 1–5%. Commit latency is
+still the fsync. In memory, the tree work rises by up to a third at 100k rows;
+an early version cost 60% more, until the folds stopped allocating an extent per
+entry and cloning measures that no dsp moved. `count_at` first regressed 5× by
+folding the extents along the boundary spines just to read the count; it now
+reads the cached sizes and is back where it was. Reads, fork, instancing,
+consolidation and open did not move beyond run-to-run noise.
+
+### The spanfilade
+
+The spanfilade holds one entry per graft, written twice, so its cost is a few
+frames per instancing (21 → 23 frames for a 100k-fact template) and nothing
+otherwise. A fork into the past rebuilds it in `O(grafts)`, because it is keyed
+by span rather than edition.
+

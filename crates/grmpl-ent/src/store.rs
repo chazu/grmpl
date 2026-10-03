@@ -33,13 +33,15 @@ use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
 use crate::granfilade::{Dec, Enc, Granfilade, Persist, StagedWrite};
-use crate::measure::Count;
+use crate::measure::{Count, Extent};
+use crate::spanfilade::{GraftSpan, Spanfilade};
 use crate::tree::Tree;
 
 /// The Fact enfilade: `tuple → net Σdiff` (nonzero only), measured by the entry
 /// [`Count`], so "how many rows" over any key span is an `O(log n)` fold of
-/// cached summaries, materializing nothing.
-type FactMeasure = Count;
+/// cached summaries, materializing nothing, and by the [`Extent`], so a search
+/// on any entity column prunes every subtree whose bounding box misses it.
+type FactMeasure = (Count, Extent);
 type FactTree = Tree<Tuple, Diff, FactMeasure>;
 /// The Edition enfilade: `(edition, submit_index) → entry`, the raw log in
 /// commit order.
@@ -352,6 +354,10 @@ struct Inner {
     /// routed to it, so an interval reaching back past it must widen to the
     /// relation-wide answer rather than read an empty fired-set as "no change".
     registered: Tree<u64, u64, Count>,
+    /// **The spanfilade** ([`crate::spanfilade`]): every graft this branch has
+    /// made, by source span and by target span, so a template knows its
+    /// instances and an instance its template.
+    grafts: Spanfilade,
 }
 
 /// A branch's state persists as its clock and links to its trees. The canopy
@@ -367,6 +373,7 @@ impl Persist for Inner {
         e.link(&self.fired);
         e.link(&self.interests);
         e.link(&self.registered);
+        self.grafts.encode(e);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         Ok(Inner {
@@ -378,6 +385,7 @@ impl Persist for Inner {
             fired: d.link()?,
             interests: d.link()?,
             registered: d.link()?,
+            grafts: Spanfilade::decode(d)?,
         })
     }
 }
@@ -485,7 +493,48 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("count_at", at.0, inner.watermark));
         }
-        Ok(inner.fact_at(rel, at.0).map(|t| t.measure_range(lo, hi).0).unwrap_or(0))
+        Ok(inner.fact_at(rel, at.0).map(|t| t.count_range(lo, hi) as u64).unwrap_or(0))
+    }
+
+    /// **WID search over entity columns.** The rows of `rel` as-of `at` whose
+    /// column `col` holds an entity in `[lo, hi)`, for every `(col, lo, hi)` in
+    /// `bounds` — a box in entity space.
+    ///
+    /// Answered from each subtree's [`Extent`]: a subtree whose bounding box
+    /// misses any of the spans is skipped unread. No Arrangement is built or
+    /// needed, so it works at any live edition and on any column, and it takes
+    /// the store lock only to find the root. What it costs depends on how well
+    /// the columns track the key order: a tight box prunes to the matches, a
+    /// column scattered across the world prunes nothing and reads the relation.
+    pub fn search_at(&self, rel: RelId, at: Edition, bounds: &[(usize, u64, u64)]) -> Result<Vec<(Tuple, Diff)>> {
+        let facts = {
+            let inner = self.inner.lock().unwrap();
+            if at.0 < inner.watermark {
+                return Err(door("search_at", at.0, inner.watermark));
+            }
+            inner.fact_at(rel, at.0).cloned()
+        };
+        Ok(facts.map(|t| search_box(&t, bounds)).unwrap_or_default())
+    }
+
+    /// **Where a block was copied to** (the spanfilade direction): every graft
+    /// made at or before `at` whose source overlaps entity ids `[lo, hi)`.
+    pub fn copies_of(&self, lo: u64, hi: u64, at: Edition) -> Vec<GraftSpan> {
+        self.inner.lock().unwrap().grafts.copies_of(lo, hi, at)
+    }
+
+    /// **Where a block was copied from** (the POOM direction): every graft made
+    /// at or before `at` whose target overlaps entity ids `[lo, hi)`.
+    pub fn sources_of(&self, lo: u64, hi: u64, at: Edition) -> Vec<GraftSpan> {
+        self.inner.lock().unwrap().grafts.sources_of(lo, hi, at)
+    }
+
+    /// **The entity `e` started as**, following grafts back as of `at`, with
+    /// the grafts that carried it, most recent first. See
+    /// [`Spanfilade::origin`].
+    pub fn origin_of(&self, e: Entity, at: Edition) -> (Entity, Vec<GraftSpan>) {
+        let (start, chain) = self.inner.lock().unwrap().grafts.origin(e.0, at);
+        (Entity(start), chain)
     }
 
     /// **Arrangements (G-9).** Ensure `rel` has an ordering led by column `col`,
@@ -536,6 +585,12 @@ impl EntStore {
     /// `0` for an in-memory store.
     pub fn frames_encoded(&self) -> u64 {
         self.family.gran.as_ref().map_or(0, |g| g.frames_encoded())
+    }
+
+    /// Bytes in the frames [`frames_encoded`](Self::frames_encoded) counts.
+    /// `0` for an in-memory store.
+    pub fn bytes_encoded(&self) -> u64 {
+        self.family.gran.as_ref().map_or(0, |g| g.bytes_encoded())
     }
 
     /// Node frames read from disk since this store was opened — the paging ops
@@ -644,6 +699,9 @@ impl EntStore {
             }
             rels
         };
+        // The spanfilade is keyed by span, not edition: forking into the past
+        // keeps the grafts made by then.
+        let grafts = if at.0 == inner.current { inner.grafts.clone() } else { inner.grafts.as_of(at) };
         let child = Inner {
             current: at.0,
             watermark: inner.watermark,
@@ -653,6 +711,7 @@ impl EntStore {
             fired: FiredTree::new(),
             interests: Tree::new(),
             registered: Tree::new(),
+            grafts,
         };
         // Graft a new branch onto this one at the fork edition in the shared
         // DagWood and stage its state, under one root lock so no root record
@@ -739,9 +798,15 @@ impl EntStore {
     /// in every relation, or the call fails without committing anything; it also
     /// fails if the shift would wrap an entity id.
     ///
-    /// Precondition: the template is self-contained — every template fact is
-    /// keyed by an in-block lead entity, and all of a fact's entity columns lie
-    /// in the block, so the relocation keeps it internally connected.
+    /// The template must be self-contained: every entity cell of every fact in
+    /// the block lies in the block, so the relocation keeps it internally
+    /// connected. This is checked, not assumed — the [`Extent`] of the block's
+    /// span says it in `O(log n)` — and a template that names an outside entity
+    /// is refused.
+    ///
+    /// The graft is recorded in the branch's [`Spanfilade`], so
+    /// [`copies_of`](Self::copies_of) finds the instances of a template and
+    /// [`origin_of`](Self::origin_of) the template of an instance.
     ///
     /// [`scan_updates`]: TraceStore::scan_updates
     pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
@@ -760,6 +825,16 @@ impl EntStore {
                 if !facts.any_in(&src_lo, &src_hi) {
                     continue;
                 }
+                // A graft moves every entity cell, so a template fact naming an
+                // entity outside the block would land pointing at the wrong one.
+                // The span's extent proves it does not, reading two spines.
+                if !facts.measure_range(&src_lo, &src_hi).1.within(block_lo, block_hi) {
+                    return Err(Error::Store(format!(
+                        "instance_template: relation {} has template facts naming entities outside \
+                         [{block_lo}, {block_hi}); a graft would move them too",
+                        rel.0
+                    )));
+                }
                 let grafted = facts.graft(&src_lo, &src_hi, shift).ok_or_else(|| {
                     Error::Store(format!(
                         "instance_template: relation {} already has facts in the target block \
@@ -770,6 +845,15 @@ impl EntStore {
                 grafts.push((rel, grafted));
             }
             inner.apply_grafts(at + 1, &grafts, &tlo, &thi);
+            if !grafts.is_empty() {
+                let to = block_lo.wrapping_add(shift as u64);
+                inner.grafts.record(&GraftSpan {
+                    source: (block_lo, block_hi),
+                    target: (to, to.wrapping_add(block_hi - block_lo)),
+                    edition: Edition(at + 1),
+                    rels: grafts.iter().map(|(rel, _)| *rel).collect(),
+                });
+            }
             (self.stage(&inner)?, at + 1)
         };
         self.await_durable(seq.0)?;
@@ -919,6 +1003,7 @@ impl Inner {
             fired: FiredTree::new(),
             interests: Tree::new(),
             registered: Tree::new(),
+            grafts: Spanfilade::new(),
         }
     }
 
@@ -1217,15 +1302,24 @@ impl TraceStore for EntStore {
         if at.0 < inner.watermark {
             return Err(door("read_range_on", at.0, inner.watermark));
         }
-        // Arrangements track the *current* order; an as-of read below it falls
-        // back to the primary order, which is always exact.
-        if col == 0 || at.0 != inner.current {
+        // The lead column is a key range on the primary order.
+        if col == 0 {
+            let (klo, khi) = (Tuple::from([lo.clone()]), Tuple::from([hi.clone()]));
+            return Ok(inner.fact_at(rel, at.0).map(|t| t.range_collect(&klo, &khi)).unwrap_or_default());
+        }
+        // Arrangements track the *current* order. Below it, an entity span is a
+        // search on the extents; anything else reads the primary order and
+        // filters, which is always exact.
+        if at.0 != inner.current {
+            let facts = inner.fact_at(rel, at.0).cloned();
             drop(inner);
-            let rows = self.read_at(rel, at)?;
-            return Ok(rows
-                .into_iter()
-                .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| lo <= v && v < hi))
-                .collect());
+            if let (Value::Ent(l), Value::Ent(h)) = (lo, hi) {
+                return Ok(facts.map(|t| search_box(&t, &[(col, l.0, h.0)])).unwrap_or_default());
+            }
+            let in_span = |k: &Tuple| k.as_slice().get(col).is_some_and(|v| lo <= v && v < hi);
+            return Ok(facts
+                .map(|t| t.iter().filter(|(k, _)| in_span(k)).map(|(k, v)| (k, *v)).collect())
+                .unwrap_or_default());
         }
         Self::ensure_order(&mut inner, rel, col);
         let Some(arr) = inner.roots(rel).and_then(|r| r.orders.get(&(col as u32))) else {
@@ -1496,6 +1590,19 @@ fn latest_schema(ctx: &ContextEnf, rel: RelId) -> Result<Option<(u64, Schema)>> 
             Ok(Some((edition, decode_schema_value(v)?)))
         }
     }
+}
+
+/// The facts whose entity cells fall in every `(col, lo, hi)` span, pruned by
+/// [`Extent`]. A box can only shrink as it descends, so the test is monotone.
+fn search_box(facts: &FactTree, bounds: &[(usize, u64, u64)]) -> Vec<(Tuple, Diff)> {
+    facts.search(
+        |(_, x)| bounds.iter().all(|&(col, lo, hi)| x.meets(col, lo, hi)),
+        |k, _| {
+            bounds.iter().all(|&(col, lo, hi)| {
+                matches!(k.as_slice().get(col), Some(Value::Ent(e)) if lo <= e.0 && e.0 < hi)
+            })
+        },
+    )
 }
 
 fn door(op: &str, at: u64, watermark: u64) -> Error {

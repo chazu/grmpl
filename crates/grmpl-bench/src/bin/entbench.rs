@@ -29,6 +29,24 @@ fn seeded(dir: &std::path::Path, rows: i64) -> EntStore {
     store
 }
 
+/// `exits(from, way, to)`: two entity columns, so the Fact trees' extents have
+/// something to bound.
+fn exit(from: u64, way: i64, to: u64) -> Tuple {
+    Tuple::from([Value::Ent(Entity(from)), Value::Int(way), Value::Ent(Entity(to))])
+}
+
+/// A world of `rows` exits, four per room, whose destinations are `to(room,
+/// way)`, loaded in 1 000-row commits.
+fn exits_world(dir: &std::path::Path, rows: u64, to: impl Fn(u64, u64) -> u64) -> EntStore {
+    let store = EntStore::open(dir).expect("open");
+    let all: Vec<(RelId, Tuple, Diff)> =
+        (0..rows).map(|i| (REL, exit(i / 4, (i % 4) as i64, to(i / 4, i % 4)), 1)).collect();
+    for chunk in all.chunks(1_000) {
+        store.commit(chunk).unwrap();
+    }
+    store
+}
+
 fn row(label: &str, size: i64, ns: f64, extra: &str) {
     println!("  {label:<34} {size:>8}  {ns:>12.0} ns  {extra}");
 }
@@ -57,6 +75,106 @@ fn main() {
         let frames = store.frames_encoded() - before;
         assert_eq!(fork.read_at(REL, fork.current()).unwrap().len(), n as usize);
         row("fork whole world", n, ns, &format!("{frames} node frames written"));
+    }
+
+    // ------------------------------------------------------------ extents ---
+    header(
+        "Extents — pruning on a column the tree is not ordered by",
+        "Exits whose destination lies in a 10-room span. `near`: exits lead to adjacent rooms; `far`: anywhere.",
+    );
+    for &n in &sizes {
+        let rooms = n as u64 / 4;
+        let span = (rooms / 2, rooms / 2 + 10);
+        let near = |r: u64, w: u64| (r + w + 1) % rooms;
+        let far = |r: u64, w: u64| (r * 7_919 + w * 104_729) % rooms;
+        for (label, to) in [("near", &near as &dyn Fn(u64, u64) -> u64), ("far", &far)] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(exits_world(dir.path(), n as u64, to));
+            let store = EntStore::open(dir.path()).unwrap();
+            let at = store.current();
+
+            let before = store.frames_paged();
+            let start = Instant::now();
+            let got = store.search_at(REL, at, &[(2, span.0, span.1)]).unwrap().len();
+            let cold = start.elapsed().as_nanos() as f64;
+            let paged = store.frames_paged() - before;
+            row(&format!("search_at, {label} (cold)"), n, cold, &format!("{got} rows, {paged} frames paged"));
+
+            const R: u32 = 50;
+            let start = Instant::now();
+            for _ in 0..R {
+                std::hint::black_box(store.search_at(REL, at, &[(2, span.0, span.1)]).unwrap());
+            }
+            let warm = start.elapsed().as_nanos() as f64 / R as f64;
+            row(&format!("search_at, {label} (warm)"), n, warm, "");
+
+            let (lo, hi) = (Value::Ent(Entity(span.0)), Value::Ent(Entity(span.1)));
+            let start = Instant::now();
+            store.read_range_on(REL, at, 2, &lo, &hi).unwrap();
+            let build = start.elapsed().as_nanos() as f64;
+            let start = Instant::now();
+            for _ in 0..R {
+                std::hint::black_box(store.read_range_on(REL, at, 2, &lo, &hi).unwrap());
+            }
+            let arr = start.elapsed().as_nanos() as f64 / R as f64;
+            row(&format!("Arrangement, {label}"), n, arr, &format!("first call built it in {:.1} ms", build / 1e6));
+
+            let start = Instant::now();
+            let all = store.read_at(REL, at).unwrap();
+            let hits = all
+                .iter()
+                .filter(|(t, _)| matches!(t.as_slice()[2], Value::Ent(e) if span.0 <= e.0 && e.0 < span.1))
+                .count();
+            let scan = start.elapsed().as_nanos() as f64;
+            row(&format!("read_at + filter, {label}"), n, scan, &format!("{hits} rows"));
+        }
+    }
+
+    // --------------------------------------------------------------- size ---
+    header(
+        "Size — what the frames cost",
+        "An exits world (two entity columns per row), then 200 single-row commits. Frame bytes before compression.",
+    );
+    for &n in &sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exits_world(dir.path(), n as u64, |r, w| r + w + 1);
+        let loaded = store.bytes_encoded();
+        let (before, bytes_before) = (store.frames_encoded(), store.bytes_encoded());
+        const C: u64 = 200;
+        let start = Instant::now();
+        for k in 0..C {
+            store.commit(&[(REL, exit(n as u64 + k, 0, n as u64 + k + 1), 1)]).unwrap();
+        }
+        let ns = start.elapsed().as_nanos() as f64 / C as f64;
+        let frames = (store.frames_encoded() - before) as f64 / C as f64;
+        let bytes = (store.bytes_encoded() - bytes_before) as f64 / C as f64;
+        row(
+            "exits commit (fsync'd)",
+            n,
+            ns,
+            &format!(
+                "{frames:.1} frames, {:.1} KB/commit; load wrote {:.0} B/row",
+                bytes / 1e3,
+                loaded as f64 / n as f64
+            ),
+        );
+    }
+
+    for &n in &sizes {
+        let store = EntStore::new();
+        let all: Vec<(RelId, Tuple, Diff)> = (0..n as u64)
+            .map(|i| (REL, exit(i / 4, (i % 4) as i64, i / 4 + i % 4 + 1), 1))
+            .collect();
+        for chunk in all.chunks(1_000) {
+            store.commit(chunk).unwrap();
+        }
+        const C: u64 = 20_000;
+        let start = Instant::now();
+        for k in 0..C {
+            store.commit(&[(REL, exit(n as u64 + k, 0, n as u64 + k + 1), 1)]).unwrap();
+        }
+        let ns = start.elapsed().as_nanos() as f64 / C as f64;
+        row("exits commit (in memory)", n, ns, "no granfilade: the tree work alone");
     }
 
     // ------------------------------------------------------- virtual copy ---
@@ -162,7 +280,7 @@ fn main() {
             std::hint::black_box(store.count_at(REL, at, &lo, &hi).unwrap());
         }
         let m_ns = start.elapsed().as_nanos() as f64 / M as f64;
-        row("count_at (measure, no rows)", n, m_ns, "");
+        row("count_at (sizes, no rows)", n, m_ns, "");
     }
 
     // ------------------------------------------------- scan vs flat array ---

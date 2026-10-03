@@ -307,6 +307,67 @@ where
         Self::fold_range(self, lo, hi, None, None, 0, M::empty())
     }
 
+    /// **WID search.** The entries `keep` accepts, in key order, visiting
+    /// only subtrees whose cached measure `admit` accepts.
+    ///
+    /// This is the search a measure exists for. Key order prunes on the lead
+    /// of the key; a measure such as [`Extent`](crate::measure::Extent) prunes
+    /// on anything it summarizes, and a subtree it rules out is never paged in.
+    ///
+    /// The two tests must agree: if `keep` accepts an entry, `admit` accepts
+    /// the measure of every subtree holding it — at the least, `admit(&M::entry(k,
+    /// v))` whenever `keep(k, v)`, and `admit` monotone under `combine`.
+    /// Otherwise a match can hide under a rejected subtree. Both see the
+    /// tree's absolute frame, with every dsp above them applied. `keep` is
+    /// separate so the per-entry test need not build a measure.
+    pub fn search(&self, admit: impl Fn(&M) -> bool, keep: impl Fn(&K, &V) -> bool) -> Vec<(K, V)> {
+        let mut out = Vec::new();
+        Self::search_into(self, 0, &admit, &keep, &mut out);
+        out
+    }
+
+    fn search_into(
+        t: &Self,
+        off: i64,
+        admit: &impl Fn(&M) -> bool,
+        keep: &impl Fn(&K, &V) -> bool,
+        out: &mut Vec<(K, V)>,
+    ) {
+        let Some(n) = t.root.as_deref() else { return };
+        let off = off.wrapping_add(t.dsp);
+        // Test the cached measure before touching the contents, so a subtree
+        // ruled out stays on disk.
+        let admitted = if off == 0 { admit(&n.measure) } else { admit(&n.measure.displace(off)) };
+        if !admitted {
+            return;
+        }
+        match n.kind() {
+            Kind::Leaf(entries) => {
+                for (k, v) in entries {
+                    let k = moved(k, off);
+                    if keep(&k, v) {
+                        out.push((k.into_owned(), v.clone()));
+                    }
+                }
+            }
+            Kind::Internal { children, .. } => {
+                for c in children {
+                    Self::search_into(c, off, admit, keep, out);
+                }
+            }
+        }
+    }
+
+    /// How many entries have a key in `[lo, hi)` — `O(log n)` from the cached
+    /// subtree sizes, whatever the measure. A tree whose measure carries more
+    /// than a count answers "how many" without folding the rest of it.
+    pub fn count_range(&self, lo: &K, hi: &K) -> usize {
+        if lo >= hi {
+            return 0;
+        }
+        Self::count_into(self, lo, hi, None, None, 0)
+    }
+
     /// The entries with key in `[lo, hi)`, cloned, in order. `O(result + depth)`
     /// — subtrees wholly outside the span are pruned. Cheap when values are
     /// `Arc`-backed (a clone is a refcount bump).
@@ -532,7 +593,7 @@ where
     fn leaf(entries: Vec<(K, V)>) -> Self {
         let mut measure = M::empty();
         for (k, v) in &entries {
-            measure = measure.combine(&M::entry(k, v));
+            measure.absorb_entry(k, v);
         }
         Tree {
             root: Some(Arc::new(Node {
@@ -550,7 +611,10 @@ where
         let mut measure = M::empty();
         let mut size = 0;
         for c in &children {
-            measure = measure.combine(&c.measure());
+            match (c.dsp, c.local_measure()) {
+                (0, Some(m)) => measure.absorb(m),
+                _ => measure.absorb(&c.measure()),
+            }
             size += c.len();
         }
         Tree {
@@ -908,21 +972,25 @@ where
             return acc;
         }
         let off = off.wrapping_add(t.dsp);
+        let mut acc = acc;
         if contained(nlo, nhi, lo, hi) {
-            return acc.combine(&n.measure.displace(off));
+            if off == 0 {
+                acc.absorb(&n.measure);
+            } else {
+                acc.absorb(&n.measure.displace(off));
+            }
+            return acc;
         }
         match n.kind() {
             Kind::Leaf(entries) => {
-                let mut acc = acc;
                 for (k, v) in entries {
                     if in_span(k, off, lo, hi) {
-                        acc = acc.combine(&M::entry(&moved(k, off), v));
+                        acc.absorb_entry(&moved(k, off), v);
                     }
                 }
                 acc
             }
             Kind::Internal { keys, children } => {
-                let mut acc = acc;
                 for (idx, c) in span(keys, children, off, lo, hi) {
                     let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
                     let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
@@ -930,6 +998,29 @@ where
                 }
                 acc
             }
+        }
+    }
+
+    /// [`fold_range`](Self::fold_range) for the entry count alone, from the
+    /// cached sizes: no measure is built, however rich the tree's measure is.
+    fn count_into(t: &Self, lo: &K, hi: &K, nlo: Bound<'_, K>, nhi: Bound<'_, K>, off: i64) -> usize {
+        let Some(n) = t.root.as_deref() else { return 0 };
+        if disjoint(nlo, nhi, lo, hi) {
+            return 0;
+        }
+        if contained(nlo, nhi, lo, hi) {
+            return n.size;
+        }
+        let off = off.wrapping_add(t.dsp);
+        match n.kind() {
+            Kind::Leaf(entries) => entries.iter().filter(|(k, _)| in_span(k, off, lo, hi)).count(),
+            Kind::Internal { keys, children } => span(keys, children, off, lo, hi)
+                .map(|(idx, c)| {
+                    let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
+                    let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
+                    Self::count_into(c, lo, hi, clo, chi, off)
+                })
+                .sum(),
         }
     }
 

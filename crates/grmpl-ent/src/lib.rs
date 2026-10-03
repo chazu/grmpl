@@ -25,6 +25,7 @@ pub mod dag;
 pub mod dsp;
 pub mod granfilade;
 pub mod measure;
+pub mod spanfilade;
 pub mod store;
 pub mod tree;
 
@@ -33,7 +34,8 @@ pub use context::{ContextEnf, Scope};
 pub use dag::{Branch, BranchId, Dag};
 pub use dsp::Displace;
 pub use granfilade::{Granfilade, Persist};
-pub use measure::{Count, Measure};
+pub use measure::{Count, Extent, Measure};
+pub use spanfilade::{GraftSpan, Spanfilade};
 pub use store::EntStore;
 pub use tree::Tree;
 
@@ -169,7 +171,7 @@ mod tests {
 
     use grmpl_core::{Entity, Tuple, Value};
 
-    type F = Tree<Tuple, i64, Count>;
+    type F = Tree<Tuple, i64, (Count, Extent)>;
     type Oracle = BTreeMap<Tuple, i64>;
 
     /// A three-column key with two entity cells, so a displacement has to move
@@ -190,13 +192,36 @@ mod tests {
         r.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
+    /// The extent of `rows`, computed directly.
+    fn extent_of<'a>(rows: impl Iterator<Item = &'a Tuple>) -> Extent {
+        rows.fold(Extent::default(), |acc, k| {
+            Measure::<Tuple, i64>::combine(&acc, &Measure::<Tuple, i64>::entry(k, &0))
+        })
+    }
+
     /// Every read path against the oracle: contents, size, point lookups, range
-    /// collection and measure, emptiness probes, and as-of lookup.
+    /// collection and measure, emptiness probes, as-of lookup, and the extent
+    /// with the search it drives.
     fn agree(t: &F, r: &Oracle, rng: &mut Rng, ctx: &str) {
         t.check();
         assert_eq!(contents(t), oracle_contents(r), "{ctx}: contents");
         assert_eq!(t.len(), r.len(), "{ctx}: size");
-        assert_eq!(t.measure(), Count(r.len() as u64), "{ctx}: measure");
+        assert_eq!(t.measure(), (Count(r.len() as u64), extent_of(r.keys())), "{ctx}: measure");
+        // A box on the trailing entity column, which key order cannot prune.
+        for _ in 0..3 {
+            let (a, b) = (rng.below(2700), rng.below(2700));
+            let (lo, hi) = (a.min(b), a.max(b));
+            let want: Vec<(Tuple, i64)> = r
+                .iter()
+                .filter(|(k, _)| matches!(k.as_slice()[2], Value::Ent(e) if lo <= e.0 && e.0 < hi))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            let got = t.search(
+                |(_, x)| x.meets(2, lo, hi),
+                |k, _| matches!(k.as_slice()[2], Value::Ent(e) if lo <= e.0 && e.0 < hi),
+            );
+            assert_eq!(got, want, "{ctx}: search [{lo},{hi})");
+        }
         for _ in 0..6 {
             let k = key(rng.below(2600), rng.below(3) as i64);
             assert_eq!(t.get(&k), r.get(&k), "{ctx}: get {k:?}");
@@ -207,8 +232,13 @@ mod tests {
             let span: Vec<(Tuple, i64)> =
                 r.range(lo.clone()..hi.clone()).map(|(k, v)| (k.clone(), *v)).collect();
             assert_eq!(t.range_collect(&lo, &hi), span, "{ctx}: range");
-            assert_eq!(t.measure_range(&lo, &hi), Count(span.len() as u64), "{ctx}: range measure");
+            assert_eq!(
+                t.measure_range(&lo, &hi),
+                (Count(span.len() as u64), extent_of(span.iter().map(|(k, _)| k))),
+                "{ctx}: range measure"
+            );
             assert_eq!(t.any_in(&lo, &hi), !span.is_empty(), "{ctx}: any_in");
+            assert_eq!(t.count_range(&lo, &hi), span.len(), "{ctx}: count_range");
         }
     }
 
@@ -351,6 +381,9 @@ mod tests {
         back.check();
         assert_eq!(back.get(&key(112_345, 0)), Some(&1));
         assert_eq!(back.get(&key(115_000, 0)), None);
-        assert_eq!(back.measure_range(&lead(105_000), &lead(115_000)), Count(10_000));
+        let (n, x) = back.measure_range(&lead(105_000), &lead(115_000));
+        assert_eq!(n, Count(10_000));
+        // The copy's extent moved with it: lead and trailing entity columns.
+        assert_eq!((x.column(0), x.column(2)), (Some((105_000, 114_999)), Some((105_007, 115_006))));
     }
 }

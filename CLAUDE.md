@@ -85,6 +85,25 @@ are each branch's whole state (clock, Rel enfilade, context enfilade, canopy).
   sweep removes swept keys from the granfilade's `present` set, so a resident
   node that loses its frame is written again if a later root reaches it.
 
+### Extents and the spanfilade (`grmpl-ent::measure`, `spanfilade`)
+
+Fact trees are measured by `(Count, Extent)`: per column, the bounding box of
+the subtree's entity cells — Gold's wid. Three rules keep the searches it drives
+exact:
+
+* **An extent displaces exactly as its keys do.** It is stored in the node's
+  local frame; `Measure::displace` shifts every bound by the dsp. A measure that
+  ignored the dsp would prune the matches out of every grafted block.
+* **`Tree::search(admit, keep)` needs the two tests to agree**: whenever `keep`
+  accepts an entry, `admit` accepts every subtree holding it. Otherwise a match
+  hides under a pruned subtree.
+* **`instance_template` refuses a template whose extent leaves its block**, since
+  a graft moves every entity cell.
+
+The spanfilade records every graft by source span and by target span, per
+branch. It is **append-only** — retraction and consolidation leave it alone — and
+a fork into the past keeps only the grafts made by the fork edition.
+
 ### Determinism
 
 Reads and deltas are deterministic regardless of the store's physical scan

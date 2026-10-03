@@ -54,7 +54,7 @@ use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
 
 use crate::dsp::Displace;
-use crate::measure::{Count, Measure};
+use crate::measure::{Count, Extent, Measure};
 use crate::tree::{NodeRef, Pager, Resident, Tree};
 
 pub use grmpl_core::hash::Sha256Digest as ContentKey;
@@ -64,9 +64,10 @@ const CK_LEN: usize = 32;
 
 /// Node frames ride the one workspace format version. v6 added links from
 /// leaves to other trees, each internal child's size and measure, and the
-/// single root record; like v4 and v5 before it the cutover is
-/// fresh-store-only, so a v6 binary rejects every older persisted node before
-/// interpreting its payload.
+/// single root record. v7 added the [`Extent`] to every Fact tree's measure
+/// and the spanfilade to each branch's state. Like every cutover before it,
+/// v7 is fresh-store-only: a v7 binary rejects every older persisted node
+/// before interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// The meta key of the root record — the granfilade's one mutable slot.
@@ -296,6 +297,25 @@ impl Persist for Count {
     }
 }
 
+/// An extent persists as its column count, then each column's bounds behind a
+/// presence flag.
+impl Persist for Extent {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        (self.0.len() as u32).encode(e);
+        for col in &self.0 {
+            col.encode(e);
+        }
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let n = u32::decode(d)? as usize;
+        let mut cols = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            cols.push(Option::<(u64, u64)>::decode(d)?);
+        }
+        Ok(Extent(cols))
+    }
+}
+
 /// A tree as a value is a **link**: see [`Enc::link`].
 impl<K, V, M> Persist for Tree<K, V, M>
 where
@@ -354,6 +374,9 @@ pub struct Granfilade {
     /// prose; this is what lets a test *fail* when an `O(log n)` walk quietly
     /// becomes a scan.
     encoded: AtomicU64,
+    /// Bytes in the frames [`encoded`](Self::encoded) counts: what the commit
+    /// path writes, before the node store compresses it.
+    encoded_bytes: AtomicU64,
     /// **Durability ops counter (group commit).** `SyncAll`s issued since this
     /// handle was opened.
     syncs: AtomicU64,
@@ -383,6 +406,7 @@ impl Granfilade {
             present: Mutex::new(HashSet::new()),
             remembered: Mutex::new(Remembered { nodes: Vec::new(), prune_at: 1024 }),
             encoded: AtomicU64::new(0),
+            encoded_bytes: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
             paged_in: AtomicU64::new(0),
         };
@@ -420,6 +444,8 @@ impl Granfilade {
         // subtree beneath it shared. Below the root, dsps ride the edges.
         let ck = collect_nodes(&tree.normalized(), &mut sink);
         self.encoded.fetch_add(sink.out.len() as u64, Ordering::Relaxed);
+        let bytes: usize = sink.out.iter().map(|(_, f)| f.len()).sum();
+        self.encoded_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         (ck, sink.out)
     }
 
@@ -586,6 +612,11 @@ impl Granfilade {
     /// [`encoded`](Self::encoded) ops counter.
     pub fn frames_encoded(&self) -> u64 {
         self.encoded.load(Ordering::Relaxed)
+    }
+
+    /// Bytes in the frames [`frames_encoded`](Self::frames_encoded) counts.
+    pub fn bytes_encoded(&self) -> u64 {
+        self.encoded_bytes.load(Ordering::Relaxed)
     }
 
     /// Node frames read from disk since this handle was opened.
@@ -986,10 +1017,10 @@ mod tests {
     }
 
     #[test]
-    fn pre_v6_node_is_rejected_with_fresh_store_guidance() {
-        let old = [5, TAG_LEAF, 0, 0, 0, 0];
+    fn pre_v7_node_is_rejected_with_fresh_store_guidance() {
+        let old = [6, TAG_LEAF, 0, 0, 0, 0];
         let err = decode_header(&old).unwrap_err().to_string();
-        assert!(err.contains("unsupported node format version 5"));
+        assert!(err.contains("unsupported node format version 6"));
         assert!(err.contains("fresh store"));
         assert!(err.contains("no migrator"));
     }

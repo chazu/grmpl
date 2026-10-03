@@ -10,13 +10,14 @@ the Part I mechanism it realizes.
 ```text
 crates/grmpl-ent/src/
   tree.rs         the enfilade primitive — persistent measured displaced tree
-  measure.rs      the WID monoid (Measure; Count)
+  measure.rs      the WID monoid (Measure; Count, Extent)
   granfilade.rs   content-addressed node store; structural sharing on disk
   store.rs        the enfilades that make an EntStore (the store traits)
   dsp.rs          what a displacement does to a key (Displace)
   dag.rs          the branch/edition DAG (DagWood: Branch, BranchId, Dag)
   canopy.rs       interest routing (interval enfilade + endorsement flag-lattice)
   context.rs      the context enfilade (catalog + schema registry, root scope)
+  spanfilade.rs   every graft, indexed by source and by target (provenance)
 
 crates/grmpl-proc/src/
   derived.rs      the Derived enfilade — materialized views (tests only)
@@ -36,16 +37,22 @@ sit under the language at all. A node holding a run of crums is, in Gold's terms
 a **loaf**.
 
 `measure.rs` defines the `Measure` trait (an associative fold with identity) and
-**`Count`** — the entry count, which is what makes "how many" a read of cached
-summaries. Every enfilade carries at least this; the Fact enfilade carries only
-this. The canopy carries its own `Reach`. Adding a measure is adding a monoid,
-not a tree.
+two measures. **`Count`** is the entry count, which is what makes "how many" a
+read of cached summaries; every enfilade carries at least this. **`Extent`** is
+the wid proper: for each column, the least and greatest entity id under the
+subtree — a bounding box in the space a dsp moves, stored in the node's local
+frame and displaced on the way down, as a key is. The Fact enfilade carries
+both. The canopy carries its own `Reach`, and the spanfilade a `Hull`. Adding a
+measure is adding a monoid, not a tree.
 
 The primitive already delivers the two Part I superpowers in miniature:
 
 - `t.measure()` is the whole-tree fold; `t.measure_range(&lo, &hi)` is the
   **WID-pruned** range fold — it reads node summaries and skips whole subtrees to
   answer "how many lie in `[lo, hi)`" in `O(log n)`.
+- `t.search(admit, keep)` is the WID search: it descends only into subtrees
+  whose measure `admit` accepts. Over extents, that prunes on a column the tree
+  is not ordered by — as well as the column tracks the key order, and no better.
 - Old versions are immutable and cheap: a retained snapshot is unaffected by
   later edits, and the edit that produced the new version allocated only
   `O(log n)` nodes.

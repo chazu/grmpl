@@ -468,9 +468,17 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   trees beneath it, and nodes page in on demand (5→6, a fresh-store cutover).
   Opening a world reads two frames at any size. Laws:
   `grmpl-ent/tests/whole_ent.rs`.
-* **Open, in order:** extent summaries beyond `Count`, then a reverse index over
-  grafts (Green's spanfilade question — the D4M associative-array model, an
-  array stored beside its transpose, is a reference for this), which also lets
-  version compare across a graft skip the merge fallback; a transactional graft
-  effect in a patch (phase 3A of the world-package plan); DSP-inherited context
-  once the language declares scopes; merges in the branch DAG.
+* **Landed:** Fact trees carry an `Extent` (per-column entity bounding box,
+  Gold's wid) beside `Count`, and `Tree::search` prunes on it, so a query on any
+  entity column prunes at any edition; `instance_template` checks its
+  self-contained precondition from the extent. A per-branch **spanfilade**
+  records every graft by source and by target (the D4M layout: an array beside
+  its transpose), answering where a template was copied to and where an
+  instance came from (6→7, a fresh-store cutover). Laws:
+  `grmpl-ent/tests/extents.rs`, `grmpl-ent/tests/provenance.rs`, and the
+  displaced-tree oracle, which now checks extents and search.
+* **Open, in order:** version compare across a graft without the merge fallback
+  (the spanfilade knows the source; `diff` does not consult it yet); a
+  transactional graft effect in a patch (phase 3A of the world-package plan);
+  DSP-inherited context once the language declares scopes; merges in the branch
+  DAG.
