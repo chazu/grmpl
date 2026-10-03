@@ -1334,6 +1334,65 @@ impl TraceStore for EntStore {
             .collect())
     }
 
+    /// **Keyed lookup through the Ent's indexes.** Each key is a probe, not a
+    /// scan:
+    ///
+    /// * column 0 is the primary order, so a key is a range read of the rows
+    ///   that start with it, at any edition;
+    /// * another column at the current edition is a range read of its
+    ///   Arrangement — built on first use and maintained after, so it is the
+    ///   persisted derived state that join maintenance leans on;
+    /// * another column below the current edition, with entity keys, is one
+    ///   extent search for all of them together.
+    ///
+    /// Anything else (a key with no successor, a non-entity key in the past)
+    /// reads the relation once and filters, as the default does.
+    fn lookup(&self, rel: RelId, at: Edition, col: usize, keys: &[Value]) -> Result<Vec<(Tuple, Diff)>> {
+        // A repeated key would read its rows twice.
+        let keys: Vec<Value> = keys.iter().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let keys = &keys[..];
+        let spans: Option<Vec<(Tuple, Tuple)>> =
+            keys.iter().map(|k| Some((Tuple::from([k.clone()]), Tuple::from([successor(k)?])))).collect();
+        let mut inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("lookup", at.0, inner.watermark));
+        }
+        let probe = |t: &FactTree, spans: &[(Tuple, Tuple)]| -> Vec<(Tuple, Diff)> {
+            spans.iter().flat_map(|(lo, hi)| t.range_collect(lo, hi)).collect()
+        };
+        if let Some(spans) = &spans {
+            if col == 0 {
+                return Ok(inner.fact_at(rel, at.0).map(|t| probe(t, spans)).unwrap_or_default());
+            }
+            if at.0 == inner.current {
+                Self::ensure_order(&mut inner, rel, col);
+                let Some(arr) = inner.roots(rel).and_then(|r| r.orders.get(&(col as u32))) else {
+                    return Ok(Vec::new());
+                };
+                return Ok(probe(arr, spans).into_iter().map(|(k, v)| (unrotate(&k, col), v)).collect());
+            }
+        }
+        let facts = inner.fact_at(rel, at.0).cloned();
+        drop(inner);
+        let Some(facts) = facts else { return Ok(Vec::new()) };
+        let ids: Option<std::collections::BTreeSet<u64>> =
+            keys.iter().map(|k| if let Value::Ent(e) = k { Some(e.0) } else { None }).collect();
+        if let Some(ids) = ids {
+            // One pass for every key: a subtree is entered only if some key
+            // falls inside its box for the column.
+            return Ok(facts.search(
+                |(_, x)| x.column(col).is_some_and(|(lo, hi)| ids.range(lo..=hi).next().is_some()),
+                |k, _| matches!(k.as_slice().get(col), Some(Value::Ent(e)) if ids.contains(&e.0)),
+            ));
+        }
+        let keys: std::collections::BTreeSet<&Value> = keys.iter().collect();
+        Ok(facts
+            .iter()
+            .filter(|(k, _)| k.as_slice().get(col).is_some_and(|v| keys.contains(v)))
+            .map(|(k, v)| (k, *v))
+            .collect())
+    }
+
     /// **Key-range interest routing, through the canopy (G-4).**
     ///
     /// The relation-wide [`touched_since`](TraceStore::touched_since) wakes every
@@ -1589,6 +1648,17 @@ fn latest_schema(ctx: &ContextEnf, rel: RelId) -> Result<Option<(u64, Schema)>> 
             };
             Ok(Some((edition, decode_schema_value(v)?)))
         }
+    }
+}
+
+/// The least value above `v` in [`Value`]'s order, for the values where that is
+/// a plain next value: `[v, successor(v))` then holds exactly the tuples whose
+/// cell is `v`. `None` where it is not (text, floats, the top of a range).
+fn successor(v: &Value) -> Option<Value> {
+    match v {
+        Value::Ent(e) => e.0.checked_add(1).map(|n| Value::Ent(Entity(n))),
+        Value::Int(n) => n.checked_add(1).map(Value::Int),
+        _ => None,
     }
 }
 

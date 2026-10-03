@@ -110,6 +110,34 @@ pub trait TraceStore: EditionStore {
             .collect())
     }
 
+    /// **Keyed lookup.** Consolidated contents of `rel` as-of `at` restricted to
+    /// rows whose **column `col`** equals one of `keys`.
+    ///
+    /// This is what incremental maintenance asks of the side of a join that did
+    /// not change: only the rows that match the changed side's keys. The default
+    /// reads the relation once and filters, which costs what reading the whole
+    /// side always cost, so no store is made slower by being asked. A store with
+    /// indexes on `col` (the Ent's primary order on column 0, its Arrangements
+    /// on the others) overrides this to probe each key instead, so maintaining
+    /// a join costs the change rather than the relation.
+    ///
+    /// Rows come back in no particular order; a `col` beyond a row's arity
+    /// excludes it.
+    fn lookup(
+        &self,
+        rel: RelId,
+        at: Edition,
+        col: usize,
+        keys: &[crate::value::Value],
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        let keys: std::collections::BTreeSet<&crate::value::Value> = keys.iter().collect();
+        Ok(self
+            .read_at(rel, at)?
+            .into_iter()
+            .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| keys.contains(v)))
+            .collect())
+    }
+
     /// **Interest routing.** Could any commit in `(from, to]` have touched one of
     /// `rels`?
     ///

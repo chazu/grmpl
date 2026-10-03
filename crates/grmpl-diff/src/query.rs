@@ -555,6 +555,39 @@ fn base_of(q: &Query) -> Option<BaseRel<'_>> {
     }
 }
 
+/// The most distinct keys a join delta probes for one at a time. Past this, the
+/// unchanged side is read whole: a probe is a descent, and enough of them cost
+/// more than one scan.
+const PROBE_LIMIT: usize = 1_024;
+
+/// The part of `side` at `at` that can join with `delta`: at least every row
+/// whose key matches one of `delta`'s keys, possibly more.
+///
+/// When `side` is a stored relation (possibly range-restricted), this is a
+/// [`TraceStore::lookup`] on its first key column for the delta's distinct
+/// values — on the Ent, one index probe per key, so maintaining a join costs
+/// the change rather than the relation. The join itself still checks every key
+/// column. Any other side, or a delta with too many keys, is evaluated whole.
+fn matching(
+    side: &Query,
+    side_key: &[usize],
+    delta: &Multiset,
+    delta_key: &[usize],
+    store: &dyn TraceStore,
+    at: Edition,
+) -> Result<Multiset> {
+    if let (Some(base), Some(&col), Some(&dcol)) = (base_of(side), side_key.first(), delta_key.first()) {
+        let keys: std::collections::BTreeSet<&Value> =
+            delta.keys().filter_map(|t| t.as_slice().get(dcol)).collect();
+        if keys.len() <= PROBE_LIMIT {
+            let keys: Vec<Value> = keys.into_iter().cloned().collect();
+            let rows = store.lookup(base.rel, at, col, &keys)?;
+            return Ok(multiset::from_pairs(rows.into_iter().filter(|(t, _)| base.admits(t))));
+        }
+    }
+    eval_snapshot(side, store, at)
+}
+
 /// Is `q` **provably** unchanged over `(from, to]`?
 ///
 /// A query is a pure function of its base relations, so if the substrate can
@@ -627,14 +660,26 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
             out
         }
         Query::Join { left, right, left_key, right_key } => {
-            // Δ(A⋈B) = ΔA⋈B_from + A_to⋈ΔB
+            // Δ(A⋈B) = ΔA⋈B_to + A_to⋈ΔB − ΔA⋈ΔB
+            //
+            // (`A_to = A_from + ΔA`, so this equals the textbook
+            // `ΔA⋈B_from + A_to⋈ΔB`.) Both unchanged sides are read at `to`,
+            // and each is read only if the other side changed, and then only
+            // where it matches the change's keys — see [`matching`].
             let da = eval_delta(left, store, from, to)?;
             let db = eval_delta(right, store, from, to)?;
-            let b_from = eval_snapshot(right, store, from)?;
-            let a_to = eval_snapshot(left, store, to)?;
-            let mut out = join_multisets(&da, left_key, &b_from, right_key);
-            let rhs = join_multisets(&a_to, left_key, &db, right_key);
-            multiset::merge(&mut out, &rhs);
+            let mut out = Multiset::new();
+            if !da.is_empty() {
+                let b_to = matching(right, right_key, &da, left_key, store, to)?;
+                out = join_multisets(&da, left_key, &b_to, right_key);
+            }
+            if !db.is_empty() {
+                let a_to = matching(left, left_key, &db, right_key, store, to)?;
+                multiset::merge(&mut out, &join_multisets(&a_to, left_key, &db, right_key));
+            }
+            if !da.is_empty() && !db.is_empty() {
+                multiset::merge(&mut out, &negate(&join_multisets(&da, left_key, &db, right_key)));
+            }
             multiset::strip_zeros(&mut out);
             out
         }
