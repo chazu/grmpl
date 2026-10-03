@@ -14,5 +14,6 @@ grmpl-core = { workspace = true }
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-proc = { path = "../grmpl-proc" }
 grmpl-ent = { path = "../grmpl-ent" }
+grmpl = { path = "../grmpl-session" }
 tempfile = "3"
 

@@ -1152,6 +1152,14 @@ impl grmpl_core::EditionReader for EntReader<'_> {
         // other read in a plan is lock-free.
         self.store.read_range_on(rel, Edition(self.at), col, lo, hi)
     }
+
+    /// Answered from the store's Edition enfilade, a measure over `(from, at]`.
+    fn touched_since(&self, from: Edition, rels: &[RelId]) -> Result<bool> {
+        if from.0 >= self.at {
+            return Ok(false);
+        }
+        self.store.touched_since(from, Edition(self.at), rels)
+    }
 }
 
 impl EditionStore for EntStore {

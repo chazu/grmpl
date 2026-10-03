@@ -84,6 +84,40 @@ pub enum Query {
     /// as `implements` (DESIGN.md §3.1). One recursion variable per `Iterate`
     /// (single-level recursion in v1).
     Iterate { init: Box<Query>, step: Box<Query> },
+    /// **A materialized view — the Derived enfilade.** Means exactly `plan`,
+    /// which is `distinct(L)` or `reduce(distinct(L))` for a linear `L`; the
+    /// rest says where a maintained copy is stored.
+    ///
+    /// A maintainer (`grmpl_proc::Materialized`) keeps the view's *open*,
+    /// linear form in the relation `into`: `L` with the view's parameters as
+    /// leading columns, each row weighted by its number of derivations. Those
+    /// weights are the state `distinct` needs to be maintained by its changes
+    /// alone, and keeping them is what makes the copy cheap to maintain: a
+    /// linear delta costs the change. `cursor_rel` records (under `key`) the
+    /// edition the rows reflect.
+    ///
+    /// **Reading** at an edition checks, through the reader, whether any of
+    /// `plan`'s base relations moved since that cursor. If none did, the answer
+    /// is the stored rows that start with `prefix` (the view's arguments), with
+    /// those columns dropped, made distinct, and folded by `reduce` if the view
+    /// aggregates: a range read of the primary order rather than an evaluation.
+    /// Otherwise `plan` is evaluated as usual.
+    ///
+    /// **Deltas** of a view without an aggregate come from the copy when it is
+    /// current at both ends: each stored row whose weight changed between the
+    /// two editions is a row entering or leaving the view exactly when its
+    /// weight crosses zero, which [`TraceStore::compare`] answers in the size
+    /// of the edit. Otherwise they are `plan`'s deltas.
+    ///
+    /// Either way, materializing a view never changes an answer, only its cost.
+    Materialized {
+        plan: Box<Query>,
+        into: RelId,
+        prefix: Tuple,
+        cursor_rel: RelId,
+        key: grmpl_core::Entity,
+        reduce: Option<(Arc<[usize]>, Agg)>,
+    },
     /// A shared arrangement: a sub-DAG evaluated once and reused wherever the
     /// same `Arc` is referenced (DESIGN.md §3.2 — arrangement sharing is the
     /// compiler's main optimization). Build with [`Query::into_shared`].
@@ -125,6 +159,7 @@ impl Query {
             | Query::Distinct(input)
             | Query::Reduce { input, .. } => input.key_span(),
             Query::Shared(inner) => inner.key_span(),
+            Query::Materialized { plan, .. } => plan.key_span(),
             _ => None,
         }
     }
@@ -152,6 +187,9 @@ impl Query {
                 step.collect_base_relations(out);
             }
             Query::Shared(inner) => inner.collect_base_relations(out),
+            // What the view reads, not where its copy is kept: the copy changes
+            // only because they do.
+            Query::Materialized { plan, .. } => plan.collect_base_relations(out),
         }
     }
 
@@ -325,6 +363,7 @@ fn contains_reduce(q: &Query) -> bool {
         | Query::Project { input, .. } => contains_reduce(input),
         Query::Negate(a) | Query::Distinct(a) => contains_reduce(a),
         Query::Shared(inner) => contains_reduce(inner),
+        Query::Materialized { plan, .. } => contains_reduce(plan),
         Query::Join { left, right, .. } | Query::Union(left, right) => {
             contains_reduce(left) || contains_reduce(right)
         }
@@ -489,6 +528,20 @@ fn eval_inner(
             }
             r
         }
+        Query::Materialized { plan, into, prefix, cursor_rel, key, reduce } => {
+            // Stored rows stand for the view only against the store itself: not
+            // inside an `Iterate`, and not with relations overridden.
+            if recur.is_none() && overrides.is_none() {
+                if let Some(rows) = stored_view(reader, plan, *into, prefix, *cursor_rel, *key)? {
+                    let set = distinct_snapshot(&rows);
+                    return Ok(match reduce {
+                        None => set,
+                        Some((cols, agg)) => reduce_snapshot(&set, cols, agg),
+                    });
+                }
+            }
+            eval_inner(plan, reader, recur, overrides, arr)?
+        }
         Query::Shared(inner) => {
             // Memoize only in a plain context: inside an `Iterate` the same node
             // evaluates against different `recur` values, and with `overrides`
@@ -507,6 +560,104 @@ fn eval_inner(
             }
         }
     })
+}
+
+/// The delta of a materialized view without an aggregate over `(from, to]`,
+/// from its copy, or `None` if the copy is not current at both ends.
+#[allow(clippy::too_many_arguments)]
+fn stored_delta(
+    store: &dyn TraceStore,
+    plan: &Query,
+    into: RelId,
+    prefix: &Tuple,
+    cursor_rel: RelId,
+    key: grmpl_core::Entity,
+    from: Edition,
+    to: Edition,
+) -> Result<Option<Multiset>> {
+    let rels: Vec<RelId> = plan.base_relations().into_iter().collect();
+    for at in [from, to] {
+        match cursor_at(&*store.dyn_reader_at(at), cursor_rel, key)? {
+            Some(c) if c >= at || !store.touched_since(c, at, &rels)? => {}
+            _ => return Ok(None),
+        }
+    }
+    let n = prefix.arity();
+    let mut out = Multiset::new();
+    for (t, w_from, w_to) in store.compare(into, from, to)? {
+        if t.as_slice().get(..n) != Some(prefix.as_slice()) {
+            continue;
+        }
+        let d = i64::from(w_to > 0) - i64::from(w_from > 0);
+        if d != 0 {
+            multiset::add(&mut out, Tuple::new(t.as_slice()[n..].to_vec()), d);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The edition a materialized view's copy reflects, as of the reader's
+/// edition, or `None` if it is not installed there.
+fn cursor_at(reader: &dyn EditionReader, cursor_rel: RelId, key: grmpl_core::Entity) -> Result<Option<Edition>> {
+    let Some(next) = key.0.checked_add(1) else { return Ok(None) };
+    let (lo, hi) = (Tuple::from([Value::Ent(key)]), Tuple::from([Value::Ent(grmpl_core::Entity(next))]));
+    Ok(reader.read_range(cursor_rel, &lo, &hi)?.into_iter().find_map(|(t, d)| match t.as_slice() {
+        [_, Value::Int(e)] if d > 0 => Some(Edition((*e).max(0) as u64)),
+        _ => None,
+    }))
+}
+
+/// The stored rows of a materialized view at the reader's edition, or `None`
+/// if they are not provably the answer there.
+///
+/// The cursor row `(key, c)` says the rows reflect the view at `c`. They are
+/// still the answer at the reader's edition if no base relation of `plan` was
+/// touched in `(c, edition]` — which the reader proves, or declines to.
+fn stored_view(
+    reader: &dyn EditionReader,
+    plan: &Query,
+    into: RelId,
+    prefix: &Tuple,
+    cursor_rel: RelId,
+    key: grmpl_core::Entity,
+) -> Result<Option<Multiset>> {
+    let Some(cursor) = cursor_at(reader, cursor_rel, key)? else { return Ok(None) };
+    let rels: Vec<RelId> = plan.base_relations().into_iter().collect();
+    if reader.touched_since(cursor, &rels)? {
+        return Ok(None);
+    }
+    let n = prefix.arity();
+    let rows = match prefix.as_slice().split_last() {
+        None => reader.read(into)?,
+        Some((last, init)) => match successor(last) {
+            // `[prefix, prefix⁺)`: every row whose leading cells are the prefix.
+            Some(next) => {
+                let hi: Vec<Value> = init.iter().cloned().chain(std::iter::once(next)).collect();
+                reader.read_range(into, prefix, &Tuple::new(hi))?
+            }
+            None => reader
+                .read(into)?
+                .into_iter()
+                .filter(|(t, _)| t.as_slice().get(..n) == Some(prefix.as_slice()))
+                .collect(),
+        },
+    };
+    let mut out = Multiset::new();
+    for (t, d) in rows {
+        multiset::add(&mut out, Tuple::new(t.as_slice()[n..].to_vec()), d);
+    }
+    multiset::strip_zeros(&mut out);
+    Ok(Some(out))
+}
+
+/// The least value above `v`, where that is a plain next value (entities and
+/// integers): `[v, successor(v))` holds exactly `v`.
+fn successor(v: &Value) -> Option<Value> {
+    match v {
+        Value::Ent(e) => e.0.checked_add(1).map(|n| Value::Ent(grmpl_core::Entity(n))),
+        Value::Int(n) => n.checked_add(1).map(Value::Int),
+        _ => None,
+    }
 }
 
 /// A query that reads exactly one base relation, possibly range-restricted —
@@ -786,5 +937,13 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
         Query::Recur => Multiset::new(),
         // A shared arrangement is transparent to delta computation.
         Query::Shared(inner) => eval_delta(inner, store, from, to)?,
+        Query::Materialized { plan, into, prefix, cursor_rel, key, reduce } => {
+            if reduce.is_none() {
+                if let Some(d) = stored_delta(store, plan, *into, prefix, *cursor_rel, *key, from, to)? {
+                    return Ok(d);
+                }
+            }
+            eval_delta(plan, store, from, to)?
+        }
     })
 }

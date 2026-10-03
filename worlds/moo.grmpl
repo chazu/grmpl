@@ -74,7 +74,7 @@ rel wdelivery(watch: Ent, n: Int)           // durable client-delivery cursor
 // ---- views: reading the world is just a query ------------------------------
 
 // Everything in my room, with names. `visible(you)` *is* a three-way join.
-view here(viewer) {
+materialized view here(viewer) {
     located(viewer, room)
     located(thing, room)
     named(thing, name)
@@ -118,7 +118,7 @@ view treasure() {
 }
 
 // Every named thing and where the watcher should react to it appearing/leaving.
-view world() {
+materialized view world() {
     located(thing, room)
     named(thing, name)
     yield thing, name
@@ -127,7 +127,7 @@ view world() {
 // --- identity-fog views (the host composes these into the room description) ---
 
 // The raw entities sharing my room (host decides how to render each).
-view contents(viewer) {
+materialized view contents(viewer) {
     located(viewer, room)
     located(thing, room)
     yield thing

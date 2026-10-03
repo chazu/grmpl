@@ -548,6 +548,9 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     }
 
     fn pump_watch(&mut self) -> Result<(), String> {
+        // Keep materialized views current; a stale one still reads correctly,
+        // only by evaluating instead of reading.
+        self.world.runtime().refresh_views().map_err(err)?;
         if let Some(ow) = &self.watch {
             ow.pump(self.store, self.store).map_err(err)?;
             let at = self.store.current();

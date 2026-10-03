@@ -243,6 +243,18 @@ pub enum QueryIr {
         init: Box<QueryIr>,
         step: Box<QueryIr>,
     },
+    /// A `materialized view`: means exactly `plan`, and reads the maintained
+    /// copy in `into` (rows led by `prefix`, the view's arguments; made
+    /// distinct, then folded by `reduce` for an aggregate view) whenever that
+    /// copy is provably current. See `grmpl_diff::Query::Materialized`.
+    Materialized {
+        plan: Box<QueryIr>,
+        into: RelId,
+        prefix: Vec<Value>,
+        cursor_rel: RelId,
+        key: Entity,
+        reduce: Option<(Vec<usize>, Agg)>,
+    },
 }
 
 impl QueryIr {
@@ -269,6 +281,14 @@ impl QueryIr {
             QueryIr::Reduce { input, key, agg } => input.lower().reduce(key, agg),
             QueryIr::Recur => Query::recur(),
             QueryIr::Iterate { init, step } => Query::iterate(init.lower(), step.lower()),
+            QueryIr::Materialized { plan, into, prefix, cursor_rel, key, reduce } => Query::Materialized {
+                plan: Box::new(plan.lower()),
+                into,
+                prefix: Tuple::new(prefix),
+                cursor_rel,
+                key,
+                reduce: reduce.map(|(cols, agg)| (cols.into(), agg)),
+            },
         }
     }
 }

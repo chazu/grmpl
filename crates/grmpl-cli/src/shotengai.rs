@@ -1388,6 +1388,7 @@ impl Game {
     }
 
     fn pump_watch(&mut self, out: &mut Vec<String>) -> Result<(), String> {
+        self.runtime.refresh_views().map_err(err)?;
         let Some(watch) = &self.watch else {
             return Ok(());
         };

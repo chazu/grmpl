@@ -160,6 +160,7 @@ impl Session {
     }
 
     pub fn push_activations(&mut self, out: &mut dyn Write) -> Result<usize> {
+        self.server.world.runtime().refresh_views()?;
         let Some(subscription) = &self.subscription else {
             return Ok(0);
         };

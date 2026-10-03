@@ -163,14 +163,14 @@ rel wcursor(watch: Ent, edition: Int)
 rel wseq(inbox: Int, target: Ent, n: Int)
 
 // ---- base views -------------------------------------------------------------
-view here(viewer) {
+materialized view here(viewer) {
     located(viewer, room)
     located(thing, room)
     named(thing, name)
     yield thing, name
 }
 
-view contents(viewer) {
+materialized view contents(viewer) {
     located(viewer, room)
     located(thing, room)
     yield thing
@@ -206,7 +206,7 @@ view treasure() {
     yield name, sum(coins)
 }
 
-view world() {
+materialized view world() {
     located(thing, room)
     named(thing, name)
     yield thing, name

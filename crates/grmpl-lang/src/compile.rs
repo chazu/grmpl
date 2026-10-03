@@ -31,7 +31,7 @@ use grmpl_core::{
 };
 use grmpl_diff::{Agg, Query, Snapshot};
 use grmpl_pattern::{Form, Pattern, VarId};
-use grmpl_proc::{Behavior, CommitOutcome, OnWatch};
+use grmpl_proc::{Behavior, CommitOutcome, Materialized, OnWatch};
 
 use crate::ast::{
     AggFunc, AggYield, Arg, Arm, BinaryOp, Decl, Expr, MatchOp, PAtom, SArg, Stmt, UnaryOp,
@@ -61,7 +61,35 @@ struct ViewDef {
     /// projection view; `Some(_)` → the view groups by `yields` and lowers to a
     /// `Query::Reduce` (P2 aggregate yield surface).
     agg: Option<AggYield>,
+    /// Declared `materialized view`.
+    materialized: bool,
+    /// The relation a materialized view is stored in, assigned once every
+    /// declared relation has its id. `None` for an ordinary view.
+    backing: Option<RelId>,
 }
+
+/// An aggregate view's fold over its `n` grouping columns and the aggregated
+/// column parked after them (`Count` ignores values), or `None`.
+fn view_reduce(v: &ViewDef, n: usize) -> Option<(Vec<usize>, Agg)> {
+    let a = v.agg.as_ref()?;
+    let agg = match a.func {
+        AggFunc::Count => Agg::Count,
+        AggFunc::Sum => Agg::Sum(n),
+        AggFunc::Min => Agg::Min(n),
+        AggFunc::Max => Agg::Max(n),
+    };
+    Some(((0..n).collect(), agg))
+}
+
+/// The catalog name of the relation a materialized view's rows are stored in.
+/// The colon cannot appear in a declared relation name, so it never collides.
+fn backing_name(view: &str) -> String {
+    format!("view:{view}")
+}
+
+/// The catalog name of the shared cursor relation, `(view: Ent, edition: Int)`:
+/// the edition each materialized view's stored rows reflect.
+pub const VIEW_CURSOR: &str = "view:cursor";
 
 struct OnDef {
     form: String,
@@ -115,6 +143,8 @@ pub struct Program {
     entities: BTreeMap<String, Entity>,
     capabilities: BTreeMap<String, CapabilityDef>,
     actors: BTreeMap<String, ActorDef>,
+    /// The cursor relation of the program's materialized views, if it has any.
+    view_cursor: Option<RelId>,
 }
 
 /// How a `compile` run assigns a [`RelId`] to each declared relation. The two
@@ -293,6 +323,7 @@ impl Program {
                     atoms,
                     yields,
                     agg,
+                    materialized,
                 } => {
                     views.insert(
                         name,
@@ -301,6 +332,8 @@ impl Program {
                             atoms,
                             yields,
                             agg,
+                            materialized,
+                            backing: None,
                         },
                     );
                 }
@@ -353,7 +386,9 @@ impl Program {
             entities: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             actors,
+            view_cursor: None,
         };
+        prog.bind_materialized_views(alloc)?;
         for (name, relation, kind) in capabilities {
             let relation_id = prog.rel_id(&relation).ok_or_else(|| {
                 format!("capability `{name}` names undeclared relation `{relation}`")
@@ -369,6 +404,109 @@ impl Program {
             }
         }
         Ok(prog)
+    }
+
+    /// Give every `materialized view` its backing relation, and the program the
+    /// shared cursor relation. Runs after every declared relation has an id, so
+    /// adding the keyword to a view never moves another relation's id; views go
+    /// in name order, so the ids do not depend on declaration order.
+    fn bind_materialized_views(&mut self, alloc: &mut dyn RelAlloc) -> Result<(), String> {
+        let mut names: Vec<String> =
+            self.views.iter().filter(|(_, v)| v.materialized).map(|(n, _)| n.clone()).collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.sort();
+        let cursor = alloc.assign(VIEW_CURSOR)?;
+        self.rels.insert(
+            VIEW_CURSOR.into(),
+            RelInfo { id: cursor, columns: vec![Column::new("view", Ty::Ent), Column::new("edition", Ty::Int)] },
+        );
+        self.view_cursor = Some(cursor);
+        for name in names {
+            let columns = self.materialized_columns(&name)?;
+            let id = alloc.assign(&backing_name(&name))?;
+            self.rels.insert(backing_name(&name), RelInfo { id, columns });
+            self.views.get_mut(&name).expect("listed above").backing = Some(id);
+        }
+        Ok(())
+    }
+
+    /// The stored columns of a materialized view: its parameters, then its
+    /// yields, then its aggregate. Every parameter must be bound by the body,
+    /// since the stored copy holds the view for all of their values at once.
+    fn materialized_columns(&self, name: &str) -> Result<Vec<Column>, String> {
+        let view = &self.views[name];
+        let vars = self.view_var_types(name)?;
+        let typed = |var: &str, role: &str| {
+            vars.get(var).copied().ok_or_else(|| {
+                format!("materialized view `{name}`: {role} `{var}` must appear in the body")
+            })
+        };
+        let mut columns: Vec<Column> = Vec::new();
+        let mut push = |col: String, ty: Ty| {
+            // A yield may repeat a parameter's name; stored columns need distinct
+            // names.
+            let mut unique = col.clone();
+            let mut n = 1;
+            while columns.iter().any(|c| c.name == unique) {
+                n += 1;
+                unique = format!("{col}{n}");
+            }
+            columns.push(Column::new(unique, ty));
+        };
+        for p in &view.params {
+            push(p.clone(), typed(p, "parameter")?);
+        }
+        for y in &view.yields {
+            push(y.clone(), typed(y, "yield")?);
+        }
+        // The stored form is linear, before the fold: it carries the
+        // aggregated column, not the aggregate (`count()` has none).
+        if let Some(AggYield { col: Some(col), .. }) = &view.agg {
+            push(col.clone(), typed(col, "aggregate column")?);
+        }
+        Ok(columns)
+    }
+
+    /// The names of the program's materialized views, in name order.
+    pub fn materialized_views(&self) -> Vec<&str> {
+        let mut names: Vec<&str> =
+            self.views.iter().filter(|(_, v)| v.materialized).map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// The maintainers of every materialized view, each committing under
+    /// `authority` (which must own the backing relations and [`VIEW_CURSOR`]).
+    /// Each keeps its view's open form — parameters as leading columns — in its
+    /// backing relation, keyed in the cursor relation by the entity whose id is
+    /// the backing relation's.
+    pub fn materializations(&self, authority: &Authority) -> Result<Vec<Materialized>, String> {
+        let Some(cursor_rel) = self.view_cursor else { return Ok(Vec::new()) };
+        self.materialized_views()
+            .into_iter()
+            .map(|name| {
+                let into = self.views[name].backing.expect("bound at compile");
+                Ok(Materialized {
+                    view: self.open_view_ir(name)?.lower(),
+                    into,
+                    key: Entity(into.0 as u64),
+                    cursor_rel,
+                    authority: authority.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The relations a materialization maintainer writes: every backing
+    /// relation and the cursor relation. Empty if the program has no
+    /// materialized views.
+    pub fn materialized_relations(&self) -> Vec<RelId> {
+        let mut out: Vec<RelId> = self.views.values().filter_map(|v| v.backing).collect();
+        out.extend(self.view_cursor);
+        out.sort();
+        out
     }
 
     /// The yielded column names of a view (in order).
@@ -557,6 +695,45 @@ impl Program {
             .map(|s| s.as_str())
             .zip(args.iter().cloned())
             .collect();
+        let plan = self.plan_view(name, &params, &v.yields, true)?;
+        match (v.backing, self.view_cursor) {
+            (Some(into), Some(cursor_rel)) => Ok(QueryIr::Materialized {
+                plan: Box::new(plan),
+                into,
+                prefix: args.to_vec(),
+                cursor_rel,
+                key: Entity(into.0 as u64),
+                reduce: view_reduce(v, v.yields.len()),
+            }),
+            _ => Ok(plan),
+        }
+    }
+
+    /// A view's **open linear** form, what a materialized view stores: its
+    /// parameters left as variables and yielded first, so one relation holds
+    /// the view for every argument at once, and no final `distinct` or
+    /// aggregate, so each row carries its number of derivations — the state
+    /// that lets the copy be maintained by changes alone.
+    fn open_view_ir(&self, name: &str) -> Result<QueryIr, String> {
+        let v = self.views.get(name).ok_or_else(|| format!("no view `{name}`"))?;
+        let yields: Vec<String> = v.params.iter().chain(&v.yields).cloned().collect();
+        self.plan_view(name, &HashMap::new(), &yields, false)
+    }
+
+    /// Plan a view's body with `params` bound to values and `yields` projected.
+    ///
+    /// With `finish`, the result is the view: the projection made distinct and,
+    /// for an aggregate view, folded. Without it, it is the projection alone —
+    /// each row weighted by its number of derivations — which is the linear
+    /// form a materialized view stores.
+    fn plan_view(
+        &self,
+        name: &str,
+        params: &HashMap<&str, Value>,
+        yields: &[String],
+        finish: bool,
+    ) -> Result<QueryIr, String> {
+        let v = self.views.get(name).ok_or_else(|| format!("no view `{name}`"))?;
 
         let mut varcol: HashMap<String, usize> = HashMap::new();
         let mut acc: Option<QueryIr> = None;
@@ -663,7 +840,7 @@ impl Program {
         // Project the grouping columns, then (for an aggregate yield) the
         // aggregate's column. This lays the group keys in positions
         // `0..yields.len()` and the folded value at `yields.len()`.
-        let mut proj: Vec<&str> = v.yields.iter().map(|s| s.as_str()).collect();
+        let mut proj: Vec<&str> = yields.iter().map(|s| s.as_str()).collect();
         if let Some(AggYield { col: Some(c), .. }) = &v.agg {
             proj.push(c.as_str());
         }
@@ -674,29 +851,21 @@ impl Program {
                 .ok_or_else(|| format!("view `{name}` yields unbound variable `{y}`"))?;
             cols.push(c);
         }
-        let projected = QueryIr::Distinct(Box::new(QueryIr::Project {
+        let linear = QueryIr::Project {
             input: Box::new(base),
             cols,
-        }));
-        match &v.agg {
+        };
+        if !finish {
+            return Ok(linear);
+        }
+        let projected = QueryIr::Distinct(Box::new(linear));
+        match view_reduce(v, yields.len()) {
             None => Ok(projected),
-            Some(a) => {
-                // Group by the plain columns; fold the aggregate over the column
-                // parked right after them (`Count` ignores values).
-                let key: Vec<usize> = (0..v.yields.len()).collect();
-                let agg_idx = v.yields.len();
-                let agg = match a.func {
-                    AggFunc::Count => Agg::Count,
-                    AggFunc::Sum => Agg::Sum(agg_idx),
-                    AggFunc::Min => Agg::Min(agg_idx),
-                    AggFunc::Max => Agg::Max(agg_idx),
-                };
-                Ok(QueryIr::Reduce {
-                    input: Box::new(projected),
-                    key,
-                    agg,
-                })
-            }
+            Some((key, agg)) => Ok(QueryIr::Reduce {
+                input: Box::new(projected),
+                key,
+                agg,
+            }),
         }
     }
 
@@ -862,6 +1031,25 @@ impl Program {
             .views
             .get(name)
             .ok_or_else(|| format!("no view `{name}`"))?;
+        let variables = self.view_var_types(name)?;
+        view.yields
+            .iter()
+            .map(|yielded| {
+                variables
+                    .get(yielded)
+                    .copied()
+                    .ok_or_else(|| format!("view `{name}` yields unbound `{yielded}`"))
+            })
+            .collect()
+    }
+
+    /// The type of each variable a view's body binds: the column type of its
+    /// first occurrence.
+    fn view_var_types(&self, name: &str) -> Result<HashMap<String, Ty>, String> {
+        let view = self
+            .views
+            .get(name)
+            .ok_or_else(|| format!("no view `{name}`"))?;
         let mut variables: HashMap<String, Ty> = HashMap::new();
         for atom in &view.atoms {
             let relation = self
@@ -876,15 +1064,7 @@ impl Program {
                 }
             }
         }
-        view.yields
-            .iter()
-            .map(|yielded| {
-                variables
-                    .get(yielded)
-                    .copied()
-                    .ok_or_else(|| format!("view `{name}` yields unbound `{yielded}`"))
-            })
-            .collect()
+        Ok(variables)
     }
 
     fn lower_stmt_arm(&self, arm: &Arm) -> Result<BehaviorIr, String> {

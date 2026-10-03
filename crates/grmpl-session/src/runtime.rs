@@ -17,7 +17,10 @@ use grmpl_diff::{Query, Snapshot};
 use grmpl_lang::{
     AuthorityRequest, CompiledPackage, GrantSet, Program, ResolvedCapabilityGrant, ResolvedGrantSet,
 };
-use grmpl_proc::{enqueue_seq, Backoff, ClockDriver, FireNextOutcome, OnWatch, Process, Scheduler};
+use grmpl_proc::{
+    enqueue_seq, Backoff, ClockDriver, FireNextOutcome, Materialized, OnWatch, Process,
+    Scheduler,
+};
 use grmpl_type::check_handler_authority;
 
 const DEFAULT_DRIVE_FUEL: usize = 1_024;
@@ -134,6 +137,15 @@ pub struct Runtime {
     grants: Arc<ResolvedGrantSet>,
     policy: Backoff,
     driven: Option<DrivenRuntime>,
+    /// The maintainers of the program's `materialized view`s.
+    views: Vec<Materialized>,
+}
+
+/// The maintainers of `program`'s materialized views, committing under an
+/// authority that owns exactly their backing relations and the cursor.
+fn view_maintainers(program: &Program) -> std::result::Result<Vec<Materialized>, String> {
+    let owns = program.materialized_relations().into_iter().map(Scope::whole).collect();
+    program.materializations(&Authority::new(DomainId(0), owns))
 }
 
 impl Runtime {
@@ -156,12 +168,19 @@ impl Runtime {
         program
             .register_schemas(store.as_ref(), store.as_ref(), effective)
             .map_err(|e| e.to_string())?;
+        let views = view_maintainers(&program)?;
+        for view in &views {
+            if view.cursor(store.as_ref()).map_err(|e| e.to_string())?.is_none() {
+                installed(view.install(store.as_ref(), store.as_ref()))?;
+            }
+        }
         Ok(Arc::new(Runtime {
             store,
             program,
             grants: Arc::new(ResolvedGrantSet::default()),
             policy: Backoff::default(),
             driven: None,
+            views,
         }))
     }
 
@@ -179,12 +198,14 @@ impl Runtime {
     ) -> std::result::Result<Arc<Runtime>, String> {
         let (package, grants) =
             Self::compile_and_install_package(&store, source, rel_base, host_grants)?;
+        let views = view_maintainers(&package.program)?;
         Ok(Arc::new(Runtime {
             store,
             program: Arc::new(package.program),
             grants,
             policy: Backoff::default(),
             driven: None,
+            views,
         }))
     }
 
@@ -224,6 +245,16 @@ impl Runtime {
                     .map(|compiled| (compiled.fact.rel, compiled.fact.tuple.clone(), 1))
                     .collect();
                 updates.push((package.marker_relation, expected.clone(), 1));
+                // Materialized views install with the bootstrap, cursors at
+                // zero, so the package still lands as one edition and the first
+                // refresh materializes each view whole.
+                for view in view_maintainers(&package.program)? {
+                    updates.push((
+                        view.cursor_rel,
+                        Tuple::from([Value::Ent(view.key), Value::Int(0)]),
+                        1,
+                    ));
+                }
                 updates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
                 let installed = store.commit(&updates).map_err(|error| error.to_string())?;
                 if installed != Edition(1) {
@@ -357,11 +388,13 @@ impl Runtime {
             require_relation_scope(&driver_authority, actor.inbox, "actor inbox")?;
         }
 
+        let views = view_maintainers(&program)?;
         Ok(Arc::new(Runtime {
             store,
             program,
             grants,
             policy: Backoff::default(),
+            views,
             driven: Some(DrivenRuntime {
                 actors,
                 clock: ClockDriver::new(clock, driver_authority.clone()),
@@ -440,6 +473,7 @@ impl Runtime {
             }
             ready.sort();
             let Some((_, actor_entity, sequence, index)) = ready.first().copied() else {
+                self.refresh_views()?;
                 return Ok(DriveReport {
                     status: DriveStatus::Idle,
                     committed: timers_fired + actor_steps,
@@ -469,6 +503,22 @@ impl Runtime {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// **Fold every change since each materialized view's cursor into its
+    /// stored rows** — one commit per view that changed. Returns the number of
+    /// stored rows written.
+    ///
+    /// Reads of a materialized view are exact whether or not this has run: a
+    /// view whose inputs moved since its cursor is evaluated instead of read.
+    /// Refreshing is what keeps it a read. Hosts call it where they pump
+    /// watches; a driven runtime calls it whenever its actors go idle.
+    pub fn refresh_views(&self) -> Result<usize> {
+        let mut written = 0;
+        for view in &self.views {
+            written += view.refresh(self.store(), self.store())?;
+        }
+        Ok(written)
     }
 
     /// The substrate holding this world.
@@ -592,6 +642,14 @@ fn require_relation_scope(
             relation.0
         ))
     }
+}
+
+/// An install commit's outcome as a load error: a rejected install means a
+/// concurrent loader installed the same view, which is the outcome we wanted.
+fn installed(
+    outcome: Result<grmpl_proc::CommitOutcome>,
+) -> std::result::Result<(), String> {
+    outcome.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Split one command line into the tuple consumed by a source `form`.

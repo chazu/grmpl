@@ -406,6 +406,8 @@ fn synth(
             Ok(RowTy(cols))
         }
         QueryIr::Recur => recur.cloned().ok_or(TypeError::RecurOutsideIterate),
+        // The stored copy holds the same rows; the plan is what they mean.
+        QueryIr::Materialized { plan, .. } => synth(plan, schemas, at, recur),
         QueryIr::Iterate { init, step } => {
             // The runtime fixpoint is `distinct(init ∪ step(Recur))`, so the row
             // type is the least `t` with `t = union_ty(t_init, synth(step, t))`.

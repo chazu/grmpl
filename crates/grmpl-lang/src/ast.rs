@@ -280,13 +280,15 @@ pub enum Decl {
     /// `yield` clause; `agg` is the optional single aggregate (`sum(pts)`,
     /// `count()`). With `agg == None` the view lowers to a projection (v1
     /// behavior); with `agg == Some(_)` it groups by `yields` and lowers to a
-    /// `Query::Reduce` (P2 aggregate yield).
+    /// `Query::Reduce` (P2 aggregate yield). A `materialized view` is kept
+    /// stored and maintained in the world (the Derived enfilade).
     View {
         name: String,
         params: Vec<String>,
         atoms: Vec<Atom>,
         yields: Vec<String>,
         agg: Option<AggYield>,
+        materialized: bool,
     },
     Form {
         name: String,

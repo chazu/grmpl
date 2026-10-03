@@ -3,7 +3,7 @@
 //! ```text
 //! program := decl*
 //! decl    := "rel"  Ident "(" collist ")"
-//!          | "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
+//!          | "materialized"? "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
 //!          | "form" Ident "{" rule* "}"
 //!          | "on" "watch" Ident ("including" "current")? "{" watchbind* "}"
 //! watchbind := ("inbox" | "cursor" | "seqs") Ident
@@ -79,11 +79,19 @@ impl Parser {
             Some(Token::Ident(k)) if k == "actor" => self.actor_decl(),
             Some(Token::Ident(k)) if k == "bootstrap" => self.bootstrap_decl(),
             Some(Token::Ident(k)) if k == "rel" => self.rel_decl(),
-            Some(Token::Ident(k)) if k == "view" => self.view_decl(),
+            Some(Token::Ident(k)) if k == "view" => self.view_decl(false),
+            Some(Token::Ident(k)) if k == "materialized" => {
+                self.next(); // materialized
+                if !self.is_ident("view") {
+                    return Err("`materialized` must be followed by `view`".into());
+                }
+                self.view_decl(true)
+            }
             Some(Token::Ident(k)) if k == "form" => self.form_decl(),
             Some(Token::Ident(k)) if k == "on" => self.on_decl(),
             other => Err(format!(
-                "expected a declaration (package/entity/requires/authority/actor/bootstrap/rel/view/form/on), \
+                "expected a declaration (package/entity/requires/authority/actor/bootstrap/rel/view/\
+                 materialized view/form/on), \
                  found {other:?}"
             )),
         }
@@ -359,7 +367,7 @@ impl Parser {
         Ok(ColDecl { name, ty })
     }
 
-    fn view_decl(&mut self) -> Result<Decl, String> {
+    fn view_decl(&mut self, materialized: bool) -> Result<Decl, String> {
         self.next(); // view
         let name = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -387,6 +395,7 @@ impl Parser {
             atoms,
             yields,
             agg,
+            materialized,
         })
     }
 

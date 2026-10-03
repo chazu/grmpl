@@ -160,6 +160,7 @@ dependencies = [
 name = "grmpl-bench"
 version = "0.0.1"
 dependencies = [
+ "grmpl",
  "grmpl-core",
  "grmpl-diff",
  "grmpl-ent",

@@ -123,12 +123,14 @@ impl Materialized {
 
             let delta = eval_delta(&self.view, store, from, to)?;
             let rows = multiset::to_sorted_vec(&delta);
-            if rows.is_empty() {
-                // Do not commit a bare cursor advance: that commit's own edition
-                // would become a fresh empty interval to chase forever. The
-                // cursor legitimately lags by non-view editions.
-                return Ok(0);
-            }
+            // An empty delta over an interval that touched the view's inputs
+            // still advances the cursor. The rows are unchanged, but a cursor
+            // left behind would leave them *unprovably* current: every reader
+            // would see the inputs moved since it and evaluate the view
+            // instead. This commit touches only the derived relation and the
+            // cursor, so on a store that routes, the next refresh finds the
+            // interval quiet and commits nothing; on one that cannot, each call
+            // costs one cursor commit, never a loop.
 
             let cursor_from = Fact::new(self.cursor_rel, self.cursor_tuple(from));
             let mut patch = Patch::new().expect(cursor_from).advance_cursor(CursorMove {

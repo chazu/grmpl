@@ -348,6 +348,15 @@ pub trait EditionReader: Send + Sync {
             .filter(|(t, _)| t.as_slice().get(col).is_some_and(|v| lo <= v && v < hi))
             .collect())
     }
+
+    /// Could a commit in `(from, this reader's edition]` have touched one of
+    /// `rels`? [`TraceStore::touched_since`] asked at a pinned edition: a
+    /// `false` proves nothing changed, a `true` means only "possibly", and the
+    /// default answers `true`. A materialized view asks it to learn whether the
+    /// rows it stored at `from` are still the answer here.
+    fn touched_since(&self, _from: Edition, _rels: &[RelId]) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 /// The default [`EditionReader`]: every read re-enters the store at the pinned
@@ -379,6 +388,13 @@ impl<S: TraceStore + ?Sized> EditionReader for ForwardingReader<'_, S> {
         hi: &crate::value::Value,
     ) -> Result<Vec<(Tuple, Diff)>> {
         self.store.read_range_on(rel, self.at, col, lo, hi)
+    }
+
+    fn touched_since(&self, from: Edition, rels: &[RelId]) -> Result<bool> {
+        if from >= self.at {
+            return Ok(false);
+        }
+        self.store.touched_since(from, self.at, rels)
     }
 }
 
