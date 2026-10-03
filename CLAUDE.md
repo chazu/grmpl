@@ -39,7 +39,8 @@ Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
 
 * `message   = version(1) || inbox(u32, BE) || encoded_tuple`
 * `node frame = version(1) || tag(1) || n_children(u32, BE) || [content_key]*n
-                || count(u32, BE) || payload`
+                || count(u32, BE) || payload` — a leaf's payload is its entries;
+  an internal node's is its separators then each child's dsp (`i64`, BE)
 
 Node content keys are **SHA-256** (`grmpl_core::hash`), vendored and pinned
 against the FIPS vectors: the hash is part of the on-disk format, so it may not
@@ -49,6 +50,22 @@ collision-resistant against chosen input.
 Decoders reject any other version loudly (`Error::Codec`) rather than misreading
 an evolved layout. **Bump `FORMAT_VERSION` on any change to the tag set or
 framing.**
+
+### Displacement (`grmpl-ent::tree`, `dsp`)
+
+Every `Tree` handle carries a **dsp** (its node's position relative to its
+parent); nodes store keys in their local frame. Two rules keep it correct:
+
+* **Reads move stored keys up to the query, never the query down.** A
+  displacement is order-preserving only over the keys a subtree holds; a query
+  key moved into a block's frame can wrap the entity id space. Compare with
+  `Displace::cmp_displaced` at the accumulated offset.
+* **Writes open a node into its parent's frame before copying it** (pushing its
+  dsp down a level), so copied spines carry dsp `0` and untouched subtrees stay
+  shared. Roots persist normalized, so a root pointer is a bare content key.
+
+`instance_template` is a graft: an occupied target block is refused, never
+merged into.
 
 ### Determinism
 

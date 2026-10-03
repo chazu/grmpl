@@ -109,7 +109,7 @@ Green's jobs do not disappear in grmpl; they are redistributed:
 |---|---|
 | textfilade — permanent content | the **Fact enfilade**, versioned by edition; nothing is overwritten |
 | I-stream / V-stream split | **editions**: facts are immutable, an edition is the arrangement current at a point in history |
-| poomfilade — V-space → I-space | **`DspEnf`**: a displacement over shared content is a permutation of ordered material by another name |
+| poomfilade — V-space → I-space | **graft**: a displaced pointer to shared content places ordered material under another name |
 | spanfilade — who quotes this span | **backfollow / version-compare** (`EntStore::compare`), plus the canopy for the *standing* form of the same question |
 | granfilade | the **granfilade**, kept under its own name |
 | tumblers | *not implemented* — tuple keys instead |
@@ -126,7 +126,7 @@ And Gold's, more directly:
 | `Loaf` | a node's 64-entry run — one granfilade record |
 | `CanopyCrum` / `SensorCrum` | `canopy.rs` — `InterestKey`, `Endorsement` |
 | `HistoryCrum inTrace:` | *not implemented* — version-compare prunes on shared content keys instead |
-| `Dsp` | `dsp.rs` — `Dsp`, `DspEnf` |
+| `Dsp` | the dsp on every `Tree` handle; `dsp.rs` — `Displace` |
 | `DagWood` | `dag.rs` — `Dag`, `Branch`, `BranchId` |
 | `GrandNode` | `granfilade.rs` — content-addressed nodes |
 

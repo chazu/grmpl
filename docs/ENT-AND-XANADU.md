@@ -13,14 +13,15 @@ implement?** It was rewritten after `grmpl-store` (the fjall LSM stand-in) was
 deleted and `grmpl-ent` became the only substrate; the previous version assessed
 the LSM.
 
-**The headline:** the *design* is faithful to the Ent, and `grmpl-ent` realizes
-its most important ideas — never overwrite, path-copied structural sharing,
-versions as roots, version compare that costs the size of the change, content-
-addressed persistence, interest routing. But the tree itself is a
-**content-addressed persistent B+tree keyed by absolute tuples**, with cached
-monoid summaries. It has no displacements in its nodes, so it is not an
-enfilade in the Udanax sense, and the Xanadu mechanisms that depend on relative
-coordinates — `O(1)` virtual copy, DSP-inherited context — are not built.
+**The headline:** the *design* is faithful to the Ent, and so, now, is the
+core data structure. `grmpl-ent` realizes never-overwrite, path-copied
+structural sharing, versions as roots, version compare that costs the size of
+the change, content-addressed persistence, interest routing — and, since the
+tree gained displacements, Gold's **dsps on pointers**, with persistent
+split/join and an `O(log n)` **virtual copy** that the store uses for template
+instancing. What remains short of the Ent is listed in §5: DSP-inherited
+context, persisting the directories that are still rebuilt on open, lazy
+loading, and Green's 2D enfilades.
 
 ---
 
@@ -114,21 +115,27 @@ dataflow** (Derived enfilades, `watch` = the maintained derivative of `find`).
 `grmpl-ent` builds every structure on one primitive, `tree::Tree<K, V, M>`, and
 persists all of them through one node store, the `granfilade`.
 
-**The primitive is a persistent B+tree, not an enfilade.**
+**The primitive is a displaced B+tree — an enfilade with tuple coordinates.**
 
 * Nodes hold up to 64 entries or children (`tree::B`), are immutable and
-  `Arc`-held, and an insert path-copies only the root-to-leaf spine
-  (`Tree::insert`). A new version costs `O(log n)` new nodes and shares
-  everything else. **This is genuine Ent-style structural sharing.**
-* Keys are **absolute**: a node is located by its separator keys, and a range
-  read prunes by passing absolute bounds down the descent (`Tree::fold_range`).
-  No node stores a displacement and nothing composes on the way down. In an
-  enfilade, a subtree's position is relative to its parent (the *dsp*), which is
-  what lets a subtree be relocated or virtually copied by changing one number.
-* Each node caches a monoid **measure** of its subtree (`measure::Measure`). This
-  is a classic augmented tree. The only measure in use is `Count` (entry count),
-  which answers "how many rows in this span" and "did anything change in this
-  edition range" in `O(log n)`.
+  `Arc`-held, and an insert path-copies only the root-to-leaf spine. A new
+  version costs `O(log n)` new nodes and shares everything else. **This is
+  genuine Ent-style structural sharing.**
+* **Every pointer carries a dsp**, as on Gold's `DspLoaf`: a `Tree` handle is a
+  shared node plus its displacement relative to its parent, and a node stores its
+  keys in its own local frame. A descent accumulates dsps; reads move stored keys
+  *up* to the query (`Displace::cmp_displaced`) rather than the query down, and
+  writes push a node's dsp one level down as they copy it. `relocate` is `O(1)`.
+* What a dsp displaces is grmpl's own coordinate: a tuple key moves by shifting
+  every entity cell together (`dsp::Displace`). Separators and range pruning are
+  still by key order, so this is an enfilade over ordered tuple coordinates rather
+  than Udanax's tumbler widths — the wid is a cached measure, not a width.
+* Persistent **split** and **join** cost `O(log n)` new nodes, and **graft** — the
+  virtual copy — splits a span out, relocates it, and joins it back in elsewhere,
+  sharing every interior node with the original.
+* Each node caches a monoid **measure** of its subtree (`measure::Measure`). The
+  only measure in use is `Count`, which answers "how many rows in this span" and
+  "did anything change in this edition range" in `O(log n)`.
 * Shape depends on the order of operations, so a content key identifies a
   *shape*, not a logical value. Sharing is within one version lineage.
 
@@ -137,7 +144,7 @@ persists all of them through one node store, the `granfilade`.
 | Structure | What it is | Persisted how |
 |---|---|---|
 | Fact trees | one `Tree<Tuple, Diff, Count>` per relation per live edition | nodes in the granfilade; the root pointer per edition in fjall's `meta` keyspace |
-| Edition log | `(edition, index) → (tuple, diff)` | granfilade; root pointer in `meta` |
+| Edition log | `(edition, index) → update`, or one `Graft` entry per relation for a virtual copy | granfilade; root pointer in `meta` |
 | Version / relation directories | `edition → Fact root`, the live-relation set | **in memory**, rebuilt from the `meta` root pointers on open |
 | Context tree | the name→`RelId` catalog and edition-versioned schemas, at the root scope | granfilade; root pointer in `meta` |
 | Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs | **in memory**, rebuilt empty on open and fork; watchers re-register |
@@ -155,13 +162,14 @@ pointers are raw values in fjall's `meta` keyspace.
   differential engine) skips any subtree the two versions share, by pointer or
   content key, so it costs the size of the difference. This is the Ent's
   version-comparison idea, realized.
-* **Fork** (`EntStore::fork_at`) shares every fact node and writes none, but
-  rebuilds each relation's version directory, so it costs
-  `O(relations × versions)`, not `O(1)`.
-* **DSP instancing** (`EntStore::instance_template`) reads a template block
-  through a shifted view (`dsp::DspEnf`) and then **commits copied facts**, so an
-  instance costs `O(template)`. A `Dsp` here is one shift of a whole query's
-  entity coordinates, not a per-node displacement.
+* **Fork** (`EntStore::fork_at`) shares every fact node and writes none; it cuts
+  each relation's version directory and log at the fork edition with a persistent
+  split, so it costs `O(relations × log n)`.
+* **Template instancing** (`EntStore::instance_template`) is a **graft** per
+  relation: `O(log n)` new nodes and one log entry however large the template is
+  (a 20 000-fact instance adds 5 nodes). The edition log records a `Graft` entry
+  and `scan_updates` expands it from that edition's Fact root, so watchers and
+  replay see ordinary updates; the canopy routes it by span.
 
 **Outside the Ent entirely:** the differential engine's working state —
 arrangements and multisets in `grmpl-diff` — is plain in-memory hash maps. The
@@ -181,9 +189,10 @@ runtime uses it yet.
 | Structural sharing / path copy | ✅ | ✅ `O(log n)` new nodes per commit |
 | Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees |
 | Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd; eager load |
-| Measured tree with upward summaries | ✅ "WIDative summaries" | ⚠️ augmented B+tree; `Count` only |
-| **DSP displacements composing down the tree** | ✅ "DSPative inherited context" | ❌ absolute keys; no dsp in nodes |
-| **`O(1)` virtual copy / relocation** | ✅ "cheap split/join" | ❌ instancing is `O(template)` |
+| Measured tree with upward summaries | ✅ "WIDative summaries" | ⚠️ cached measures over ordered keys; `Count` only |
+| **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
+| **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
+| **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
 | DSP-inherited context down scopes | ✅ Context enfilades | ❌ catalog and schemas only, at the root scope |
 | Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ branch tree, no merges; stored as a blob |
 | Canopy indexing interest | ✅ Canopy enfilades | ⚠️ real interval routing, but in memory |
@@ -196,30 +205,34 @@ runtime uses it yet.
 ## 5. Verdict
 
 The design is a faithful, ambitious generalization of the Ent, and the
-implementation has the Ent's **versioning** right: immutable versions, path
-copying, cheap history, comparison that costs the change, content-addressed
-persistence. What it does not have is the Ent's **coordinate system**. Its tree
-is a Merkle B+tree over absolute tuple keys — closer to Datomic or Dolt than to
-Udanax — with Xanadu vocabulary on some of its parts.
+implementation now has both halves of the Ent's core: its **versioning**
+(immutable versions, path copying, cheap history, comparison that costs the
+change, content-addressed persistence) and its **coordinate system** (dsps on
+pointers, `O(1)` relocation, `O(log n)` virtual copy by graft). It differs from
+Udanax in what the coordinates are: ordered tuples whose entity cells move,
+rather than tumbler widths.
 
-Making it a true enfilade means changing the primitive, not adding modules:
+What is still short of the Ent:
 
-1. **Relative positions in nodes.** Each child carries a displacement relative
-   to its parent, and a descent accumulates them. Widths become the extent of a
-   subtree in that coordinate space, not just a cached count.
-2. **`O(1)` relocation and virtual copy** fall out of (1): a template instance
-   becomes a new parent node that points at the template's subtree with a
-   different displacement, and diverges copy-on-write.
-3. **Context inheritance** becomes a DSP down a scope tree rather than repeated
-   point lookups.
-4. **Persist what is now rebuilt:** the version and relation directories, the
-   canopy, and the branch DAG as trees in the granfilade, and load lazily
-   rather than eagerly.
+1. **DSP-inherited context.** Context enfilades that carry namespace, authority
+   or placement down a scope tree are not built, and nothing in the language
+   declares scopes yet; building the mechanism first would only produce another
+   unused placeholder.
+2. **Directories rebuilt on open.** The version and relation directories are
+   rebuilt from per-edition root pointers in fjall's `meta` keyspace, the canopy
+   is rebuilt empty, and the branch DAG is a blob. Persisting them as trees in the
+   granfilade needs node frames that can reference other trees' roots, which GC
+   must then follow.
+3. **Eager load.** Opening a store loads every node; nothing is paged in.
+4. **Version compare across a graft** falls back to an in-order merge of the
+   subtrees whose separators differ, so comparing across an instance costs the
+   instance's size rather than its node count.
+5. **Green's 2D enfilades** (poom/span) have no counterpart.
 
 `store.rs` and everything above it — the `TraceStore` contract, the language,
-the laws — can stay as they are while the primitive changes underneath, and the
-conformance suite (`grmpl-conformance`) is the place to run the current B+tree
-as an oracle against the new one.
+the laws — were untouched by the coordinate change, which is what the bright line
+promised: the tree changed underneath, and the conformance and law suites passed
+unchanged.
 
 ---
 

@@ -78,7 +78,7 @@ edition in `O(depth)`:
 - **Lag compensation** — resolve an action against the edition the client saw.
 - **Forked instances and instanced worlds** — `fork_edition` is an `O(edit)`
   virtual copy of the *whole world*. The MOO's `enter vault` instances a room
-  by copying a template's facts (`O(template)`), not yet by virtual copy.
+  by grafting its template: a virtual copy sharing the template's nodes.
 - **Speculative NPC planning** — fork, simulate ahead, discard or commit.
 - **Undoable construction** — building is patching; undo is an older root.
 - **Client snapshots** — hand a client an opaque edition; deltas bring it

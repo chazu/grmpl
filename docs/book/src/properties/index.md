@@ -4,9 +4,8 @@ Why rebuild a 1980s hypertext structure to run a multiplayer world? Because the
 `Ent` bundles together a set of properties that are individually hard and, in
 most systems, mutually antagonistic — history *versus* space, addressing *versus*
 sparsity, copying *versus* cost. The enfilade gets them at once. This chapter is
-the payoff list; Part III shows most of them paying off in grmpl. Two are not
-built yet: the `O(edit)` virtual copy by displacement (§5 — grmpl's instances
-copy their template) and context inherited down scopes (§7).
+the payoff list; Part III shows most of them paying off in grmpl. One is not
+built yet: context inherited down scopes (§7).
 
 ## 1. Nothing is ever overwritten — and that is affordable
 

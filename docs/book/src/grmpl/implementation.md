@@ -9,11 +9,11 @@ the Part I mechanism it realizes.
 
 ```text
 crates/grmpl-ent/src/
-  tree.rs         the enfilade primitive — persistent measured tree
+  tree.rs         the enfilade primitive — persistent measured displaced tree
   measure.rs      the WID monoid (Measure; Count)
   granfilade.rs   content-addressed node store; structural sharing on disk
   store.rs        the enfilades that make an EntStore (the store traits)
-  dsp.rs          DSP coordinate transforms (Dsp, DspEnf)
+  dsp.rs          what a displacement does to a key (Displace)
   dag.rs          the branch/edition DAG (DagWood: Branch, BranchId, Dag)
   canopy.rs       interest routing (interval enfilade + endorsement flag-lattice)
   context.rs      the context enfilade (catalog + schema registry, root scope)
@@ -24,10 +24,11 @@ crates/grmpl-proc/src/
 
 ## The enfilade primitive — `tree.rs`, `measure.rs`
 
-At the bottom is `Tree<K, V, M>`: a **persistent, measured B+ tree**. It is
-immutable in the functional sense — `insert`/`remove` return a new tree and share
-the old one's untouched subtrees (path copy) — and every node carries the
-monoidal measure `M` of its subtree. A node holds a *run* of up to 64 entries (or
+At the bottom is `Tree<K, V, M>`: a **persistent, measured, displaced B+ tree**.
+It is immutable in the functional sense — `insert`/`remove` return a new tree and
+share the old one's untouched subtrees (path copy) — every node carries the
+monoidal measure `M` of its subtree, and every pointer to a node carries a
+**dsp**, the node's position relative to its parent (see the DSP section below). A node holds a *run* of up to 64 entries (or
 children), not one: a node is one content-addressed granfilade record, so arity
 is the difference between one record per **run** of tuples and one per tuple.
 That constant factor, not any asymptotic gap, is what decides whether the Ent can
@@ -176,24 +177,39 @@ which is exactly the `Filter` it replaced.
 This is the shape the design predicted: "multi-order arrangements" are not a new
 mechanism but the same primitive replicated per order — more measured trees.
 
-## DSP coordinate transforms — `dsp.rs`
+## DSPs — `tree.rs`, `dsp.rs`
 
-`Dsp` and `DspEnf` implement a minimal displacement: a `Dsp` is an invertible
-shift of a key's entity coordinate, and `DspEnf::relocate` wraps a shared Fact
-tree as a displaced *read view* without copying it. Gold's dsps live in the
-nodes and compose down the descent, which is what makes relocation and virtual
-copy `O(1)`; that is **not built** here.
+As in Gold, **dsps live on the pointers**. A `Tree` is a handle: a shared node
+plus the displacement it sits at. A node stores its keys and separators in its
+own local frame, and a descent accumulates the dsps to recover absolute keys.
+`dsp.rs` says what a displacement does to a key (`Displace`): for a tuple it
+shifts every entity cell together, so a relocated sub-world keeps its exits and
+item placements connected while its text and numbers stay put. Coordinates with
+nothing to displace (editions, relation ids) implement it as the identity.
 
-The dsp is **threaded through the WID walk**: `DspEnf::range_all` answers a
-displaced range by transforming the *query* into the shared tree's own
-coordinates and pruning there, so reading a relocated span costs
-`O(result + log n)` with no materialization of the whole tree.
+Two rules keep this correct and cheap:
 
-In the playable world this is *instancing*: `grmpl run`'s `enter vault` /
-`leave` verbs spin up a private, disjoint sub-world from a template and tear it
-down again. `EntStore::instance_template` reads the template through the
-displaced view and **commits the relocated facts**, so an instance costs
-`O(template)` — a real copy, not a virtual one.
+- **Reads move stored keys up, never the query down.** A displacement is
+  order-preserving over the keys a subtree holds, but an arbitrary query key
+  moved down into a block's frame could wrap the entity id space. So reads carry
+  the accumulated offset and compare with `Displace::cmp_displaced`, which for
+  tuples needs no allocation.
+- **Writes push dsps down.** An operation that rewrites a node first opens it
+  into its parent's frame — keys displaced, each child's dsp composed with the
+  node's. The copied spine ends up at dsp `0`, and every subtree the edit did not
+  touch keeps its dsp and stays shared. This is lazy propagation.
+
+On that, the tree has persistent **split** and **join** (`O(log n)` new nodes
+along the cut or seam) and **graft**: split a key span out, relocate it in `O(1)`,
+and join it back in at its new position. The copy shares every interior node with
+the original and diverges copy-on-write. Node frames carry each child's dsp.
+
+In the playable world this is *instancing*: `grmpl run`'s `enter vault` and
+Shotengai's dungeon spin up a private, disjoint sub-world from a template.
+`EntStore::instance_template` grafts each relation's template block, so an
+instance costs `O(log n)` new nodes however large the template is (a 20 000-fact
+template instances in 5), and the edition log records it as one `Graft` entry
+that `scan_updates` expands from the edition's Fact root.
 
 ## The branch/edition DAG — `dag.rs`
 
