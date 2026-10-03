@@ -491,6 +491,7 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   names each graft by its span from the spanfilade. Law and cost:
   `grmpl-ent/tests/graft_compare.rs`.
 * **Open, in order:** a transactional graft effect in a patch (phase 3A of the
-  world-package plan); DSP-inherited context once the language declares scopes;
-  merges in the branch DAG. The full list of fidelity gaps is
+  world-package plan); sequences as measured enfilades; merges in the branch
+  DAG. Context inherited down scopes other than entity space waits on
+  clustering. The full list of fidelity gaps is
   [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).

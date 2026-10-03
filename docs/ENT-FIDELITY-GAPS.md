@@ -4,7 +4,8 @@
 the Ent/enfilade design. The design is `idea.md` §1 (the enfilade plex) and §6
 and §10, plus Gold's `Ent` as read in [`ENT-AND-XANADU.md`](ENT-AND-XANADU.md).
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-03, after fidelity steps 1–3 and gap 4.
+**Last updated:** 2026-10-03, after fidelity steps 1–3, gap 4, and gap 2's
+reclassification.
 
 The step reports say what each step built and what it cost:
 [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md) and
@@ -18,7 +19,7 @@ The step reports say what each step built and what it cost:
 |---|---|
 | Fact enfilades: stored relations and their indexes | ✅ measured by `(Count, Extent)`; Arrangements as derived indexes |
 | Edition enfilades: roots, patches, branches, ancestry | ⚠️ persisted and forkable, but branches form a tree: no merges (gap 3) |
-| Context enfilades: scope-inherited context | ⚠️ over nested entity blocks only (gap 2) |
+| Context enfilades: scope-inherited context | ✅ for core: over nested spans of entity space, carried by grafts; ⏸ authority, namespace and placement wait on a nesting that core lacks (gap 2) |
 | Canopy enfilades: standing interest | ✅ interval routing, persisted with the commits routed to it |
 | Derived enfilades: materialized views, incremental state | ✅ for joins and `distinct`; ⚠️ aggregates and `inherit` recompute (gap 7) |
 | Sequences as measured enfilades (§6) | ❌ not built (gap 1) |
@@ -26,8 +27,10 @@ The step reports say what each step built and what it cost:
 
 ## Open gaps
 
-Ordered by how much of the design they leave out. Gaps 1–3 need a design
+Ordered by how much of the design they leave out. Gaps 1 and 3 need a design
 decision before code. Gaps 5–7 are refinements of things that already work.
+Gap 2 is complete for core and waits on clustering (see
+[Deferred](#deferred-until-core-has-what-they-need)).
 
 ### Gap 1 — Sequences as measured enfilades ❌
 
@@ -40,17 +43,6 @@ decision before code. Gaps 5–7 are refinements of things that already work.
 * **Needs design:** what a sequence key is (a position that can be displaced,
   next to entity-keyed facts), and which consumer edits sequences
   incrementally. A command line is too short to measure anything on.
-
-### Gap 2 — Context only down entity blocks ⚠️
-
-* **Design:** context inherited down scopes carries authority, namespace,
-  schema, permissions, placement and simulation parameters.
-* **Today:** `context`/`inherit` bind key/value pairs over nested inclusive
-  spans of entity ids, carried by grafts. The store's own context enfilade
-  holds the catalog and schemas at the root scope only.
-* **Needs design:** packages and authority domains do not nest in the
-  language, so there is no scope tree to inherit down. Deciding how they nest
-  comes first.
 
 ### Gap 3 — No merges in the edition DAG ⚠️
 
@@ -85,6 +77,32 @@ decision before code. Gaps 5–7 are refinements of things that already work.
 * **Choosing what to materialize** is manual. The extents and counts already
   in the Ent could drive it.
 
+## Deferred until core has what they need
+
+### Gap 2 — Context beyond entity space ⏸
+
+* **Design:** context inherited down scopes carries authority, namespace,
+  schema, permissions, placement and simulation parameters (`idea.md` §1, §10).
+* **Done for core:** `context`/`inherit` bind values over nested inclusive
+  spans of entity space, the coordinate the dsps move, and a graft carries a
+  block's bindings with it. That is the Ent's mechanism: context flowing down
+  the tree, displaced with what it describes.
+* **Why the rest waits:** inheriting authority, namespace or placement needs a
+  scope tree in core to inherit down, and core has none:
+  * authority domains are flat (one in v1);
+  * packages are flat and cannot import each other;
+  * branches nest, but a fork copies its parent whole, so inheriting down them
+    adds nothing.
+
+  The nesting `idea.md` §10 has in mind comes with clustering ("scopes are the
+  bridge to clustering"): placement and replication policy inherited down scope
+  covers. Clustering is deferred, so gap 2 reopens with it.
+* **Not a core gap:** giving packages or instances owned blocks of entity ids,
+  with authority and allocation ranges bound over them, is world-building
+  policy. A world can build it today from `context`, `instance_template` and
+  key-range authority scopes. Shotengai's hard-coded instance blocks are an
+  example.
+
 ## Closed gaps
 
 ### Gap 4 — Version compare across a graft ✅ (closed 2026-10-03)
@@ -103,7 +121,7 @@ decision before code. Gaps 5–7 are refinements of things that already work.
 * **Tuples, not tumblers.** Coordinates are ordered tuples whose entity cells
   move under a dsp; Gold's are tumbler widths. A representation choice.
 * **Clustering is deferred.** `idea.md` §10's partitioning along scope covers
-  needs gap 2 first, and only an in-process transport exists.
+  is not built, and only an in-process transport exists. Gap 2 reopens with it.
 
 ---
 

@@ -31,8 +31,9 @@ derived state in the Ent, so maintaining it costs the change. A version
 compare recognizes a shared subtree however the spines above it were rebuilt,
 and can name a graft by its span from the spanfilade. What remains short of
 the Ent is listed in §5 and kept current in
-[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md): scopes beyond entity blocks,
-merges in the branch DAG, and Green's 2-D enfilades proper.
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md): sequences as enfilades, merges
+in the branch DAG, and Green's 2-D enfilades proper. Context beyond entity
+space waits on clustering, which is what would give core a scope tree.
 
 ---
 
@@ -292,7 +293,7 @@ recomputes both ends of every interval.
 | **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
 | **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
 | **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
-| DSP-inherited context down scopes | ✅ Context enfilades | ✅ over nested entity blocks (`context`, `inherit`), carried by grafts; ⚠️ no other kind of scope |
+| DSP-inherited context down scopes | ✅ Context enfilades | ✅ over nested entity blocks (`context`, `inherit`), carried by grafts; ⏸ other scopes wait on clustering, the nesting core lacks |
 | Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ a persisted enfilade, but a tree of branches: no merges |
 | Canopy indexing interest | ✅ Canopy enfilades | ✅ interval routing, persisted with the commits routed to it |
 | Reverse index over virtual copies (Green's spanfilade) | — | ✅ by source and by target; origin follows chains of copies |
@@ -326,15 +327,19 @@ What is still short of the Ent:
 
 1. **Scopes are entity blocks only.** Context is inherited down nested spans
    of entity ids, which is where the dsps act. Namespace, authority or schema
-   inherited down package or authority scopes are not built: those scopes do
-   not nest in the language.
-2. **Extents cover entity cells only.** Text and number columns are not
+   inherited down other scopes are not built, because nothing else in core
+   nests: authority domains and packages are flat, and a fork copies its parent
+   whole. That reopens with clustering. Blocks owned by packages or instances
+   are world policy a world can build today, not a core gap.
+2. **Sequences are not enfilades.** `idea.md` §6's sequences in measured
+   trees, with parsing that shares their split and summaries, are not built.
+3. **Extents cover entity cells only.** Text and number columns are not
    summarized, so a search on them reads and filters, or uses an Arrangement.
    That keeps a frame's measures fixed-size; summarizing text would put
    arbitrary strings in every internal frame.
-3. **The branch DAG has no merges.** It is a tree of branches, each with one
+4. **The branch DAG has no merges.** It is a tree of branches, each with one
    parent.
-4. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
+5. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
    but as two 1-D interval trees each measured by a hull, not as one enfilade
    with 2-D wids. The Fact trees' extents are n-dimensional boxes, but they ride
    a tree ordered by its whole key, so they prune only as well as each column
