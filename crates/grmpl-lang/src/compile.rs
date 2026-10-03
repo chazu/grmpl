@@ -145,6 +145,8 @@ pub struct Program {
     actors: BTreeMap<String, ActorDef>,
     /// The cursor relation of the program's materialized views, if it has any.
     view_cursor: Option<RelId>,
+    /// The program's `context` (scope) relations, by name.
+    contexts: BTreeSet<String>,
 }
 
 /// How a `compile` run assigns a [`RelId`] to each declared relation. The two
@@ -269,6 +271,7 @@ impl Program {
         let mut watches = HashMap::new();
         let mut capabilities = Vec::new();
         let mut actors = BTreeMap::new();
+        let mut contexts = BTreeSet::new();
 
         for decl in decls {
             match decl {
@@ -316,6 +319,20 @@ impl Program {
                     }
                     let id = alloc.assign(&name)?;
                     rels.insert(name, RelInfo { id, columns });
+                }
+                Decl::Context { name } => {
+                    if rels.contains_key(&name) {
+                        return Err(format!("relation `{name}` declared twice"));
+                    }
+                    let columns = vec![
+                        Column::new("first", Ty::Ent),
+                        Column::new("last", Ty::Ent),
+                        Column::new("key", Ty::Text),
+                        Column::new("value", Ty::Any),
+                    ];
+                    let id = alloc.assign(&name)?;
+                    rels.insert(name.clone(), RelInfo { id, columns });
+                    contexts.insert(name);
                 }
                 Decl::View {
                     name,
@@ -387,6 +404,7 @@ impl Program {
             capabilities: BTreeMap::new(),
             actors,
             view_cursor: None,
+            contexts,
         };
         prog.bind_materialized_views(alloc)?;
         for (name, relation, kind) in capabilities {
@@ -744,6 +762,18 @@ impl Program {
                 .rels
                 .get(&atom.rel)
                 .ok_or_else(|| format!("view `{name}` uses undeclared relation `{}`", atom.rel))?;
+            if atom.inherit {
+                let prev = acc.take().ok_or_else(|| {
+                    format!("view `{name}`: `inherit {}` needs an earlier atom to bind its entity", atom.rel)
+                })?;
+                let (q, out) = self.plan_inherit(name, atom, info.id, prev, &varcol, params, width)?;
+                if let Some(var) = out {
+                    varcol.insert(var, width);
+                }
+                acc = Some(q);
+                width += 1;
+                continue;
+            }
             if atom.args.len() != info.arity() {
                 return Err(format!(
                     "`{}` has arity {} but was used with {} args",
@@ -866,6 +896,70 @@ impl Program {
                 key,
                 agg,
             }),
+        }
+    }
+
+    /// Plan `inherit ctx(entity, "key", value)` over the atoms before it
+    /// (`prev`, `width` columns wide): an [`QueryIr::Inherit`] appending the
+    /// inherited value as column `width`, then a filter if `value` is already
+    /// bound. Returns the plan and the variable the new column binds, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_inherit(
+        &self,
+        name: &str,
+        atom: &crate::ast::Atom,
+        ctx: RelId,
+        prev: QueryIr,
+        varcol: &HashMap<String, usize>,
+        params: &HashMap<&str, Value>,
+        width: usize,
+    ) -> Result<(QueryIr, Option<String>), String> {
+        let here = format!("view `{name}`: `inherit {}`", atom.rel);
+        if !self.contexts.contains(&atom.rel) {
+            return Err(format!("{here} names a relation that is not declared with `context`"));
+        }
+        let [entity, key, value] = atom.args.as_slice() else {
+            return Err(format!("{here} takes (entity, \"key\", value)"));
+        };
+        let col = match entity {
+            Arg::Var(v) if varcol.contains_key(v) => varcol[v],
+            _ => return Err(format!("{here}: its entity must be a variable bound by an earlier atom")),
+        };
+        let Arg::Str(key) = key else {
+            return Err(format!("{here}: its key must be a string literal"));
+        };
+        let q = QueryIr::Inherit { input: Box::new(prev), col, key: Value::text(key), ctx };
+        let literal = |v: Value| -> Result<(QueryIr, Option<String>), String> {
+            Ok((
+                QueryIr::Filter {
+                    input: Box::new(q.clone()),
+                    pred: PredExpr::Eq(RowExpr::Col(width), RowExpr::Lit(v)),
+                },
+                None,
+            ))
+        };
+        match value {
+            Arg::Var(v) => {
+                if let Some(entity) = self.entity(v) {
+                    literal(Value::Ent(entity))
+                } else if let Some(val) = params.get(v.as_str()) {
+                    literal(val.clone())
+                } else if let Some(&c) = varcol.get(v) {
+                    Ok((
+                        QueryIr::Filter {
+                            input: Box::new(q),
+                            pred: PredExpr::Eq(RowExpr::Col(width), RowExpr::Col(c)),
+                        },
+                        None,
+                    ))
+                } else {
+                    Ok((q, Some(v.clone())))
+                }
+            }
+            Arg::Str(t) => literal(Value::text(t)),
+            Arg::Int(n) => literal(Value::Int(*n)),
+            Arg::Float(n) => literal(Value::Float(*n)),
+            Arg::Bool(b) => literal(Value::Bool(*b)),
         }
     }
 
@@ -1056,6 +1150,16 @@ impl Program {
                 .rels
                 .get(&atom.rel)
                 .ok_or_else(|| format!("view `{name}` uses undeclared relation `{}`", atom.rel))?;
+            if atom.inherit {
+                // `(entity, key, value)`: the entity was typed by an earlier
+                // atom, and the value is whatever the scope bound.
+                if let Some(Arg::Var(v)) = atom.args.get(2) {
+                    if self.entity(v).is_none() {
+                        variables.entry(v.clone()).or_insert(Ty::Any);
+                    }
+                }
+                continue;
+            }
             for (argument, column) in atom.args.iter().zip(&relation.columns) {
                 if let Arg::Var(variable) = argument {
                     if self.entity(variable).is_none() {

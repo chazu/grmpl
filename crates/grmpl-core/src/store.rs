@@ -138,6 +138,26 @@ pub trait TraceStore: EditionStore {
             .collect())
     }
 
+    /// **Span stabbing.** Consolidated contents of `rel` as-of `at` restricted to
+    /// rows that **contain** one of `points`: `row[first] <= p <= row[last]`
+    /// for some `p`, the span inclusive at both ends.
+    ///
+    /// This is what scope-inherited context asks: which bindings cover this
+    /// entity. The default reads the relation and filters. A store that
+    /// summarizes each subtree's bounds (the Ent's extents) overrides it to
+    /// skip every subtree whose spans all start after the points or all end
+    /// before them.
+    fn read_containing(
+        &self,
+        rel: RelId,
+        at: Edition,
+        first: usize,
+        last: usize,
+        points: &[crate::value::Value],
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self.read_at(rel, at)?.into_iter().filter(|(t, _)| contains_any(t, first, last, points)).collect())
+    }
+
     /// **Interest routing.** Could any commit in `(from, to]` have touched one of
     /// `rels`?
     ///
@@ -349,6 +369,19 @@ pub trait EditionReader: Send + Sync {
             .collect())
     }
 
+    /// [`read`](Self::read) restricted to rows whose inclusive span
+    /// `[row[first], row[last]]` contains one of `points`; see
+    /// [`TraceStore::read_containing`].
+    fn read_containing(
+        &self,
+        rel: RelId,
+        first: usize,
+        last: usize,
+        points: &[crate::value::Value],
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        Ok(self.read(rel)?.into_iter().filter(|(t, _)| contains_any(t, first, last, points)).collect())
+    }
+
     /// Could a commit in `(from, this reader's edition]` have touched one of
     /// `rels`? [`TraceStore::touched_since`] asked at a pinned edition: a
     /// `false` proves nothing changed, a `true` means only "possibly", and the
@@ -395,6 +428,24 @@ impl<S: TraceStore + ?Sized> EditionReader for ForwardingReader<'_, S> {
             return Ok(false);
         }
         self.store.touched_since(from, self.at, rels)
+    }
+
+    fn read_containing(
+        &self,
+        rel: RelId,
+        first: usize,
+        last: usize,
+        points: &[crate::value::Value],
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        self.store.read_containing(rel, self.at, first, last, points)
+    }
+}
+
+/// Whether `t`'s inclusive span `[t[first], t[last]]` contains one of `points`.
+pub fn contains_any(t: &Tuple, first: usize, last: usize, points: &[crate::value::Value]) -> bool {
+    match (t.as_slice().get(first), t.as_slice().get(last)) {
+        (Some(lo), Some(hi)) => points.iter().any(|p| lo <= p && p <= hi),
+        _ => false,
     }
 }
 

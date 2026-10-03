@@ -47,6 +47,10 @@ pub struct BootstrapFact {
 pub struct Atom {
     pub rel: String,
     pub args: Vec<Arg>,
+    /// `inherit ctx(entity, "key", value)`: binds `value` to what `entity`
+    /// inherits for `key` from the `context` relation `ctx`, rather than
+    /// matching a stored row.
+    pub inherit: bool,
 }
 
 /// An aggregate function that may head a `yield` item: `count`, `sum`, `min`,
@@ -275,6 +279,12 @@ pub enum Decl {
     Rel {
         name: String,
         cols: Vec<ColDecl>,
+    },
+    /// `context NAME`: a scope relation `NAME(first: Ent, last: Ent, key:
+    /// Text, value: Any)`, whose rows bind `key` to `value` across the entity
+    /// span `first..=last`, read through `inherit` atoms.
+    Context {
+        name: String,
     },
     /// A `view`. `yields` are the plain grouping/projection columns of the
     /// `yield` clause; `agg` is the optional single aggregate (`sum(pts)`,

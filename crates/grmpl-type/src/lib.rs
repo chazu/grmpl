@@ -406,6 +406,13 @@ fn synth(
             Ok(RowTy(cols))
         }
         QueryIr::Recur => recur.cloned().ok_or(TypeError::RecurOutsideIterate),
+        // The input's columns, then the inherited value, whose type is
+        // whatever the scope bound.
+        QueryIr::Inherit { input, .. } => {
+            let mut t = synth(input, schemas, at, recur)?;
+            t.0.push(Ty::Any);
+            Ok(t)
+        }
         // The stored copy holds the same rows; the plan is what they mean.
         QueryIr::Materialized { plan, .. } => synth(plan, schemas, at, recur),
         QueryIr::Iterate { init, step } => {

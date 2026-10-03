@@ -4,12 +4,13 @@
 //! program := decl*
 //! decl    := "rel"  Ident "(" collist ")"
 //!          | "materialized"? "view" Ident "(" identlist? ")" "{" atom* "yield" yieldlist "}"
+//!          | "context" Ident                // a scope relation (first, last, key, value)
 //!          | "form" Ident "{" rule* "}"
 //!          | "on" "watch" Ident ("including" "current")? "{" watchbind* "}"
 //! watchbind := ("inbox" | "cursor" | "seqs") Ident
 //! collist := col ("," col)*
 //! col     := Ident (":" Ident)?          // column name and optional type
-//! atom    := Ident "(" arg ("," arg)* ")"
+//! atom    := "inherit"? Ident "(" arg ("," arg)* ")"
 //! arg     := Ident | Str | Int
 //! yieldlist := yielditem ("," yielditem)*
 //! yielditem := Ident                     // a grouping / projection column
@@ -79,6 +80,10 @@ impl Parser {
             Some(Token::Ident(k)) if k == "actor" => self.actor_decl(),
             Some(Token::Ident(k)) if k == "bootstrap" => self.bootstrap_decl(),
             Some(Token::Ident(k)) if k == "rel" => self.rel_decl(),
+            Some(Token::Ident(k)) if k == "context" => {
+                self.next(); // context
+                Ok(Decl::Context { name: self.ident()? })
+            }
             Some(Token::Ident(k)) if k == "view" => self.view_decl(false),
             Some(Token::Ident(k)) if k == "materialized" => {
                 self.next(); // materialized
@@ -90,7 +95,7 @@ impl Parser {
             Some(Token::Ident(k)) if k == "form" => self.form_decl(),
             Some(Token::Ident(k)) if k == "on" => self.on_decl(),
             other => Err(format!(
-                "expected a declaration (package/entity/requires/authority/actor/bootstrap/rel/view/\
+                "expected a declaration (package/entity/requires/authority/actor/bootstrap/rel/context/view/\
                  materialized view/form/on), \
                  found {other:?}"
             )),
@@ -455,7 +460,11 @@ impl Parser {
     }
 
     fn atom(&mut self) -> Result<Atom, String> {
-        let rel = self.ident()?;
+        let mut rel = self.ident()?;
+        let inherit = rel == "inherit" && matches!(self.peek(), Some(Token::Ident(_)));
+        if inherit {
+            rel = self.ident()?;
+        }
         self.expect(&Token::LParen)?;
         let mut args = vec![self.arg()?];
         while matches!(self.peek(), Some(Token::Comma)) {
@@ -463,7 +472,7 @@ impl Parser {
             args.push(self.arg()?);
         }
         self.expect(&Token::RParen)?;
-        Ok(Atom { rel, args })
+        Ok(Atom { rel, args, inherit })
     }
 
     fn arg(&mut self) -> Result<Arg, String> {

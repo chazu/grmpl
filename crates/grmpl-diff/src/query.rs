@@ -84,6 +84,23 @@ pub enum Query {
     /// as `implements` (DESIGN.md §3.1). One recursion variable per `Iterate`
     /// (single-level recursion in v1).
     Iterate { init: Box<Query>, step: Box<Query> },
+    /// **Scope-inherited context — the Context enfilade.** Each `input` row,
+    /// extended with the value its entity in column `col` inherits for `key`
+    /// from the scope relation `ctx`; rows whose entity inherits nothing are
+    /// dropped.
+    ///
+    /// `ctx` holds bindings `(first: Ent, last: Ent, key, value)`, each binding
+    /// `key` to `value` across the inclusive span of entity ids
+    /// `first..=last`. An entity inherits from the **most specific** span that
+    /// contains it and binds the key: the one starting latest, then ending
+    /// earliest, then the least value — for nested spans, the innermost. So an
+    /// inner scope overrides an outer one, and removing it lets the outer one
+    /// show through. The spans are coordinates the Ent's dsps move: grafting a
+    /// block carries the scopes inside it, displaced with the block.
+    ///
+    /// Read with [`TraceStore::read_containing`], which the Ent answers by
+    /// stabbing the scope relation through its extents.
+    Inherit { input: Box<Query>, col: usize, key: Value, ctx: RelId },
     /// **A materialized view — the Derived enfilade.** Means exactly `plan`,
     /// which is `distinct(L)` or `reduce(distinct(L))` for a linear `L`; the
     /// rest says where a maintained copy is stored.
@@ -190,6 +207,10 @@ impl Query {
             // What the view reads, not where its copy is kept: the copy changes
             // only because they do.
             Query::Materialized { plan, .. } => plan.collect_base_relations(out),
+            Query::Inherit { input, ctx, .. } => {
+                input.collect_base_relations(out);
+                out.insert(*ctx);
+            }
         }
     }
 
@@ -364,6 +385,7 @@ fn contains_reduce(q: &Query) -> bool {
         Query::Negate(a) | Query::Distinct(a) => contains_reduce(a),
         Query::Shared(inner) => contains_reduce(inner),
         Query::Materialized { plan, .. } => contains_reduce(plan),
+        Query::Inherit { input, .. } => contains_reduce(input),
         Query::Join { left, right, .. } | Query::Union(left, right) => {
             contains_reduce(left) || contains_reduce(right)
         }
@@ -528,6 +550,17 @@ fn eval_inner(
             }
             r
         }
+        Query::Inherit { input, col, key, ctx } => {
+            let rows = eval_inner(input, reader, recur, overrides, arr)?;
+            let ctx_rows = match overrides.and_then(|o| o.get(ctx)) {
+                Some(m) => m.iter().map(|(t, d)| (t.clone(), *d)).collect(),
+                None => {
+                    let points: Vec<Value> = distinct_cells(&rows, *col);
+                    reader.read_containing(*ctx, 0, 1, &points)?
+                }
+            };
+            inherit(&rows, *col, key, &ctx_rows)
+        }
         Query::Materialized { plan, into, prefix, cursor_rel, key, reduce } => {
             // Stored rows stand for the view only against the store itself: not
             // inside an `Iterate`, and not with relations overridden.
@@ -560,6 +593,42 @@ fn eval_inner(
             }
         }
     })
+}
+
+/// The distinct values in column `col` of `rows`.
+fn distinct_cells(rows: &Multiset, col: usize) -> Vec<Value> {
+    let cells: std::collections::BTreeSet<&Value> = rows.keys().filter_map(|t| t.as_slice().get(col)).collect();
+    cells.into_iter().cloned().collect()
+}
+
+/// [`Query::Inherit`] over materialized rows: each row extended with the value
+/// its `col` entity inherits for `key` from the scope rows `ctx`.
+fn inherit(rows: &Multiset, col: usize, key: &Value, ctx: &[(Tuple, Diff)]) -> Multiset {
+    // The live bindings of `key`, as (first, last, value).
+    let scopes: Vec<(&Value, &Value, &Value)> = ctx
+        .iter()
+        .filter(|(_, d)| *d > 0)
+        .filter_map(|(t, _)| match t.as_slice() {
+            [first, last, k, v] if k == key => Some((first, last, v)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Multiset::new();
+    for (row, w) in rows {
+        let Some(e) = row.as_slice().get(col) else { continue };
+        // Most specific: latest start, then earliest end, then least value.
+        let best = scopes
+            .iter()
+            .filter(|(first, last, _)| *first <= e && e <= *last)
+            .max_by(|a, b| a.0.cmp(b.0).then_with(|| b.1.cmp(a.1)).then_with(|| b.2.cmp(a.2)));
+        if let Some((_, _, v)) = best {
+            let mut cells = row.as_slice().to_vec();
+            cells.push((*v).clone());
+            multiset::add(&mut out, Tuple::new(cells), *w);
+        }
+    }
+    multiset::strip_zeros(&mut out);
+    out
 }
 
 /// The delta of a materialized view without an aggregate over `(from, to]`,
@@ -937,6 +1006,23 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
         Query::Recur => Multiset::new(),
         // A shared arrangement is transparent to delta computation.
         Query::Shared(inner) => eval_delta(inner, store, from, to)?,
+        Query::Inherit { input, col, key, ctx } => {
+            if store.touched_since(from, to, &[*ctx])? {
+                // A scope moved: any entity's inheritance may have changed, so
+                // difference the two ends (the boundary recompute).
+                let mut out = eval_snapshot(q, store, to)?;
+                multiset::merge(&mut out, &negate(&eval_snapshot(q, store, from)?));
+                multiset::strip_zeros(&mut out);
+                out
+            } else {
+                // The scopes are the same at both ends, so the operator is
+                // linear in its input: extend the input's change.
+                let d = eval_delta(input, store, from, to)?;
+                let points = distinct_cells(&d, *col);
+                let ctx_rows = store.read_containing(*ctx, to, 0, 1, &points)?;
+                inherit(&d, *col, key, &ctx_rows)
+            }
+        }
         Query::Materialized { plan, into, prefix, cursor_rel, key, reduce } => {
             if reduce.is_none() {
                 if let Some(d) = stored_delta(store, plan, *into, prefix, *cursor_rel, *key, from, to)? {

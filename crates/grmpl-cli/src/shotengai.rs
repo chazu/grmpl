@@ -74,6 +74,7 @@ const INSTANCE_STRIDE: u64 = 1_000;
 
 #[derive(Clone, Copy)]
 struct Rels {
+    scopes: RelId,
     located: RelId,
     named: RelId,
     described: RelId,
@@ -139,6 +140,7 @@ impl Rels {
                 .ok_or_else(|| format!("shotengai world has no `rel {name}`"))
         };
         Ok(Rels {
+            scopes: get("scopes")?,
             located: get("located")?,
             named: get("named")?,
             described: get("described")?,
@@ -257,8 +259,9 @@ impl Rels {
         ]
     }
 
-    fn template(self) -> [RelId; 13] {
+    fn template(self) -> [RelId; 14] {
         [
+            self.scopes,
             self.located,
             self.named,
             self.described,
@@ -651,6 +654,10 @@ impl Game {
         let mut out = vec![format!("{}", self.name_of(room))];
         if let Some(description) = self.description_of(room) {
             out.push(description);
+        }
+        // Inherited from the innermost scope around the room.
+        if let Some((mood, _)) = self.view_rows("ambience", &[Value::Ent(PLAYER)]).unwrap_or_default().first() {
+            out.push(text_at(mood, 0));
         }
         let depth = self.echo_depth();
         if depth > 0 {
@@ -1753,12 +1760,19 @@ mod tests {
         run(game, "use live");
         run(game, "use live");
         run(game, "use live");
+        let look = game.look().join("\n");
+        assert!(look.contains("stale popcorn"), "the dungeon scope did not reach the instance: {look}");
         run(game, "go east");
         let (shift, _) = game.instance_info().unwrap();
         assert_eq!(game.room_of(PLAYER), Some(shifted(MIRROR_CHAMBER, shift)));
         assert!(game
             .read_entity_set(game.r.defeated)
             .contains(&shifted(LAST_CUSTOMER, shift)));
+        // The instance was grafted with the template's scopes: its mirror
+        // chamber inherits the chamber's own ambience, not the dungeon's.
+        let look = game.look().join("\n");
+        assert!(look.contains("reflection is a half-step late"), "{look}");
+        assert!(!look.contains("stale popcorn"), "{look}");
     }
 
     #[test]
@@ -1778,6 +1792,7 @@ mod tests {
             ("enemies", &[Value::Ent(PLAYER)]),
             ("treasure", &[]),
             ("world", &[]),
+            ("ambience", &[Value::Ent(PLAYER)]),
             ("crib_pairs", &[Value::Ent(PLAYER)]),
             ("crib_fif2", &[Value::Ent(PLAYER)]),
             ("crib_fif3", &[Value::Ent(PLAYER)]),
@@ -1795,6 +1810,7 @@ mod tests {
     fn surface_world_retains_the_manor_feature_set() {
         let (_dir, mut game) = fresh_game();
         assert!(game.look().join("\n").contains("East Gate"));
+        assert!(game.look().join("\n").contains("Paper lanterns"), "the street scope");
         assert!(game.look().join("\n").contains("a calico cat"));
         let cat_before_command = game.room_of(CAT);
         let greeting = run(&mut game, "greet cat").join("\n");

@@ -243,6 +243,15 @@ pub enum QueryIr {
         init: Box<QueryIr>,
         step: Box<QueryIr>,
     },
+    /// Each input row extended with the value its entity in column `col`
+    /// inherits for `key` from the scope relation `ctx`. See
+    /// `grmpl_diff::Query::Inherit`.
+    Inherit {
+        input: Box<QueryIr>,
+        col: usize,
+        key: Value,
+        ctx: RelId,
+    },
     /// A `materialized view`: means exactly `plan`, and reads the maintained
     /// copy in `into` (rows led by `prefix`, the view's arguments; made
     /// distinct, then folded by `reduce` for an aggregate view) whenever that
@@ -281,6 +290,12 @@ impl QueryIr {
             QueryIr::Reduce { input, key, agg } => input.lower().reduce(key, agg),
             QueryIr::Recur => Query::recur(),
             QueryIr::Iterate { init, step } => Query::iterate(init.lower(), step.lower()),
+            QueryIr::Inherit { input, col, key, ctx } => Query::Inherit {
+                input: Box::new(input.lower()),
+                col,
+                key,
+                ctx,
+            },
             QueryIr::Materialized { plan, into, prefix, cursor_rel, key, reduce } => Query::Materialized {
                 plan: Box::new(plan.lower()),
                 into,

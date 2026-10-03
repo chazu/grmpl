@@ -82,6 +82,10 @@ fn collect_rels(q: &Query, out: &mut Vec<RelId>) {
         }
         Query::Shared(inner) => collect_rels(inner, out),
         Query::Materialized { plan, .. } => collect_rels(plan, out),
+        Query::Inherit { input, ctx, .. } => {
+            collect_rels(input, out);
+            out.push(*ctx);
+        }
         Query::Recur => {}
     }
 }

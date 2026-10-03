@@ -1153,6 +1153,18 @@ impl grmpl_core::EditionReader for EntReader<'_> {
         self.store.read_range_on(rel, Edition(self.at), col, lo, hi)
     }
 
+    fn read_containing(&self, rel: RelId, first: usize, last: usize, points: &[Value]) -> Result<Vec<(Tuple, Diff)>> {
+        self.door("read_containing")?;
+        let Some(facts) = self.facts(rel) else { return Ok(Vec::new()) };
+        Ok(stab(facts, first, last, points).unwrap_or_else(|| {
+            facts
+                .iter()
+                .filter(|(k, _)| grmpl_core::store::contains_any(k, first, last, points))
+                .map(|(k, v)| (k, *v))
+                .collect()
+        }))
+    }
+
     /// Answered from the store's Edition enfilade, a measure over `(from, at]`.
     fn touched_since(&self, from: Edition, rels: &[RelId]) -> Result<bool> {
         if from.0 >= self.at {
@@ -1399,6 +1411,33 @@ impl TraceStore for EntStore {
             .filter(|(k, _)| k.as_slice().get(col).is_some_and(|v| keys.contains(v)))
             .map(|(k, v)| (k, *v))
             .collect())
+    }
+
+    /// **Span stabbing through the extents** — see [`stab`]. Non-entity points
+    /// read and filter, as the default does.
+    fn read_containing(
+        &self,
+        rel: RelId,
+        at: Edition,
+        first: usize,
+        last: usize,
+        points: &[Value],
+    ) -> Result<Vec<(Tuple, Diff)>> {
+        let facts = {
+            let inner = self.inner.lock().unwrap();
+            if at.0 < inner.watermark {
+                return Err(door("read_containing", at.0, inner.watermark));
+            }
+            inner.fact_at(rel, at.0).cloned()
+        };
+        let Some(facts) = facts else { return Ok(Vec::new()) };
+        Ok(stab(&facts, first, last, points).unwrap_or_else(|| {
+            facts
+                .iter()
+                .filter(|(k, _)| grmpl_core::store::contains_any(k, first, last, points))
+                .map(|(k, v)| (k, *v))
+                .collect()
+        }))
     }
 
     /// **Key-range interest routing, through the canopy (G-4).**
@@ -1657,6 +1696,26 @@ fn latest_schema(ctx: &ContextEnf, rel: RelId) -> Result<Option<(u64, Schema)>> 
             Ok(Some((edition, decode_schema_value(v)?)))
         }
     }
+}
+
+/// The rows of `facts` whose inclusive span `[row[first], row[last]]` holds one
+/// of the entity `points` — or `None` if a point is not an entity, which only a
+/// filter can answer.
+///
+/// A subtree is entered only if some point lies between its least `first` and
+/// its greatest `last`: the extent's two columns are the interval tree's
+/// min-low and max-high, so nested scopes are stabbed the way the canopy stabs
+/// interests.
+fn stab(facts: &FactTree, first: usize, last: usize, points: &[Value]) -> Option<Vec<(Tuple, Diff)>> {
+    let ids: std::collections::BTreeSet<u64> =
+        points.iter().map(|p| if let Value::Ent(e) = p { Some(e.0) } else { None }).collect::<Option<_>>()?;
+    Some(facts.search(
+        |(_, x)| match (x.column(first), x.column(last)) {
+            (Some((lo, _)), Some((_, hi))) => lo <= hi && ids.range(lo..=hi).next().is_some(),
+            _ => false,
+        },
+        |k, _| grmpl_core::store::contains_any(k, first, last, points),
+    ))
 }
 
 /// The least value above `v` in [`Value`]'s order, for the values where that is

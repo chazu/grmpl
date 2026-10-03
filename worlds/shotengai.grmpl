@@ -43,6 +43,7 @@ entity MANNEQUIN_SHELL = 1013
 entity DUNGEON_COIN = 1020
 entity RED_THREAD = 1021
 entity COPYING_MIRROR = 1022
+entity DUNGEON_LAST = 1099
 
 requires random omens(state: rng_state, owner: WORLD, algorithm: xorshift64star_v1)
 requires schedule world_clock(clock: clock, timers: timers, sequences: inbox_seq)
@@ -102,6 +103,13 @@ rel rng_state(owner: Ent, state: Int)
 rel clock(seq: Int, wall_ms: Int, random: Int)
 rel timers(due: Int, inbox: Int, target: Ent, body: Tuple)
 rel patrol_due(actor: Ent, due: Int)
+
+// ---- scopes: context inherited down entity blocks ---------------------------
+// `scopes(first, last, key, value)` binds `key` across the entity span
+// first..last; `inherit` gives a room the binding of the innermost span that
+// holds it. The dungeon template's scopes are part of the template, so every
+// instance is grafted with its own copy, displaced with its rooms.
+context scopes
 
 // ---- card table: arithmetic and combinations are relations -----------------
 rel card(holder: Ent, slot: Int, code: Int)
@@ -210,6 +218,12 @@ materialized view world() {
     located(thing, room)
     named(thing, name)
     yield thing, name
+}
+
+view ambience(viewer) {
+    located(viewer, room)
+    inherit scopes(room, "ambient", mood)
+    yield mood
 }
 
 view folks(viewer) {
@@ -509,6 +523,9 @@ on combat_inbox parse combat_command {
 
 on watch world including current { inbox wmail cursor wcursor seqs wseq }
 bootstrap {
+    scopes(EAST_GATE, ROOFTOP, "ambient", "Paper lanterns sway over the half-shuttered arcade.")
+    scopes(DUNGEON_ENTRY, DUNGEON_LAST, "ambient", "The air tastes of old receipts and stale popcorn.")
+    scopes(MIRROR_CHAMBER, MIRROR_CHAMBER, "ambient", "Every surface hums, and your reflection is a half-step late.")
     located(PLAYER, EAST_GATE)
     located(RED_UMBRELLA, EAST_GATE)
     located(BRASS_TOKEN, ARCADE)
