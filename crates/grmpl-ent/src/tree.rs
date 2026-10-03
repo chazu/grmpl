@@ -329,7 +329,18 @@ where
 
     /// Split into the entries below `key` and those at or above it. Persistent:
     /// `O(log n)` new nodes along the cut, everything else shared.
+    ///
+    /// A cut outside the tree's span shares the whole tree and writes nothing.
     pub fn split(&self, key: &K) -> (Self, Self) {
+        if self.is_empty() {
+            return (Tree::new(), Tree::new());
+        }
+        if self.max_key() < *key {
+            return (self.clone(), Tree::new());
+        }
+        if self.min_key() >= *key {
+            return (Tree::new(), self.clone());
+        }
         Self::split_at(self, key)
     }
 

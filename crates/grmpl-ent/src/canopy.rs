@@ -208,6 +208,54 @@ impl Canopy {
         hit
     }
 
+    /// The interests of `rel` whose interval overlaps `[lo, hi)`, sorted — the
+    /// routing for a change known by its span rather than its tuples (a graft:
+    /// the span is the copied block). Conservative in the way routing may be: an
+    /// interest overlapping the span is woken even if the rows that landed miss
+    /// its own interval.
+    pub fn route_span(&self, rel: RelId, lo: &Tuple, hi: &Tuple) -> Vec<InterestId> {
+        let mut hit = Vec::new();
+        if lo < hi {
+            Self::overlap(&self.enf, rel.0, lo, hi, &mut hit);
+        }
+        hit.sort();
+        hit
+    }
+
+    fn overlap(t: &CanopyEnf, rel: u32, lo: &Tuple, hi: &Tuple, out: &mut Vec<InterestId>) {
+        let node = match t.node() {
+            None => return,
+            Some(n) => n,
+        };
+        // WID prune: nothing under here reaches past the span's start.
+        if t.measure().max_hi.as_ref().is_none_or(|h| h <= lo) {
+            return;
+        }
+        match node {
+            NodeRef::Leaf(entries) => {
+                for ((r, ilo, id), (ihi, _)) in entries {
+                    if *r == rel && ilo < hi && lo < ihi {
+                        out.push(InterestId(*id));
+                    }
+                }
+            }
+            NodeRef::Internal(keys, children) => {
+                for (i, child) in children.iter().enumerate() {
+                    if i > 0 {
+                        let (kr, klo, _) = &keys[i - 1];
+                        if *kr > rel || (*kr == rel && klo >= hi) {
+                            break;
+                        }
+                    }
+                    if i < keys.len() && keys[i].0 < rel {
+                        continue;
+                    }
+                    Self::overlap(child, rel, lo, hi, out);
+                }
+            }
+        }
+    }
+
     /// Collect the interests of `rel` whose interval contains `point`, pruning on
     /// the upward measure: a subtree whose greatest `hi` does not clear the point
     /// holds nothing that can contain it, and a subtree whose joined endorsement
@@ -393,6 +441,19 @@ mod tests {
                     want.sort();
                     want.dedup();
                     assert_eq!(c.route(&[(RelId(1), t(p), 1)]), want, "seed {seed}, point {p}");
+                }
+                // Every span must route identically to the overlap oracle.
+                for _ in 0..6 {
+                    let a = rng.below(50) as i64 - 5;
+                    let b = rng.below(50) as i64 - 5;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let mut want: Vec<InterestId> = refs
+                        .iter()
+                        .filter(|(_, ilo, ihi)| lo < hi && *ilo < hi && lo < *ihi)
+                        .map(|(id, _, _)| *id)
+                        .collect();
+                    want.sort();
+                    assert_eq!(c.route_span(RelId(1), &t(lo), &t(hi)), want, "seed {seed}, span {lo}..{hi}");
                 }
             }
         }

@@ -384,10 +384,11 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
     // --- instanced dungeons: DSP relocation (the Ent's virtual copy) ------
 
     /// `enter vault` — mint a **private instance** of the vault template by
-    /// relocating its whole sub-world into a fresh id block (DSP `apply_all`), then
-    /// step the player into the instanced antechamber. Every visit is disjoint, so
-    /// two players never collide — the store's `instance_template` does the WID
-    /// read + coordinate shift; the host only picks the block and walks the player.
+    /// grafting its whole sub-world into a fresh id block (a DSP virtual copy that
+    /// shares the template's nodes), then step the player into the instanced
+    /// antechamber. Every visit is disjoint, so two players never collide — the
+    /// store's `instance_template` does the graft; the host only picks the block
+    /// and walks the player.
     fn cmd_enter(&mut self, line: &str) -> Result<(), String> {
         if line.split_whitespace().nth(1) != Some("vault") {
             println!("You can only `enter vault` from here.");
@@ -404,13 +405,28 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
                 return Ok(());
             }
         };
-        // Allocate this session's next instance block and the shift onto it.
-        let target_base = INSTANCE_BASE + self.instances * INSTANCE_STRIDE;
+        // Allocate the next free instance block and the shift onto it. The
+        // counter is per session, so on a reused store skip the blocks earlier
+        // sessions already filled: instancing refuses an occupied block.
+        let rels = [self.r.located, self.r.named, self.r.exits];
+        let target_base = loop {
+            let base = INSTANCE_BASE + self.instances * INSTANCE_STRIDE;
+            self.instances += 1;
+            let lo = Tuple::from([Value::Ent(Entity(base))]);
+            let hi = Tuple::from([Value::Ent(Entity(base + VAULT_SPAN))]);
+            let at = self.store.current();
+            let mut used = false;
+            for rel in rels {
+                used |= self.store.count_at(rel, at, &lo, &hi).map_err(err)? > 0;
+            }
+            if !used {
+                break base;
+            }
+        };
         let shift = target_base as i64 - VAULT_BASE as i64;
-        self.instances += 1;
         self.store
             .instance_template(
-                &[self.r.located, self.r.named, self.r.exits],
+                &rels,
                 VAULT_BASE,
                 VAULT_BASE + VAULT_SPAN,
                 shift,

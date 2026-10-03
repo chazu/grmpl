@@ -29,7 +29,7 @@ use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
-use crate::granfilade::{ContentKey, Granfilade, StagedWrite};
+use crate::granfilade::{ContentKey, Granfilade, Persist, StagedWrite};
 use crate::measure::Count;
 use crate::tree::Tree;
 
@@ -38,8 +38,55 @@ use crate::tree::Tree;
 /// cached summaries, materializing nothing.
 type FactMeasure = Count;
 type FactTree = Tree<Tuple, Diff, FactMeasure>;
-/// The Edition enfilade: `(edition, submit_index) → (tuple, diff)` raw log.
-type LogTree = Tree<(u64, u64), (Tuple, Diff), Count>;
+/// The Edition enfilade: `(edition, submit_index) → entry`, the raw log in
+/// commit order.
+type LogTree = Tree<(u64, u64), LogEntry, Count>;
+
+/// One record of the Edition enfilade.
+#[derive(Clone, PartialEq, Debug)]
+enum LogEntry {
+    /// An ordinary update, in submit order.
+    Update(Tuple, Diff),
+    /// A **graft**: this edition's Fact root holds, in `[lo, hi)`, a virtual
+    /// copy of a block that was empty before it. The rows are read back from
+    /// that root rather than logged one by one, so the log grows by one entry
+    /// however large the copy is.
+    Graft(Tuple, Tuple),
+}
+
+impl Persist for LogEntry {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            LogEntry::Update(tuple, diff) => {
+                out.push(0);
+                tuple.encode(out);
+                diff.encode(out);
+            }
+            LogEntry::Graft(lo, hi) => {
+                out.push(1);
+                lo.encode(out);
+                hi.encode(out);
+            }
+        }
+    }
+    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
+        let tag = *bytes
+            .get(pos)
+            .ok_or_else(|| Error::Codec("granfilade: truncated log entry".into()))?;
+        let (a, p) = Tuple::decode(bytes, pos + 1)?;
+        match tag {
+            0 => {
+                let (diff, p) = Diff::decode(bytes, p)?;
+                Ok((LogEntry::Update(a, diff), p))
+            }
+            1 => {
+                let (hi, p) = Tuple::decode(bytes, p)?;
+                Ok((LogEntry::Graft(a, hi), p))
+            }
+            other => Err(Error::Codec(format!("granfilade: unknown log entry tag {other}"))),
+        }
+    }
+}
 /// The **Version enfilade**: `edition → Fact root`, one persistent root per
 /// live as-of edition (G-2a). `last_le` makes an as-of read a descent.
 type VersionTree = Tree<u64, FactTree, Count>;
@@ -467,19 +514,9 @@ impl EntStore {
         // prefix ≤ `at`.
         let mut rels = RelTree::new();
         for (rel, roots) in inner.rels.iter() {
-            let mut versions = VersionTree::new();
-            for (e, t) in roots.versions.range_collect(&0, &(at.0 + 1)) {
-                versions = versions.insert(e, t);
-            }
-            let log = if at.0 >= inner.current {
-                roots.log.clone()
-            } else {
-                let mut t = LogTree::new();
-                for (k, v) in roots.log.range_collect(&(0, 0), &(at.0 + 1, 0)) {
-                    t = t.insert(k, v);
-                }
-                t
-            };
+            // A persistent split: `O(log n)` new nodes, every root shared.
+            let (versions, _) = roots.versions.split(&(at.0 + 1));
+            let (log, _) = roots.log.split(&(at.0 + 1, 0));
             if !versions.is_empty() || !log.is_empty() {
                 // Arrangements are derived from the primary order, so a fork
                 // rebuilds them on demand rather than carrying them.
@@ -612,45 +649,65 @@ impl EntStore {
             .common_ancestor(self.branch, here, other.branch, there)
     }
 
-    /// **DSP template instancing (E6).** Read every fact of `rels` whose lead
-    /// entity lies in the template block `[block_lo, block_hi)` — a WID range read
-    /// (E2) over each relation — relocate **all** of its entity coordinates by
-    /// `shift` ([`Dsp::apply_all`]), and commit the relocated facts as one new
-    /// edition: a private, independently-mutable copy of the template sub-world,
-    /// its rooms/exits/items renamed only in *coordinate* (their text and weights
+    /// **DSP template instancing (E6): a virtual copy.** Copy every fact of
+    /// `rels` whose lead entity lies in the template block `[block_lo,
+    /// block_hi)` into the block displaced by `shift`, moving **all** of each
+    /// fact's entity coordinates together, as one new edition: a private,
+    /// independently-mutable copy of the template sub-world, its rooms, exits
+    /// and items renamed only in *coordinate* (their text and weights
     /// preserved). Returns the new edition.
     ///
-    /// Distinct `shift`s give disjoint instances that never collide, so N players
-    /// can each `enter` the same template into their own block. Building an
-    /// instance is `O(template facts)` — a self-contained vault is a handful of
-    /// facts, so it is effectively instant; an `O(1)` displaced-overlay that shares
-    /// the template until an instance diverges (true copy-on-write) is the next
-    /// increment on this same DSP relocation.
+    /// Each relation's block is [grafted](Tree::graft): split out of the Fact
+    /// enfilade, relocated by one dsp, and joined back in at its new position.
+    /// The instance shares every interior node with the template — the commit
+    /// writes `O(log n)` new nodes per relation and one log entry, however large
+    /// the template is — and diverges copy-on-write as either side is edited.
+    /// Readers still see the copy as ordinary updates: [`scan_updates`]
+    /// expands the log entry from the edition's Fact root.
     ///
-    /// Precondition: the template is self-contained — every template fact is keyed
-    /// by an in-block lead entity (so the lead-column WID range collects it), and
-    /// all of a fact's entity columns lie in the block (so the relocation keeps it
-    /// internally connected). The target block `[block_lo+shift, block_hi+shift)`
-    /// must be otherwise unused.
+    /// Distinct `shift`s give disjoint instances, so N players can each `enter`
+    /// the same template into their own block. The target block must be empty
+    /// in every relation, or the call fails without committing anything; it also
+    /// fails if the shift would wrap an entity id.
+    ///
+    /// Precondition: the template is self-contained — every template fact is
+    /// keyed by an in-block lead entity, and all of a fact's entity columns lie
+    /// in the block, so the relocation keeps it internally connected.
+    ///
+    /// [`scan_updates`]: TraceStore::scan_updates
     pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
-        let at = self.current();
-        // The *source* block: the template's own coordinates.
         let src_lo = Tuple::from([Value::Ent(Entity(block_lo))]);
         let src_hi = Tuple::from([Value::Ent(Entity(block_hi))]);
-        let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
-        {
-            let inner = self.inner.lock().unwrap();
-            if at.0 < inner.watermark {
-                return Err(door("instance_template", at.0, inner.watermark));
-            }
-            for &rel in rels {
-                let Some(facts) = inner.fact_at(rel, at.0) else { continue };
-                for (tuple, diff) in facts.range_collect(&src_lo, &src_hi) {
-                    updates.push((rel, tuple.displace(shift), diff));
+        let (tlo, thi) = (src_lo.displace(shift), src_hi.displace(shift));
+        let mut rels = rels.to_vec();
+        rels.sort();
+        rels.dedup();
+        let e = {
+            let mut inner = self.inner.lock().unwrap();
+            let at = inner.current;
+            let mut grafts = Vec::new();
+            for rel in rels {
+                let Some(facts) = inner.fact_at(rel, at) else { continue };
+                if !facts.any_in(&src_lo, &src_hi) {
+                    continue;
                 }
+                let grafted = facts.graft(&src_lo, &src_hi, shift).ok_or_else(|| {
+                    Error::Store(format!(
+                        "instance_template: relation {} already has facts in the target block \
+                         [{block_lo}+{shift}, {block_hi}+{shift}), or the shift wraps the id space",
+                        rel.0
+                    ))
+                })?;
+                grafts.push((rel, grafted));
             }
-        }
-        self.commit(&updates)
+            let e = at + 1;
+            inner.apply_grafts(e, &grafts, &tlo, &thi);
+            let touched: Vec<RelId> = grafts.iter().map(|(rel, _)| *rel).collect();
+            self.stage_commit(&inner, &touched, e)?;
+            e
+        };
+        self.await_durable(e)?;
+        Ok(Edition(e))
     }
 
     /// Persist the context enfilade (catalog, schemas, scoped bindings) as one
@@ -956,11 +1013,32 @@ impl Inner {
     fn apply(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
         for (i, (rel, tuple, diff)) in updates.iter().enumerate() {
             let mut roots = self.roots(*rel).cloned().unwrap_or_default();
-            roots.log = roots.log.insert((e, i as u64), (tuple.clone(), *diff));
+            roots.log = roots.log.insert((e, i as u64), LogEntry::Update(tuple.clone(), *diff));
             self.put(*rel, roots);
             self.fold_fact(e, *rel, tuple, *diff);
         }
         self.route(e, updates);
+        self.current = e;
+    }
+
+    /// Commit `grafts` — each relation's new Fact root — as edition `e`, every
+    /// copy landing in `[lo, hi)`: one Graft entry in each relation's log, and
+    /// the canopy stabbed with the span rather than row by row.
+    fn apply_grafts(&mut self, e: u64, grafts: &[(RelId, FactTree)], lo: &Tuple, hi: &Tuple) {
+        for (rel, root) in grafts {
+            let mut roots = self.roots(*rel).cloned().unwrap_or_default();
+            roots.versions = roots.versions.insert(e, root.clone());
+            roots.log = roots.log.insert((e, 0), LogEntry::Graft(lo.clone(), hi.clone()));
+            // An Arrangement orders by another column, where the copy is not one
+            // contiguous span; it is rebuilt on demand from the new primary.
+            roots.orders = OrderTree::new();
+            self.put(*rel, roots);
+            if !self.canopy.is_empty() {
+                for id in self.canopy.route_span(*rel, lo, hi) {
+                    self.fired = self.fired.insert((id.0, e), ());
+                }
+            }
+        }
         self.current = e;
     }
 
@@ -1117,11 +1195,22 @@ impl TraceStore for EntStore {
             return Err(door("scan_updates", from.0, inner.watermark));
         }
         let mut out = Vec::new();
-        if let Some(log) = inner.log_of(rel) {
-            for ((edition, _submit), (tuple, diff)) in
-                log.range_collect(&(from.0 + 1, 0), &(to.0 + 1, 0))
-            {
-                out.push(Update { tuple, time: Time::input(edition), diff });
+        let Some(roots) = inner.roots(rel) else { return Ok(out) };
+        for ((edition, _submit), entry) in roots.log.range_collect(&(from.0 + 1, 0), &(to.0 + 1, 0)) {
+            match entry {
+                LogEntry::Update(tuple, diff) => {
+                    out.push(Update { tuple, time: Time::input(edition), diff })
+                }
+                // A graft's rows are the copy in its edition's own Fact root;
+                // the block was empty before, so each row is one update.
+                LogEntry::Graft(lo, hi) => {
+                    let root = roots.versions.get(&edition).ok_or_else(|| {
+                        Error::Store(format!("graft at edition {edition} has no Fact root"))
+                    })?;
+                    for (tuple, diff) in root.range_collect(&lo, &hi) {
+                        out.push(Update { tuple, time: Time::input(edition), diff });
+                    }
+                }
             }
         }
         Ok(out)
@@ -1317,17 +1406,11 @@ impl TraceStore for EntStore {
             let roots = inner.roots(rel).cloned().unwrap_or_default();
             // Fold everything at or below the new watermark into one checkpoint,
             // and keep the versions above it.
-            let mut versions = VersionTree::new();
+            let (_, mut versions) = roots.versions.split(&(new_wm + 1));
             if let Some((_, t)) = roots.versions.last_le(&new_wm) {
                 versions = versions.insert(new_wm, t.clone());
             }
-            for (e, t) in roots.versions.range_collect(&(new_wm + 1), &u64::MAX) {
-                versions = versions.insert(e, t);
-            }
-            let mut log = LogTree::new();
-            for (k, v) in roots.log.range_collect(&(new_wm + 1, 0), &(u64::MAX, u64::MAX)) {
-                log = log.insert(k, v);
-            }
+            let (_, log) = roots.log.split(&(new_wm + 1, 0));
             // Consolidation retires versions; the Arrangements rebuild on demand.
             inner.put(rel, RelRoots { versions, log, orders: OrderTree::new() });
         }
