@@ -10,15 +10,18 @@
 //!   `(edition, submit_index)` with the submit index as immutable payload, so
 //!   `scan_updates` returns raw, per-multiplicity updates in exact submit order.
 //!
-//! [`EntStore::open`] backs the store with a [`Granfilade`]: on each commit the
-//! touched Edition enfilades are persisted as content-addressed nodes (structural
-//! sharing across editions) with the roots + clock in one atomic write; on open
-//! the state is rebuilt from the persisted enfilades. The **persisted form is the
-//! enfilade itself, never a log** — the Ent is the substrate. [`EntStore::new`]
+//! [`EntStore::open`] backs the store with a [`Granfilade`]. **Everything is in
+//! the Ent:** the granfilade's one root record links to the branch DAG and to the
+//! **branch enfilade**, `branch → that branch's whole state` — its clock, its
+//! Rel enfilade (each relation's versions, log and Arrangements), its context
+//! enfilade and its canopy. A commit path-copies its way up to a new root record
+//! and writes it, with the new nodes, in one atomic batch. Opening a store reads
+//! the root record and pages the rest in as reads reach it; nothing is rebuilt.
+//! The **persisted form is the enfilade itself, never a log**. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use grmpl_core::{
     wire, Catalog, Diff, Edition, EditionStore, Entity, Error, RelId, Result, Schema,
@@ -29,7 +32,7 @@ use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
-use crate::granfilade::{ContentKey, Granfilade, Persist, StagedWrite};
+use crate::granfilade::{Dec, Enc, Granfilade, Persist, StagedWrite};
 use crate::measure::Count;
 use crate::tree::Tree;
 
@@ -55,34 +58,26 @@ enum LogEntry {
 }
 
 impl Persist for LogEntry {
-    fn encode(&self, out: &mut Vec<u8>) {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
         match self {
             LogEntry::Update(tuple, diff) => {
-                out.push(0);
-                tuple.encode(out);
-                diff.encode(out);
+                e.put(&[0]);
+                tuple.encode(e);
+                diff.encode(e);
             }
             LogEntry::Graft(lo, hi) => {
-                out.push(1);
-                lo.encode(out);
-                hi.encode(out);
+                e.put(&[1]);
+                lo.encode(e);
+                hi.encode(e);
             }
         }
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let tag = *bytes
-            .get(pos)
-            .ok_or_else(|| Error::Codec("granfilade: truncated log entry".into()))?;
-        let (a, p) = Tuple::decode(bytes, pos + 1)?;
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let tag = d.take(1)?[0];
+        let a = Tuple::decode(d)?;
         match tag {
-            0 => {
-                let (diff, p) = Diff::decode(bytes, p)?;
-                Ok((LogEntry::Update(a, diff), p))
-            }
-            1 => {
-                let (hi, p) = Tuple::decode(bytes, p)?;
-                Ok((LogEntry::Graft(a, hi), p))
-            }
+            0 => Ok(LogEntry::Update(a, Diff::decode(d)?)),
+            1 => Ok(LogEntry::Graft(a, Tuple::decode(d)?)),
             other => Err(Error::Codec(format!("granfilade: unknown log entry tag {other}"))),
         }
     }
@@ -120,6 +115,19 @@ struct RelRoots {
     orders: OrderTree,
 }
 
+/// A relation's roots persist as three links, so a Rel enfilade leaf names its
+/// relations' trees and GC follows them from there.
+impl Persist for RelRoots {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        e.link(&self.versions);
+        e.link(&self.log);
+        e.link(&self.orders);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok(RelRoots { versions: d.link()?, log: d.link()?, orders: d.link()? })
+    }
+}
+
 /// Rotate `tuple` so column `col` leads, the rest following in order — or `None`
 /// if the tuple has no such column, in which case it simply does not belong to
 /// that Arrangement. (Returning it unrotated would be worse than useless: it
@@ -153,10 +161,21 @@ fn unrotate(tuple: &Tuple, col: usize) -> Tuple {
     Tuple::new(out)
 }
 
+/// One staged write waiting for its group's `fsync`.
+struct Pending {
+    /// Its place in the family's staging order.
+    seq: u64,
+    /// The branch and edition it makes durable.
+    branch: BranchId,
+    edition: u64,
+    write: StagedWrite,
+}
+
 /// **The group-commit queue.** Editions applied in memory and encoded, waiting
-/// for the `fsync` that makes them durable.
+/// for the `fsync` that makes them durable. One queue serves every branch of a
+/// world, because they share one root record.
 ///
-/// The `Mutex<Inner>` above serializes *edition allocation*, which is the law
+/// The `Mutex<Inner>` serializes *edition allocation*, which is the law
 /// (one authority domain, one commit clock). It used to serialize *durability*
 /// too, because `commit_if` held it across the ~1 ms `SyncAll`, so N committers
 /// paid N fsyncs strictly in series. This queue separates the two: a committer
@@ -195,17 +214,22 @@ fn unrotate(tuple: &Tuple, col: usize) -> Tuple {
 /// [`EntStore::durable_edition`].
 #[derive(Default)]
 struct Durable {
-    /// Staged writes in **edition order** — the order they must reach disk, and
-    /// the order the batch applies them in. Pushed under the edition lock, which
-    /// is what keeps them ordered.
-    pending: VecDeque<(u64, StagedWrite)>,
-    /// The highest edition proven durable. This is the store's public clock.
-    durable: u64,
+    /// Staged writes in **staging order** — the order they must reach disk, and
+    /// the order the batch applies them in. Each carries the whole root record
+    /// as of its stage, so the last one in a batch is the world the batch leaves
+    /// behind. Pushed under the root lock, which is what keeps them ordered.
+    pending: VecDeque<Pending>,
+    /// The last staging sequence number handed out.
+    staged: u64,
+    /// The highest staging sequence number proven durable.
+    landed: u64,
+    /// Each branch's highest edition proven durable.
+    durable: BTreeMap<BranchId, u64>,
     /// Whether a leader is inside the batch + fsync right now.
     writing: bool,
-    /// A failed group: the highest edition it carried, and why it failed.
-    /// Sticky, so every committer whose edition was in that group learns of it
-    /// rather than waiting forever for a flush that will never come.
+    /// A failed group: the highest sequence number it carried, and why it
+    /// failed. Sticky, so every committer whose write was in that group learns
+    /// of it rather than waiting forever for a flush that will never come.
     failure: Option<(u64, String)>,
 }
 
@@ -215,20 +239,66 @@ impl Durable {
     fn doom(&self, target: Option<u64>) -> Option<String> {
         let (through, msg) = self.failure.as_ref()?;
         match target {
-            Some(e) if e > *through => None,
+            Some(s) if s > *through => None,
             _ => Some(msg.clone()),
         }
     }
 }
 
-/// An ent store: a family of per-relation Fact + Edition enfilades behind one
-/// commit clock, optionally durable on a [`Granfilade`].
-pub struct EntStore {
-    inner: Mutex<Inner>,
-    /// Editions staged but not yet fsynced (see [`Durable`]).
+/// **The Ent's root**: the branch DAG (the fulltrace's DagWood) and the branch
+/// enfilade (Gold's `oroots`, one state per branch). The granfilade's root
+/// record links to exactly these two trees.
+struct EntRoot {
+    dag: Dag,
+    branches: BranchStates,
+}
+
+/// The branch enfilade: `branch → that branch's whole state`.
+type BranchStates = Tree<BranchId, Inner, Count>;
+
+impl EntRoot {
+    fn empty() -> EntRoot {
+        EntRoot { dag: Dag::new(), branches: BranchStates::new() }
+    }
+
+    /// The root record's trees, paged: one frame read for each.
+    fn load(gran: &Arc<Granfilade>) -> Result<EntRoot> {
+        let slots = gran.root()?;
+        let slot = |i: usize| slots.get(i).copied().flatten();
+        Ok(EntRoot { dag: Dag::from_tree(gran.load(slot(0))?), branches: gran.load(slot(1))? })
+    }
+
+    /// The state of `branch` as last staged, or a fresh one for a branch that
+    /// has never committed.
+    fn state(&self, branch: BranchId) -> Result<Inner> {
+        if self.dag.get(branch).is_none() {
+            return Err(Error::Store(format!("unknown branch {branch}")));
+        }
+        Ok(self.branches.get(&branch).cloned().unwrap_or_else(Inner::empty))
+    }
+}
+
+/// Everything the branches of one world share: the node store, the Ent's
+/// root, and the group-commit queue that writes it.
+///
+/// The root record is one slot for the whole world, so every branch's commit
+/// rewrites it; staging under one lock and writing in staging order is what
+/// keeps a later root from being overwritten by an earlier one.
+struct Family {
+    /// The node substrate; `None` for an in-memory world.
+    gran: Option<Arc<Granfilade>>,
+    /// The Ent's root as of the latest stage.
+    root: Mutex<EntRoot>,
+    /// Staged root records not yet fsynced (see [`Durable`]).
     dur: Mutex<Durable>,
     /// Signalled whenever a group lands (or fails), waking its followers.
     flushed: Condvar,
+}
+
+/// An ent store: one branch of a world, its relations held as Fact + Edition
+/// enfilades behind one commit clock, optionally durable on a [`Granfilade`].
+pub struct EntStore {
+    inner: Mutex<Inner>,
     /// **Read-lock ops counter.** How many times a pinned-edition read has had to
     /// take the edition lock.
     ///
@@ -240,17 +310,17 @@ pub struct EntStore {
     /// that is prose; with it, a test fails the day a read quietly re-enters the
     /// store.
     read_locks: std::sync::atomic::AtomicU64,
-    /// The node substrate, **shared with every fork of this store** (G-6): all
-    /// branches live in one granfilade with their roots namespaced by branch, so
-    /// a durable fork shares nodes with its ancestor instead of copying them.
-    gran: Option<Arc<Granfilade>>,
+    /// What this branch shares with every other branch of its world (G-6): one
+    /// granfilade and one root, so a durable fork shares nodes with its ancestor
+    /// instead of copying them.
+    family: Arc<Family>,
     /// This store's branch in the fulltrace's DagWood.
     branch: BranchId,
-    /// The branch DAG shared with every fork of this store (Xanadu's `DagWood` /
-    /// fulltrace branch structure) — see [`crate::dag`].
-    dag: Arc<Mutex<Dag>>,
 }
 
+/// **One branch's whole state** — the value the branch enfilade holds for it,
+/// and what the store mutates under its edition lock.
+#[derive(Clone)]
 struct Inner {
     current: u64,
     watermark: u64,
@@ -282,6 +352,34 @@ struct Inner {
     /// routed to it, so an interval reaching back past it must widen to the
     /// relation-wide answer rather than read an empty fired-set as "no change".
     registered: Tree<u64, u64, Count>,
+}
+
+/// A branch's state persists as its clock and links to its trees. The canopy
+/// and its fired-set ride along, so an interest and the commits routed to it
+/// land in the same atomic root — a reopen sees both or neither.
+impl Persist for Inner {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.current.encode(e);
+        self.watermark.encode(e);
+        e.link(&self.rels);
+        e.link(&self.ctx);
+        self.canopy.encode(e);
+        e.link(&self.fired);
+        e.link(&self.interests);
+        e.link(&self.registered);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok(Inner {
+            current: u64::decode(d)?,
+            watermark: u64::decode(d)?,
+            rels: d.link()?,
+            ctx: d.link()?,
+            canopy: Canopy::decode(d)?,
+            fired: d.link()?,
+            interests: d.link()?,
+            registered: d.link()?,
+        })
+    }
 }
 
 impl Inner {
@@ -319,37 +417,50 @@ impl Default for EntStore {
 impl EntStore {
     /// A pure in-memory ent store (no durability).
     pub fn new() -> EntStore {
-        EntStore {
-            inner: Mutex::new(Inner::empty()),
+        let family = Family {
+            gran: None,
+            root: Mutex::new(EntRoot::empty()),
             dur: Mutex::new(Durable::default()),
             flushed: Condvar::new(),
-            read_locks: std::sync::atomic::AtomicU64::new(0),
-            gran: None,
-            branch: Dag::ROOT,
-            dag: Arc::new(Mutex::new(Dag::new())),
-        }
+        };
+        EntStore::on(Arc::new(family), Dag::ROOT, Inner::empty())
     }
 
-    /// Open (or create) a durable ent store on a granfilade at `path`, rebuilding
-    /// its state from the persisted enfilades.
+    /// Open (or create) a durable ent store on a granfilade at `path`.
+    ///
+    /// This reads the root record and the few frames above the root branch's
+    /// state; every relation, version and log beneath it stays on disk until a
+    /// read reaches it. Opening a world costs the same however large it is.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<EntStore> {
+        Self::open_branch(path, Dag::ROOT)
+    }
+
+    /// Reopen a specific branch of a granfilade — the durable counterpart of
+    /// [`fork_at`](Self::fork_at). [`open`](Self::open) is this at
+    /// [`Dag::ROOT`]. The granfilade must not already be open: use
+    /// [`branch`](Self::branch) when it is.
+    pub fn open_branch(path: impl AsRef<std::path::Path>, branch: BranchId) -> Result<EntStore> {
         let gran = Granfilade::open(path)?;
-        let inner = Inner::rebuild(&gran, Dag::ROOT)?;
-        // The branch graph is durable too: a reopened store that forgot its
-        // forks would have forgotten its history.
-        let dag = gran
-            .meta_get(DAG_KEY)?
-            .and_then(|b| Dag::decode(&b))
-            .unwrap_or_else(Dag::new);
-        Ok(EntStore {
-            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
+        let root = EntRoot::load(&gran)?;
+        let inner = root.state(branch)?;
+        let family = Family {
+            gran: Some(gran),
+            root: Mutex::new(root),
+            dur: Mutex::new(Durable::default()),
             flushed: Condvar::new(),
-            read_locks: std::sync::atomic::AtomicU64::new(0),
+        };
+        Ok(EntStore::on(Arc::new(family), branch, inner))
+    }
+
+    /// A handle on `branch` of `family`, whose state is `inner`.
+    fn on(family: Arc<Family>, branch: BranchId, inner: Inner) -> EntStore {
+        family.dur.lock().unwrap().durable.insert(branch, inner.current);
+        EntStore {
             inner: Mutex::new(inner),
-            gran: Some(Arc::new(gran)),
-            branch: Dag::ROOT,
-            dag: Arc::new(Mutex::new(dag)),
-        })
+            read_locks: std::sync::atomic::AtomicU64::new(0),
+            family,
+            branch,
+        }
     }
 
     /// **WID range read (E2).** The rows of `rel` whose tuple key lies in
@@ -424,7 +535,14 @@ impl EntStore {
     /// counter, surfaced so tests can assert the commit path stays path-sized.
     /// `0` for an in-memory store.
     pub fn frames_encoded(&self) -> u64 {
-        self.gran.as_ref().map_or(0, |g| g.frames_encoded())
+        self.family.gran.as_ref().map_or(0, |g| g.frames_encoded())
+    }
+
+    /// Node frames read from disk since this store was opened — the paging ops
+    /// counter, surfaced so tests can assert that opening a world and reading a
+    /// little of it reads a little. `0` for an in-memory store.
+    pub fn frames_paged(&self) -> u64 {
+        self.family.gran.as_ref().map_or(0, |g| g.frames_paged())
     }
 
     /// **The durable frontier**: the highest edition proven on disk.
@@ -437,7 +555,10 @@ impl EntStore {
     /// take back. Group commit is the only reason the two can differ, and they
     /// differ only for the length of one `fsync`.
     pub fn durable_edition(&self) -> Edition {
-        Edition(self.dur.lock().unwrap().durable)
+        if self.family.gran.is_none() {
+            return self.current();
+        }
+        Edition(self.family.dur.lock().unwrap().durable.get(&self.branch).copied().unwrap_or(0))
     }
 
     /// Count one edition-lock acquisition on a pinned-edition read path.
@@ -457,14 +578,14 @@ impl EntStore {
     /// their durability cost rather than each paying it. `0` for an in-memory
     /// store.
     pub fn syncs(&self) -> u64 {
-        self.gran.as_ref().map_or(0, |g| g.syncs())
+        self.family.gran.as_ref().map_or(0, |g| g.syncs())
     }
 
     /// Distinct nodes currently stored in the granfilade — the on-disk size of
     /// the world in nodes, for measuring how history accumulates and what GC
     /// reclaims. `0` for an in-memory store.
     pub fn stored_nodes(&self) -> Result<usize> {
-        match &self.gran {
+        match &self.family.gran {
             Some(g) => g.node_count(),
             None => Ok(0),
         }
@@ -475,12 +596,11 @@ impl EntStore {
     /// `consolidate` truncates). Serialized with commits (holds the edition
     /// lock). A no-op in-memory. Returns the number of nodes collected.
     pub fn gc(&self) -> Result<usize> {
-        let _guard = self.inner.lock().unwrap();
-        // Reachability is computed from the roots *in meta*, so a staged commit
-        // whose roots have not landed yet must be flushed first — otherwise the
-        // sweep would be reasoning about a stale root set.
+        // Hold the root so no branch stages a new one mid-sweep, and land what
+        // is staged: reachability is computed from the root record on disk.
+        let _root = self.family.root.lock().unwrap();
         self.flush_pending()?;
-        match &self.gran {
+        match &self.family.gran {
             Some(g) => g.gc(),
             None => Ok(0),
         }
@@ -488,11 +608,13 @@ impl EntStore {
 
     /// **Structural-sharing fork (E3, made durable in G-6).** A new independent
     /// store whose state is this store's as-of `at`, **sharing every enfilade
-    /// node** with the parent — the versioned Fact roots are `Arc`-cloned in
-    /// memory and, on a durable store, the child's roots are written into the
-    /// *same granfilade* pointing at the *same node keys*. Forking is therefore
-    /// `O(#roots)` meta writes and **zero** node writes: the cheap virtual copy
-    /// at the heart of the Ent, where the LSM must copy `O(state)` bytes.
+    /// node** with the parent. Forking at the present shares the whole Rel
+    /// enfilade; forking into the past splits each relation's versions and log
+    /// at `at` (`O(log n)` new nodes apiece). Either way the child's state joins
+    /// the branch enfilade of the *same* root, so the only frames written are
+    /// the new spines of the DAG and branch enfilades and of any split — the
+    /// cheap virtual copy at the heart of the Ent, where the LSM must copy
+    /// `O(state)` bytes.
     ///
     /// The fork is a new branch in the shared DagWood, so ancestry stays
     /// queryable across the whole family, and it survives a reopen
@@ -502,63 +624,52 @@ impl EntStore {
         if at.0 < inner.watermark {
             return Err(door("fork_at", at.0, inner.watermark));
         }
-        // The child's roots name nodes the parent may only have staged. Land the
-        // parent's queue first so the fork is durable the moment it exists.
+        // Land the parent's queue first, so every node the child names is
+        // already durable and the fork encodes directory nodes only.
         self.flush_pending()?;
-        // Graft a new branch onto this store's branch at the fork edition in the
-        // shared DagWood; the child carries that id and the same registry, so
-        // ancestry is queryable across the whole fork family (the fulltrace).
-        let child_branch = self.dag.lock().unwrap().fork(self.branch, at.0);
-        // Keep each relation's versioned roots up to `at` (their trees are
-        // shared Arcs), and its log — whole when forking at current, else the
-        // prefix ≤ `at`.
-        let mut rels = RelTree::new();
-        for (rel, roots) in inner.rels.iter() {
-            // A persistent split: `O(log n)` new nodes, every root shared.
-            let (versions, _) = roots.versions.split(&(at.0 + 1));
-            let (log, _) = roots.log.split(&(at.0 + 1, 0));
-            if !versions.is_empty() || !log.is_empty() {
-                // Arrangements are derived from the primary order, so a fork
-                // rebuilds them on demand rather than carrying them.
-                rels = rels.insert(rel, RelRoots { versions, log, orders: OrderTree::new() });
+        let rels = if at.0 == inner.current {
+            // Forking at the present shares the whole Rel enfilade.
+            inner.rels.clone()
+        } else {
+            let mut rels = RelTree::new();
+            for (rel, roots) in inner.rels.iter() {
+                // A persistent split: `O(log n)` new nodes, every root shared.
+                let (versions, _) = roots.versions.split(&(at.0 + 1));
+                let (log, _) = roots.log.split(&(at.0 + 1, 0));
+                if !versions.is_empty() || !log.is_empty() {
+                    // Arrangements track the present; a fork into the past
+                    // rebuilds them on demand.
+                    rels = rels.insert(rel, RelRoots { versions, log, orders: OrderTree::new() });
+                }
             }
-        }
-        let child = EntStore {
-            dur: Mutex::new(Durable { durable: at.0, ..Durable::default() }),
-            flushed: Condvar::new(),
-            read_locks: std::sync::atomic::AtomicU64::new(0),
-            inner: Mutex::new(Inner {
-                current: at.0,
-                watermark: inner.watermark,
-                rels,
-                ctx: inner.ctx.clone(),
-                canopy: Canopy::new(),
-                fired: FiredTree::new(),
-                interests: Tree::new(),
-                registered: Tree::new(),
-            }),
-            gran: self.gran.clone(),
-            branch: child_branch,
-            dag: Arc::clone(&self.dag),
+            rels
         };
-        // Write the child's roots and its branch record. Every node they name is
-        // already durable and memoized, so `collect_tree` returns their keys
-        // without re-encoding anything: the fork writes roots, never nodes.
-        if let Some(gran) = &self.gran {
-            let child_inner = child.inner.lock().unwrap();
-            let rels: Vec<RelId> = child_inner.rel_ids();
-            child.persist(&child_inner, &rels, None)?;
-            child.persist_ctx(&child_inner)?;
-            gran.write(
-                Vec::new(),
-                vec![(DAG_KEY.to_vec(), self.dag.lock().unwrap().encode())],
-            )?;
-        }
-        Ok(child)
+        let child = Inner {
+            current: at.0,
+            watermark: inner.watermark,
+            rels,
+            ctx: inner.ctx.clone(),
+            canopy: Canopy::new(),
+            fired: FiredTree::new(),
+            interests: Tree::new(),
+            registered: Tree::new(),
+        };
+        // Graft a new branch onto this one at the fork edition in the shared
+        // DagWood and stage its state, under one root lock so no root record
+        // ever names the branch without its state.
+        let (branch, seq) = {
+            let mut root = self.family.root.lock().unwrap();
+            let branch = root.dag.fork(self.branch, at.0);
+            let seq = self.stage_in(&mut root, branch, &child)?;
+            (branch, seq)
+        };
+        drop(inner);
+        self.await_durable(seq)?;
+        Ok(EntStore::on(Arc::clone(&self.family), branch, child))
     }
 
-    /// A handle on another **branch of this same store**, sharing its granfilade
-    /// and DagWood.
+    /// A handle on another **branch of this same world**, sharing its
+    /// granfilade and root.
     ///
     /// Prefer this over [`open_branch`](Self::open_branch) whenever the parent is
     /// still live: a granfilade takes an exclusive lock on its directory, so two
@@ -566,44 +677,8 @@ impl EntStore {
     /// opens of the same path. That is the same constraint that makes all
     /// branches sharing one node store the right design in the first place.
     pub fn branch(&self, branch: BranchId) -> Result<EntStore> {
-        if self.dag.lock().unwrap().get(branch).is_none() {
-            return Err(Error::Store(format!("unknown branch {branch}")));
-        }
-        let inner = match &self.gran {
-            Some(gran) => Inner::rebuild(gran, branch)?,
-            None => return Err(Error::Store("in-memory store has no persisted branches".into())),
-        };
-        Ok(EntStore {
-            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
-            flushed: Condvar::new(),
-            read_locks: std::sync::atomic::AtomicU64::new(0),
-            inner: Mutex::new(inner),
-            gran: self.gran.clone(),
-            branch,
-            dag: Arc::clone(&self.dag),
-        })
-    }
-
-    /// Reopen a specific branch of a granfilade — the durable counterpart of
-    /// [`fork_at`](Self::fork_at). [`open`](Self::open) is this at
-    /// [`Dag::ROOT`]. The parent must not be open: use
-    /// [`branch`](Self::branch) when it is.
-    pub fn open_branch(path: impl AsRef<std::path::Path>, branch: BranchId) -> Result<EntStore> {
-        let gran = Granfilade::open(path)?;
-        let inner = Inner::rebuild(&gran, branch)?;
-        let dag = gran
-            .meta_get(DAG_KEY)?
-            .and_then(|b| Dag::decode(&b))
-            .unwrap_or_else(Dag::new);
-        Ok(EntStore {
-            dur: Mutex::new(Durable { durable: inner.current, ..Durable::default() }),
-            flushed: Condvar::new(),
-            read_locks: std::sync::atomic::AtomicU64::new(0),
-            inner: Mutex::new(inner),
-            gran: Some(Arc::new(gran)),
-            branch,
-            dag: Arc::new(Mutex::new(dag)),
-        })
+        let inner = self.family.root.lock().unwrap().state(branch)?;
+        Ok(EntStore::on(Arc::clone(&self.family), branch, inner))
     }
 
     /// This store's branch in the fulltrace's DagWood ([`Dag::ROOT`] unless it is
@@ -615,7 +690,7 @@ impl EntStore {
     /// A snapshot of the branch DAG shared with this store's fork family — the
     /// fulltrace's branch structure (Xanadu's `DagWood`).
     pub fn dag(&self) -> Dag {
-        self.dag.lock().unwrap().clone()
+        self.family.root.lock().unwrap().dag.clone()
     }
 
     /// **Backfollow across branches (E3).** Does this store's current point
@@ -624,29 +699,23 @@ impl EntStore {
     /// whole family; two stores that never shared a fork return `false` (disjoint
     /// DagWoods). Reflexive on the same branch (earlier editions are ancestors).
     pub fn descends_from(&self, ancestor: &EntStore, ancestor_at: Edition) -> bool {
-        if !Arc::ptr_eq(&self.dag, &ancestor.dag) {
+        if !Arc::ptr_eq(&self.family, &ancestor.family) {
             return false;
         }
         let here = self.inner.lock().unwrap().current;
-        self.dag
-            .lock()
-            .unwrap()
-            .is_ancestor(ancestor.branch, ancestor_at.0, self.branch, here)
+        self.dag().is_ancestor(ancestor.branch, ancestor_at.0, self.branch, here)
     }
 
     /// The merge base of this store and `other` in the shared DagWood — the latest
     /// `(branch, edition)` their histories both descend from, or `None` if they
     /// belong to disjoint DagWoods.
     pub fn common_ancestor_with(&self, other: &EntStore) -> Option<(BranchId, u64)> {
-        if !Arc::ptr_eq(&self.dag, &other.dag) {
+        if !Arc::ptr_eq(&self.family, &other.family) {
             return None;
         }
         let here = self.inner.lock().unwrap().current;
         let there = other.inner.lock().unwrap().current;
-        self.dag
-            .lock()
-            .unwrap()
-            .common_ancestor(self.branch, here, other.branch, there)
+        self.dag().common_ancestor(self.branch, here, other.branch, there)
     }
 
     /// **DSP template instancing (E6): a virtual copy.** Copy every fact of
@@ -682,7 +751,7 @@ impl EntStore {
         let mut rels = rels.to_vec();
         rels.sort();
         rels.dedup();
-        let e = {
+        let seq = {
             let mut inner = self.inner.lock().unwrap();
             let at = inner.current;
             let mut grafts = Vec::new();
@@ -700,162 +769,74 @@ impl EntStore {
                 })?;
                 grafts.push((rel, grafted));
             }
-            let e = at + 1;
-            inner.apply_grafts(e, &grafts, &tlo, &thi);
-            let touched: Vec<RelId> = grafts.iter().map(|(rel, _)| *rel).collect();
-            self.stage_commit(&inner, &touched, e)?;
-            e
+            inner.apply_grafts(at + 1, &grafts, &tlo, &thi);
+            (self.stage(&inner)?, at + 1)
         };
-        self.await_durable(e)?;
-        Ok(Edition(e))
+        self.await_durable(seq.0)?;
+        Ok(Edition(seq.1))
     }
 
-    /// Persist the context enfilade (catalog, schemas, scoped bindings) as one
-    /// atomic granfilade write. A no-op for an in-memory store.
+    /// Stage this branch's state: put it in the branch enfilade and, on a
+    /// durable store, encode the new root record and queue it for the group.
+    /// Returns the staging sequence number to [await](Self::await_durable).
     ///
-    /// Kept separate from [`persist`](Self::persist) because context is written
-    /// on its own occasions — `register`, `put_schema` — not on the commit path,
-    /// and it is exempt from consolidation: the catalog is append-only for the
-    /// life of the world.
-    fn persist_ctx(&self, inner: &Inner) -> Result<()> {
-        let gran = match &self.gran {
-            Some(g) => g,
-            None => return Ok(()),
-        };
-        // A schema version is keyed by the edition it took effect, so it must not
-        // reach disk ahead of that edition's own staged write; drain first.
-        self.flush_pending()?;
-        let (ck, nodes) = gran.collect_tree(&inner.ctx);
-        gran.write(nodes, vec![(ctx_key(self.branch), opt_ck_bytes(ck))])
+    /// **Called under the edition lock**, so a branch's stages queue in edition
+    /// order; the root lock orders them against every other branch's.
+    fn stage(&self, inner: &Inner) -> Result<Option<u64>> {
+        let mut root = self.family.root.lock().unwrap();
+        self.stage_in(&mut root, self.branch, inner)
     }
 
-    /// Persist the clock plus the touched relations' Edition enfilades (roots +
-    /// nodes) in one atomic granfilade write, **immediately**. A no-op for an
-    /// in-memory store.
+    /// [`stage`](Self::stage) for `branch`, with the root already locked.
     ///
-    /// This is the un-grouped path, for the occasions that must land on their own:
-    /// a fork's roots, consolidation's whole-history rewrite, the context
-    /// enfilade. The commit path instead [`stage`](Self::stage)s and lets a group
-    /// share one fsync.
-    fn persist(&self, inner: &Inner, touched: &[RelId], drop_below: Option<u64>) -> Result<()> {
-        match self.stage(inner, touched, drop_below)? {
-            Some(staged) => self.gran.as_ref().unwrap().write_group(vec![staged]),
-            None => Ok(()),
-        }
-    }
-
-    /// Encode this commit's durable work without writing it: the node frames for
-    /// the touched relations' enfilades, plus the meta entries naming their roots
-    /// and the clock. `None` for an in-memory store.
-    ///
-    /// Pure with respect to the store (it only reads the immutable trees), which
-    /// is what lets the commit path do this inside the edition lock and the
-    /// `fsync` outside it.
-    fn stage(
-        &self,
-        inner: &Inner,
-        touched: &[RelId],
-        drop_below: Option<u64>,
-    ) -> Result<Option<StagedWrite>> {
-        // Consolidation is the only occasion that rewrites existing roots.
-        let write_all_versions = drop_below.is_some();
-        let gran = match &self.gran {
-            Some(g) => g,
-            None => return Ok(None),
-        };
-        let mut nodes = Vec::new();
-        let mut meta = vec![
-            (cur_key(self.branch), inner.current.to_be_bytes().to_vec()),
-            (wm_key(self.branch), inner.watermark.to_be_bytes().to_vec()),
-        ];
-        let mut drop_meta = Vec::new();
-        for rel in touched {
-            // The Edition enfilade (the raw commit-order log).
-            let log = inner.log_of(*rel).cloned().unwrap_or_default();
-            let (ck, ns) = gran.collect_tree(&log);
-            nodes.extend(ns);
-            meta.push((log_key(self.branch, *rel), opt_ck_bytes(ck)));
-
-            // **The Fact enfilade, versioned by edition (G-2).** Every live
-            // as-of root is persisted, so `open` is a root lookup rather than a
-            // replay of the log — the Fact enfilade is durable state in its own
-            // right, not an index derived from a log underneath it.
-            //
-            // Only the version this commit *created* is written. An older
-            // version's root is immutable — a later commit inserts a new root
-            // beside it and never edits it — so rewriting them all would be
-            // `O(live editions)` meta writes per commit, making N commits into an
-            // unconsolidated world `O(N²)`. (Measured before this was fixed: a
-            // commit cost 774µs at history depth 0 and 20.3ms at depth 4000.)
-            // `write_all_versions` is for consolidation, which *does* replace the
-            // checkpoint and retire the roots below it.
-            if let Some(roots) = inner.roots(*rel) {
-                let versions: Vec<(u64, FactTree)> = if write_all_versions {
-                    roots.versions.iter().map(|(e, t)| (e, t.clone())).collect()
-                } else {
-                    roots
-                        .versions
-                        .last_le(&inner.current)
-                        .map(|(e, t)| vec![(e, t.clone())])
-                        .unwrap_or_default()
-                };
-                for (edition, tree) in versions {
-                    let (ck, ns) = gran.collect_tree(&tree);
-                    nodes.extend(ns);
-                    meta.push((fact_key(self.branch, *rel, edition), opt_ck_bytes(ck)));
-                }
-            }
-        }
-        // Consolidation retires every Fact root below the new watermark, in the
-        // same batch as the checkpoint that replaces them: a crash leaves the
-        // old horizon or the new one, never a half-cut history.
-        if let Some(wm) = drop_below {
-            for (key, _) in gran.meta_prefix(&branch_key(b"fact:", self.branch))? {
-                if fact_edition(&key).is_some_and(|e| e < wm) {
-                    drop_meta.push(key);
-                }
-            }
-        }
-        Ok(Some(StagedWrite { nodes, meta, drop_meta }))
+    /// Encoding is pure with respect to the store (it only reads immutable
+    /// trees), and it is path-sized: every subtree a previous stage wrote is
+    /// memoized and durable, so only the copied spines — the edited Fact and
+    /// log paths, the directories above them, this branch's entry in the
+    /// branch enfilade — are serialized.
+    fn stage_in(&self, root: &mut MutexGuard<'_, EntRoot>, branch: BranchId, inner: &Inner) -> Result<Option<u64>> {
+        root.branches = root.branches.insert(branch, inner.clone());
+        let Some(gran) = &self.family.gran else { return Ok(None) };
+        let (dag, mut nodes) = gran.collect_tree(root.dag.tree());
+        let (branches, more) = gran.collect_tree(&root.branches);
+        nodes.extend(more);
+        let mut d = self.family.dur.lock().unwrap();
+        d.staged += 1;
+        let seq = d.staged;
+        d.pending.push_back(Pending {
+            seq,
+            branch,
+            edition: inner.current,
+            write: StagedWrite { nodes, root: vec![dag, branches] },
+        });
+        Ok(Some(seq))
     }
 
     // -----------------------------------------------------------------------
     // Group commit
     // -----------------------------------------------------------------------
 
-    /// Encode `e`'s durable work and queue it for the group. **Called under the
-    /// edition lock**, which is what keeps `pending` in edition order — a batch
-    /// applied out of order would durably record a stale clock.
-    ///
-    /// An in-memory store has nothing to make durable, so its clock advances
-    /// here and the whole group machinery is bypassed.
-    fn stage_commit(&self, inner: &Inner, touched: &[RelId], e: u64) -> Result<()> {
-        let staged = self.stage(inner, touched, None)?;
-        let mut d = self.dur.lock().unwrap();
-        match staged {
-            Some(staged) => d.pending.push_back((e, staged)),
-            None => d.durable = d.durable.max(e),
+    /// Wait until stage `seq` is durable, joining or leading a group along the
+    /// way. **Must not be called holding the edition lock** on the commit path
+    /// — that is the serialization this exists to remove. `None` (an in-memory
+    /// store) returns at once.
+    fn await_durable(&self, seq: Option<u64>) -> Result<()> {
+        match seq {
+            Some(s) => self.drive_durability(Some(s)),
+            None => Ok(()),
         }
-        Ok(())
-    }
-
-    /// Wait until edition `target` is durable, joining or leading a group along
-    /// the way. **Must not be called holding the edition lock** on the commit
-    /// path — that is the serialization this exists to remove.
-    fn await_durable(&self, target: u64) -> Result<()> {
-        self.drive_durability(Some(target))
     }
 
     /// Drive every staged edition to disk and return once nothing is pending.
     ///
-    /// Safe to call while holding the edition lock: the flush touches only the
-    /// granfilade and the durability queue, never `Inner`. Nothing ever takes the
-    /// edition lock while holding the durability lock, so the order is total.
+    /// Safe to call while holding the edition or root lock: the flush touches
+    /// only the granfilade and the durability queue. Locks are always taken in
+    /// the order edition → root → durability, so the order is total.
     fn flush_pending(&self) -> Result<()> {
         self.drive_durability(None)
     }
 
-    /// The group-commit loop. `Some(e)` waits for edition `e` to be durable;
+    /// The group-commit loop. `Some(s)` waits for stage `s` to be durable;
     /// `None` waits for the queue to drain.
     ///
     /// A thread either **leads** — takes everything staged so far, writes it as
@@ -865,17 +846,18 @@ impl EntStore {
     /// latency when there is no contention (a lone committer simply leads its own
     /// group of one, exactly as before).
     fn drive_durability(&self, target: Option<u64>) -> Result<()> {
-        let gran = match &self.gran {
+        let fam = &*self.family;
+        let gran = match &fam.gran {
             Some(g) => g,
             None => return Ok(()),
         };
-        let mut d = self.dur.lock().unwrap();
+        let mut d = fam.dur.lock().unwrap();
         loop {
             if let Some(msg) = d.doom(target) {
                 return Err(Error::Store(msg));
             }
             let done = match target {
-                Some(e) => d.durable >= e,
+                Some(s) => d.landed >= s,
                 None => d.pending.is_empty() && !d.writing,
             };
             if done {
@@ -884,37 +866,44 @@ impl EntStore {
             if d.writing {
                 // Someone else is inside the fsync; our edition may be in their
                 // group. Wait for it to land and re-check.
-                d = self.flushed.wait(d).unwrap();
+                d = fam.flushed.wait(d).unwrap();
                 continue;
             }
             // Lead: take the whole queue. Later stages arriving mid-write simply
             // form the next group.
-            let group: Vec<(u64, StagedWrite)> = d.pending.drain(..).collect();
-            let Some(hi) = group.last().map(|(e, _)| *e) else {
+            let group: Vec<Pending> = d.pending.drain(..).collect();
+            let Some(hi) = group.last().map(|p| p.seq) else {
                 return Err(Error::Store(format!(
-                    "group commit: edition {target:?} is neither pending nor durable \
-                     (durable={})",
-                    d.durable
+                    "group commit: stage {target:?} is neither pending nor durable \
+                     (landed={})",
+                    d.landed
                 )));
             };
+            let editions: Vec<(BranchId, u64)> = group.iter().map(|p| (p.branch, p.edition)).collect();
             d.writing = true;
             drop(d);
 
-            let res = gran.write_group(group.into_iter().map(|(_, s)| s).collect());
+            let res = gran.write_group(group.into_iter().map(|p| p.write).collect());
 
-            d = self.dur.lock().unwrap();
+            d = fam.dur.lock().unwrap();
             d.writing = false;
             match res {
-                Ok(()) => d.durable = d.durable.max(hi),
+                Ok(()) => {
+                    d.landed = d.landed.max(hi);
+                    for (branch, edition) in editions {
+                        let e = d.durable.entry(branch).or_insert(0);
+                        *e = (*e).max(edition);
+                    }
+                }
                 Err(err) => {
                     // The group is gone from `pending` and never reached disk.
                     // Record it so its members error instead of waiting forever.
                     d.failure = Some((hi, format!("{err:?}")));
-                    self.flushed.notify_all();
+                    fam.flushed.notify_all();
                     return Err(err);
                 }
             }
-            self.flushed.notify_all();
+            fam.flushed.notify_all();
         }
     }
 }
@@ -931,49 +920,6 @@ impl Inner {
             interests: Tree::new(),
             registered: Tree::new(),
         }
-    }
-
-    /// Rebuild in-memory state from a granfilade: the clock, then each
-    /// relation's persisted Edition-log root and its **versioned Fact roots**.
-    ///
-    /// This is a root lookup per relation-version — no fold, no replay. Before
-    /// G-2 the Fact enfilade was not persisted at all: `open` loaded a
-    /// watermark checkpoint and replayed the whole log tail back through
-    /// `fold_fact`, which is checkpoint-and-replay recovery — the LSM shape the
-    /// mandate rules out from underneath the Ent.
-    fn rebuild(gran: &Granfilade, branch: BranchId) -> Result<Inner> {
-        let current = gran.meta_get(&cur_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
-        let watermark = gran.meta_get(&wm_key(branch))?.map(|b| u64_be(&b)).unwrap_or(0);
-        let ctx: ContextEnf = gran.load(bytes_opt_ck(&gran.meta_get(&ctx_key(branch))?.unwrap_or_default()))?;
-        let mut inner = Inner {
-            current,
-            watermark,
-            rels: RelTree::new(),
-            ctx,
-            // The canopy indexes *live* interests, so it is rebuilt as watchers
-            // ask again after a reopen rather than persisted with stale ones.
-            canopy: Canopy::new(),
-            fired: FiredTree::new(),
-            interests: Tree::new(),
-            registered: Tree::new(),
-        };
-
-        for (key, val) in gran.meta_prefix(&branch_key(b"fact:", branch))? {
-            let rel = rel_from_key(&key, b"fact:");
-            let edition = fact_edition(&key)
-                .ok_or_else(|| Error::Codec("granfilade: malformed fact root key".into()))?;
-            let tree: FactTree = gran.load(bytes_opt_ck(&val))?;
-            let mut roots = inner.roots(rel).cloned().unwrap_or_default();
-            roots.versions = roots.versions.insert(edition, tree);
-            inner.put(rel, roots);
-        }
-        for (key, val) in gran.meta_prefix(&branch_key(b"log:", branch))? {
-            let rel = rel_from_key(&key, b"log:");
-            let mut roots = inner.roots(rel).cloned().unwrap_or_default();
-            roots.log = gran.load(bytes_opt_ck(&val))?;
-            inner.put(rel, roots);
-        }
-        Ok(inner)
     }
 
     /// Fold one update into the Fact enfilade at edition `e`: build a fresh root
@@ -1137,19 +1083,18 @@ impl EditionStore for EntStore {
 
 impl TraceStore for EntStore {
     fn commit(&self, updates: &[(RelId, Tuple, Diff)]) -> Result<Edition> {
-        let e = {
+        let (seq, e) = {
             // The short critical section: allocate the edition, apply in memory,
             // encode. No `fsync` is held here, so the next committer may enter as
             // soon as this one's work is staged.
             let mut inner = self.inner.lock().unwrap();
             let e = inner.current + 1;
             inner.apply(e, updates);
-            self.stage_commit(&inner, &touched(updates), e)?;
-            e
+            (self.stage(&inner)?, e)
         };
         // Durability, shared with everyone else staged behind us. Returning only
         // once `e` is durable is what makes the returned edition safe to act on.
-        self.await_durable(e)?;
+        self.await_durable(seq)?;
         Ok(Edition(e))
     }
 
@@ -1158,7 +1103,7 @@ impl TraceStore for EntStore {
         preconditions: &[(RelId, Tuple)],
         updates: &[(RelId, Tuple, Diff)],
     ) -> Result<Option<Edition>> {
-        let e = {
+        let (seq, e) = {
             let mut inner = self.inner.lock().unwrap();
             // Preconditions are checked against the *allocated* state, not the
             // durable one: two committers in the same group must still serialize
@@ -1170,10 +1115,9 @@ impl TraceStore for EntStore {
             }
             let e = inner.current + 1;
             inner.apply(e, updates);
-            self.stage_commit(&inner, &touched(updates), e)?;
-            e
+            (self.stage(&inner)?, e)
         };
-        self.await_durable(e)?;
+        self.await_durable(seq)?;
         Ok(Some(Edition(e)))
     }
 
@@ -1256,8 +1200,10 @@ impl TraceStore for EntStore {
     ///
     /// The Arrangement is built on first use for that column and maintained by
     /// every later commit, so a query that never asks about a column never pays
-    /// for one. It is *derived* state — the primary order is the truth — so it is
-    /// rebuilt on demand after a reopen rather than persisted.
+    /// for one. It is *derived* state — the primary order is the truth — but it
+    /// lives in the relation's roots like everything else, so once a commit has
+    /// written it, it survives a reopen. A graft or a fork into the past drops
+    /// it, to be rebuilt on demand.
     fn read_range_on(
         &self,
         rel: RelId,
@@ -1391,13 +1337,6 @@ impl TraceStore for EntStore {
 
     fn consolidate(&self, up_to: Edition) -> Result<Edition> {
         let mut inner = self.inner.lock().unwrap();
-        // Consolidation is the one occasion that *replaces* existing roots and
-        // retires the ones below the new watermark. A staged commit still in the
-        // queue would land afterwards and re-insert a root this pass just retired,
-        // so drain the queue first. Holding the edition lock across the flush is
-        // safe (the flush never takes it) and keeps new commits from staging
-        // behind our back.
-        self.flush_pending()?;
         let new_wm = up_to.0.min(inner.current);
         if new_wm <= inner.watermark {
             return Ok(Edition(inner.watermark));
@@ -1415,10 +1354,12 @@ impl TraceStore for EntStore {
             inner.put(rel, RelRoots { versions, log, orders: OrderTree::new() });
         }
         inner.watermark = new_wm;
-        // Every rel's Fact versions and log tail changed — persist all, and
-        // retire the roots below the new watermark in the same batch.
-        let all_rels: Vec<RelId> = inner.rel_ids();
-        self.persist(&inner, &all_rels, Some(new_wm))?;
+        // The retired versions simply leave the Version enfilades; the root
+        // record that no longer names them lands atomically, and GC reclaims
+        // their nodes.
+        let seq = self.stage(&inner)?;
+        drop(inner);
+        self.await_durable(seq)?;
         Ok(Edition(new_wm))
     }
 }
@@ -1446,7 +1387,9 @@ impl Catalog for EntStore {
             return Ok(());
         }
         inner.ctx = inner.ctx.insert(key, Value::Int(id.0 as i64));
-        self.persist_ctx(&inner)
+        let seq = self.stage(&inner)?;
+        drop(inner);
+        self.await_durable(seq)
     }
 
     fn entries(&self) -> Result<Vec<(String, RelId)>> {
@@ -1493,7 +1436,9 @@ impl SchemaCatalog for EntStore {
         }
         let bytes = wire::encode_schema(schema);
         inner.ctx = inner.ctx.insert(context::schema_key(rel, at.0), Value::Bytes(bytes.into()));
-        self.persist_ctx(&inner)
+        let seq = self.stage(&inner)?;
+        drop(inner);
+        self.await_durable(seq)
     }
 
     fn schema(&self, rel: RelId) -> Result<Option<Schema>> {
@@ -1551,90 +1496,6 @@ fn latest_schema(ctx: &ContextEnf, rel: RelId) -> Result<Option<(u64, Schema)>> 
             Ok(Some((edition, decode_schema_value(v)?)))
         }
     }
-}
-
-fn touched(updates: &[(RelId, Tuple, Diff)]) -> Vec<RelId> {
-    let mut rels: Vec<RelId> = updates.iter().map(|(r, _, _)| *r).collect();
-    rels.sort();
-    rels.dedup();
-    rels
-}
-
-/// The meta key holding the serialized branch graph (the fulltrace's DagWood).
-const DAG_KEY: &[u8] = b"dag";
-
-/// Meta keys are **namespaced by branch** (G-6), so every branch's roots live in
-/// one granfilade and a fork shares nodes with its ancestor rather than copying
-/// them. GC prefix-scans `log:`/`fact:`/`ctx:` and therefore roots from every
-/// live branch automatically.
-fn branch_key(prefix: &[u8], branch: BranchId) -> Vec<u8> {
-    let mut k = prefix.to_vec();
-    k.extend_from_slice(&branch.to_be_bytes());
-    k
-}
-
-/// `ctx:{branch}` — the context enfilade root (catalog + schemas + bindings).
-fn ctx_key(branch: BranchId) -> Vec<u8> {
-    branch_key(b"ctx:", branch)
-}
-
-/// `cur:{branch}` / `wm:{branch}` — this branch's clock and watermark.
-fn cur_key(branch: BranchId) -> Vec<u8> {
-    branch_key(b"cur:", branch)
-}
-
-fn wm_key(branch: BranchId) -> Vec<u8> {
-    branch_key(b"wm:", branch)
-}
-
-/// `log:{branch}{rel}` — the Edition enfilade root.
-fn log_key(branch: BranchId, rel: RelId) -> Vec<u8> {
-    let mut k = branch_key(b"log:", branch);
-    k.extend_from_slice(&rel.0.to_be_bytes());
-    k
-}
-
-/// `fact:{branch}{rel}{edition}` — one Fact root per live as-of edition.
-fn fact_key(branch: BranchId, rel: RelId, edition: u64) -> Vec<u8> {
-    let mut k = branch_key(b"fact:", branch);
-    k.extend_from_slice(&rel.0.to_be_bytes());
-    k.extend_from_slice(&edition.to_be_bytes());
-    k
-}
-
-/// The edition a `fact:` key names.
-fn fact_edition(key: &[u8]) -> Option<u64> {
-    let start = b"fact:".len() + 8 + 4;
-    key.get(start..start + 8).map(u64_be)
-}
-
-/// The relation a branch-namespaced key names (`prefix || branch || rel || …`).
-fn rel_from_key(key: &[u8], prefix: &[u8]) -> RelId {
-    let at = prefix.len() + 8;
-    let b = &key[at..at + 4];
-    RelId(u32::from_be_bytes(b.try_into().unwrap()))
-}
-
-fn opt_ck_bytes(ck: Option<ContentKey>) -> Vec<u8> {
-    match ck {
-        None => vec![0],
-        Some(c) => {
-            let mut v = vec![1];
-            v.extend_from_slice(&c);
-            v
-        }
-    }
-}
-
-fn bytes_opt_ck(bytes: &[u8]) -> Option<ContentKey> {
-    match bytes.first() {
-        Some(1) => bytes.get(1..1 + std::mem::size_of::<ContentKey>()).map(|b| b.try_into().unwrap()),
-        _ => None,
-    }
-}
-
-fn u64_be(b: &[u8]) -> u64 {
-    u64::from_be_bytes(b[..8].try_into().unwrap())
 }
 
 fn door(op: &str, at: u64, watermark: u64) -> Error {

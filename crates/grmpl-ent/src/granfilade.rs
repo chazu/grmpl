@@ -13,181 +13,362 @@
 //! (plan v5 §G-2b, settled: identity is logical, witnessed by `iter` /
 //! `scan_updates`, exactly as `tree.rs` and `DESIGN.md` already had it).
 //!
+//! **One root, everything beneath it.** The granfilade has a single mutable
+//! slot, the **root record** (Gold's turtle): a short list of content keys. Every
+//! other durable thing — every relation's versions and log, the directories that
+//! name them, the branch DAG, the canopy — is a tree reachable from it, because a
+//! leaf may hold **links** to other trees ([`Enc::link`]). A link is a content
+//! key plus the linked tree's dsp, size and measure, and the key rides in the
+//! frame's reference run beside an internal node's children, so GC follows a
+//! link exactly as it follows a child.
+//!
+//! **Demand paging.** A load reads one frame. An internal node's frame records
+//! each child's size and measure as well as its key and dsp, so its children
+//! come back as **paged** nodes ([`Tree::paged`]): counted, measured and
+//! comparable by key, with their contents still on disk until a read reaches
+//! them. Opening a store reads the root record and a handful of frames,
+//! whatever the size of the world. Every paged node handed out is remembered
+//! weakly, and GC treats the ones still unread as roots — their frames are the
+//! only copy of what they hold.
+//!
 //! **Path-only, in work as well as in bytes (G-1).** A commit adds only the
 //! `O(log n)` new nodes on the edited path, *and* only visits them: each node
 //! memoizes its content key ([`Tree::ck_cell`]), and a node whose key is both
 //! memoized and already durable here is returned without being re-serialized —
 //! and so are all its descendants, since a node's key closes over its children's.
-//! Previously the *traversal* was `O(n)` per commit even though the growth was
-//! path-sized.
+//! A paged node is both by construction, so persisting never pages anything in.
 //!
-//! The memo alone is not enough, which is the subtlety that had this deferred: a
-//! memoized key says "this is its key", not "it is on *this* disk". A fork
-//! clones nodes whose keys were memoized against its parent's granfilade, so
-//! each granfilade also tracks the keys it knows are durable, and a subtree is
-//! skipped only when both hold. (There is no pointer-ABA to worry about: nodes
-//! are immutable and `Arc`-held, so the key is a pure function of the node and
-//! caching it is plain memoization.)
+//! The memo alone is not enough: a memoized key says "this is its key", not "it
+//! is on *this* disk". So each granfilade also tracks the keys it knows are
+//! durable, and a subtree is skipped only when both hold.
 //!
-//! A load reconstructs the exact tree shape — and memoizes each key it read — so
-//! content keys round-trip and re-persisting a reloaded tree writes nothing.
 //! Values are serialized through the single `grmpl_core::wire` value codec
 //! ([`Persist`]).
 
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 use grmpl_core::{wire, Error, Result, Tuple, Value};
 
 use crate::dsp::Displace;
-use crate::measure::Measure;
-use crate::tree::{NodeRef, Tree};
+use crate::measure::{Count, Measure};
+use crate::tree::{NodeRef, Pager, Resident, Tree};
 
 pub use grmpl_core::hash::Sha256Digest as ContentKey;
 
 /// The width of a [`ContentKey`] on the wire.
 const CK_LEN: usize = 32;
 
-/// Node frames ride the one workspace format version. v5 added each internal
-/// node's child dsps; like v4 before it the cutover is fresh-store-only, so a v5
-/// binary rejects every older persisted node before interpreting its payload.
+/// Node frames ride the one workspace format version. v6 added links from
+/// leaves to other trees, each internal child's size and measure, and the
+/// single root record; like v4 and v5 before it the cutover is
+/// fresh-store-only, so a v6 binary rejects every older persisted node before
+/// interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
+
+/// The meta key of the root record — the granfilade's one mutable slot.
+const ROOT_KEY: &[u8] = b"root";
+
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
 
 /// A type that can be (de)serialized into a node frame. Payloads reuse the one
 /// `grmpl_core::wire` codec, so "one serialization" holds.
+///
+/// Encoding goes through an [`Enc`] and decoding through a [`Dec`] rather than
+/// a bare byte buffer because a value may be a whole tree: [`Enc::link`]
+/// persists it and records its key in the frame's reference run, and
+/// [`Dec::link`] hands it back paged.
 pub trait Persist: Sized {
-    fn encode(&self, out: &mut Vec<u8>);
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)>;
+    fn encode(&self, e: &mut Enc<'_, '_>);
+    fn decode(d: &mut Dec<'_>) -> Result<Self>;
 }
 
-impl Persist for i64 {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
+/// A key the granfilade can store: ordered, displaceable, and shareable across
+/// the threads a paged tree may be read from.
+pub trait PersistKey: Persist + Displace + Send + Sync + 'static {}
+impl<T: Persist + Displace + Send + Sync + 'static> PersistKey for T {}
+
+/// A value the granfilade can store.
+pub trait PersistVal: Persist + Clone + Send + Sync + 'static {}
+impl<T: Persist + Clone + Send + Sync + 'static> PersistVal for T {}
+
+/// A measure the granfilade can store. Internal frames record each child's
+/// measure, which is what lets a paged child answer a range measure without
+/// being read.
+pub trait PersistMeasure<K, V>: Measure<K, V> + Persist + Send + Sync + 'static {}
+impl<K, V, T: Measure<K, V> + Persist + Send + Sync + 'static> PersistMeasure<K, V> for T {}
+
+/// Where encoded frames collect during one [`Granfilade::collect_tree`].
+struct Sink<'g> {
+    gran: &'g Granfilade,
+    out: Vec<(ContentKey, Vec<u8>)>,
+}
+
+/// One node frame's payload under construction: its bytes, and the content keys
+/// it references (an internal node's children, a leaf's links), which become
+/// the frame's leading reference run.
+pub struct Enc<'s, 'g> {
+    buf: Vec<u8>,
+    refs: Vec<ContentKey>,
+    sink: &'s mut Sink<'g>,
+}
+
+impl Enc<'_, '_> {
+    /// Append raw bytes to the payload.
+    pub fn put(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let end = pos + 8;
-        let b = bytes.get(pos..end).ok_or_else(|| trunc("i64"))?;
-        Ok((i64::from_be_bytes(b.try_into().unwrap()), end))
+
+    /// The payload buffer, for codecs that write into a `Vec<u8>`.
+    pub fn buf(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Persist `tree` and link to it from this frame: its nodes join the write,
+    /// its content key joins the reference run (so GC follows it), and the
+    /// payload records its dsp, size and measure (so it reloads paged).
+    pub fn link<K, V, M>(&mut self, tree: &Tree<K, V, M>)
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        match collect_nodes(tree, self.sink) {
+            None => self.buf.push(0),
+            Some(ck) => {
+                self.buf.push(1);
+                self.refs.push(ck);
+                tree.dsp().encode(self);
+                (tree.len() as u64).encode(self);
+                tree.local_measure().expect("a non-empty tree has a measure").encode(self);
+            }
+        }
     }
 }
 
-impl Persist for u64 {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
+/// A node frame's payload being read: the bytes, a cursor, and the frame's
+/// reference run, consumed in order by [`link`](Self::link).
+pub struct Dec<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    refs: &'a [ContentKey],
+    next_ref: usize,
+    gran: &'a Arc<Granfilade>,
+}
+
+impl<'a> Dec<'a> {
+    /// The next `n` payload bytes.
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self.pos + n;
+        let b = self.bytes.get(self.pos..end).ok_or_else(|| trunc("payload"))?;
+        self.pos = end;
+        Ok(b)
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let end = pos + 8;
-        let b = bytes.get(pos..end).ok_or_else(|| trunc("u64"))?;
-        Ok((u64::from_be_bytes(b.try_into().unwrap()), end))
+
+    /// Decode with a `(bytes, pos) -> (value, pos)` codec such as
+    /// `wire::decode_tuple`.
+    pub fn with<T>(&mut self, f: impl FnOnce(&[u8], usize) -> Result<(T, usize)>) -> Result<T> {
+        let (v, pos) = f(self.bytes, self.pos)?;
+        self.pos = pos;
+        Ok(v)
+    }
+
+    fn next_ref(&mut self) -> Result<ContentKey> {
+        let ck = *self.refs.get(self.next_ref).ok_or_else(|| trunc("reference run"))?;
+        self.next_ref += 1;
+        Ok(ck)
+    }
+
+    /// A linked tree, paged: nothing beneath its root is read until used.
+    pub fn link<K, V, M>(&mut self) -> Result<Tree<K, V, M>>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        match self.take(1)?[0] {
+            0 => Ok(Tree::new()),
+            1 => {
+                let ck = self.next_ref()?;
+                let dsp = i64::decode(self)?;
+                let size = u64::decode(self)? as usize;
+                let measure = M::decode(self)?;
+                let pager = self.gran.pager::<K, V, M>();
+                Ok(self.gran.stub(ck, size, measure, &pager).relocate(dsp))
+            }
+            t => Err(Error::Codec(format!("granfilade: bad link flag {t}"))),
+        }
     }
 }
 
-impl Persist for u32 {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
-    }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let end = pos + 4;
-        let b = bytes.get(pos..end).ok_or_else(|| trunc("u32"))?;
-        Ok((u32::from_be_bytes(b.try_into().unwrap()), end))
+macro_rules! fixed_width {
+    ($($t:ty),*) => {$(
+        impl Persist for $t {
+            fn encode(&self, e: &mut Enc<'_, '_>) {
+                e.put(&self.to_be_bytes());
+            }
+            fn decode(d: &mut Dec<'_>) -> Result<Self> {
+                let b = d.take(std::mem::size_of::<$t>())?;
+                Ok(<$t>::from_be_bytes(b.try_into().unwrap()))
+            }
+        }
+    )*};
+}
+fixed_width!(i64, u64, u32);
+
+impl Persist for () {
+    fn encode(&self, _e: &mut Enc<'_, '_>) {}
+    fn decode(_d: &mut Dec<'_>) -> Result<Self> {
+        Ok(())
     }
 }
 
-impl<A: Persist, B: Persist, C: Persist> Persist for (A, B, C) {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.0.encode(out);
-        self.1.encode(out);
-        self.2.encode(out);
+impl<T: Persist> Persist for Option<T> {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        match self {
+            None => e.put(&[0]),
+            Some(v) => {
+                e.put(&[1]);
+                v.encode(e);
+            }
+        }
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let (a, pos) = A::decode(bytes, pos)?;
-        let (b, pos) = B::decode(bytes, pos)?;
-        let (c, pos) = C::decode(bytes, pos)?;
-        Ok(((a, b, c), pos))
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        match d.take(1)?[0] {
+            0 => Ok(None),
+            1 => Ok(Some(T::decode(d)?)),
+            t => Err(Error::Codec(format!("granfilade: bad option flag {t}"))),
+        }
     }
 }
 
 impl<A: Persist, B: Persist> Persist for (A, B) {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.0.encode(out);
-        self.1.encode(out);
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.0.encode(e);
+        self.1.encode(e);
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        let (a, pos) = A::decode(bytes, pos)?;
-        let (b, pos) = B::decode(bytes, pos)?;
-        Ok(((a, b), pos))
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok((A::decode(d)?, B::decode(d)?))
+    }
+}
+
+impl<A: Persist, B: Persist, C: Persist> Persist for (A, B, C) {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.0.encode(e);
+        self.1.encode(e);
+        self.2.encode(e);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok((A::decode(d)?, B::decode(d)?, C::decode(d)?))
     }
 }
 
 impl Persist for Tuple {
-    fn encode(&self, out: &mut Vec<u8>) {
-        wire::encode_tuple(self, out);
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        wire::encode_tuple(self, e.buf());
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        wire::decode_tuple(bytes, pos)
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        d.with(wire::decode_tuple)
     }
 }
 
 /// Also allow a bare `Value` payload (single-column keys, etc.).
 impl Persist for Value {
-    fn encode(&self, out: &mut Vec<u8>) {
-        wire::encode_value(self, out);
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        wire::encode_value(self, e.buf());
     }
-    fn decode(bytes: &[u8], pos: usize) -> Result<(Self, usize)> {
-        wire::decode_value(bytes, pos)
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        d.with(wire::decode_value)
     }
 }
 
-/// One commit's worth of durable work, **already encoded and hashed** but not
-/// yet written: the node frames it adds, the meta entries (enfilade roots, the
-/// clock) that name them, and any meta keys it retires.
+impl Persist for Count {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.0.encode(e);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok(Count(u64::decode(d)?))
+    }
+}
+
+/// A tree as a value is a **link**: see [`Enc::link`].
+impl<K, V, M> Persist for Tree<K, V, M>
+where
+    K: PersistKey,
+    V: PersistVal,
+    M: PersistMeasure<K, V>,
+{
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        e.link(self);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        d.link()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The store
+// ---------------------------------------------------------------------------
+
+/// One durable step, **already encoded and hashed** but not yet written: the
+/// node frames it adds and the root record that names them.
 ///
 /// Encoding is pure and needs only the immutable trees, so it happens inside the
-/// store's edition lock; the batch and its `fsync` happen outside, where a group
-/// of them can share one. Splitting the two is what [`write_group`] exists for.
+/// store's locks; the batch and its `fsync` happen outside, where a group of
+/// them can share one. Splitting the two is what [`write_group`] exists for.
 ///
 /// [`write_group`]: Granfilade::write_group
 pub struct StagedWrite {
     pub nodes: Vec<(ContentKey, Vec<u8>)>,
-    pub meta: Vec<(Vec<u8>, Vec<u8>)>,
-    pub drop_meta: Vec<Vec<u8>>,
+    pub root: Vec<Option<ContentKey>>,
 }
 
-/// The content-addressed node store for one or more enfilades, plus a small
-/// `meta` keyspace for enfilade roots and the edition clock.
+/// Weak handles on every paged node handed out, for GC.
+struct Remembered {
+    nodes: Vec<(ContentKey, Weak<dyn Resident>)>,
+    /// Prune when the list reaches this length, then double it, so pruning is
+    /// amortized `O(1)` per paged node.
+    prune_at: usize,
+}
+
+/// The content-addressed node store for the Ent, plus the one root record.
 pub struct Granfilade {
     db: Database,
     nodes: fjall::Keyspace,
     meta: fjall::Keyspace,
     /// **Keys known to be durable in *this* granfilade (G-1).** A memoized
-    /// content key on a node says "this is its key", not "it is on this disk" —
-    /// a fork clones nodes whose keys were memoized against the *parent's*
-    /// granfilade. Without this set, a commit would skip writing them and leave
-    /// a root pointing at a node that was never stored. Populated on every write
-    /// and every load.
+    /// content key on a node says "this is its key", not "it is on this disk".
+    /// Without this set, a commit could skip writing a node and leave a root
+    /// pointing at a frame that was never stored. Populated on every write, load
+    /// and page-in; GC removes what it sweeps.
     present: Mutex<HashSet<ContentKey>>,
+    /// Paged nodes still reachable from memory (see [`Resident`]).
+    remembered: Mutex<Remembered>,
     /// **Ops counter (G-0a).** Node frames serialized+hashed since this handle
     /// was opened. Sublinear claims about the commit path are otherwise only
     /// prose; this is what lets a test *fail* when an `O(log n)` walk quietly
-    /// becomes a scan. One relaxed atomic add per node, against a SHA-256 — not
-    /// measurable.
+    /// becomes a scan.
     encoded: AtomicU64,
     /// **Durability ops counter (group commit).** `SyncAll`s issued since this
     /// handle was opened.
-    ///
-    /// The same discipline as `encoded`, applied to what actually costs: every
-    /// axis of `docs/PERFORMANCE-ENT.md` bottoms out on this ~1 ms call. Without
-    /// a counter, "N committers now share one fsync" is prose; with it, a test
-    /// can *fail* when grouping silently stops happening and the write path
-    /// quietly returns to one fsync per committer.
     syncs: AtomicU64,
+    /// **Paging ops counter.** Node frames read from disk since this handle was
+    /// opened — what lets a test fail if `open` goes back to reading the world.
+    paged_in: AtomicU64,
 }
 
 impl Granfilade {
     /// Open (or create) a granfilade rooted at `path`.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Granfilade> {
+    ///
+    /// A store written before the root record existed is refused: its roots
+    /// live under keys this version does not read, so opening it would look
+    /// like an empty world.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Arc<Granfilade>> {
         let db = Database::builder(path.as_ref()).open().map_err(store_err)?;
         let nodes = db
             .keyspace("nodes", KeyspaceCreateOptions::default)
@@ -195,65 +376,51 @@ impl Granfilade {
         let meta = db
             .keyspace("meta", KeyspaceCreateOptions::default)
             .map_err(store_err)?;
-        Ok(Granfilade {
+        let gran = Granfilade {
             db,
             nodes,
             meta,
             present: Mutex::new(HashSet::new()),
+            remembered: Mutex::new(Remembered { nodes: Vec::new(), prune_at: 1024 }),
             encoded: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
-        })
-    }
-
-    /// Collect a tree's nodes as `(content_key, frame)` pairs (children first) and
-    /// its root key — pure, no I/O. The caller batches these with meta so nodes
-    /// land **before/with** the roots that reference them (crash-safety).
-    pub fn collect_tree<K, V, M>(
-        &self,
-        tree: &Tree<K, V, M>,
-    ) -> (Option<ContentKey>, Vec<(ContentKey, Vec<u8>)>)
-    where
-        K: Persist + Ord + Displace,
-        V: Persist + Clone,
-        M: Measure<K, V>,
-    {
-        let mut out = Vec::new();
-        // A root pointer is a bare content key, so a displaced root is written in
-        // its normalized form: the root node opened into this frame, every
-        // subtree beneath it shared. Below the root, dsps ride the edges.
-        let root = tree.normalized();
-        let ck = {
-            let present = self.present.lock().unwrap();
-            collect_nodes(&root, &mut out, &present)
+            paged_in: AtomicU64::new(0),
         };
-        self.encoded.fetch_add(out.len() as u64, Ordering::Relaxed);
-        (ck, out)
+        if gran.meta_get(ROOT_KEY)?.is_none() && gran.meta.iter().next().is_some() {
+            return Err(Error::Codec(format!(
+                "granfilade: store has no root record — it predates format v{NODE_FORMAT_VERSION}, \
+                 which requires a fresh store and has no migrator"
+            )));
+        }
+        Ok(Arc::new(gran))
     }
 
-    /// One atomic write of node frames + meta entries (nodes and the roots that
-    /// reference them land together — the Patch–edition law for the store).
-    pub fn write(
-        &self,
-        nodes: Vec<(ContentKey, Vec<u8>)>,
-        meta: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<()> {
-        self.write_full(nodes, meta, Vec::new())
+    /// The root record: the content keys every durable tree hangs from, or an
+    /// empty list for a fresh store.
+    pub fn root(&self) -> Result<Vec<Option<ContentKey>>> {
+        match self.meta_get(ROOT_KEY)? {
+            None => Ok(Vec::new()),
+            Some(bytes) => decode_root(&bytes),
+        }
     }
 
-    /// [`write`](Self::write), plus meta keys to drop in the same batch — used by
-    /// consolidation to retire the Fact roots below the new watermark atomically
-    /// with the checkpoint that replaces them.
-    pub fn write_full(
-        &self,
-        nodes: Vec<(ContentKey, Vec<u8>)>,
-        meta: Vec<(Vec<u8>, Vec<u8>)>,
-        drop_meta: Vec<Vec<u8>>,
-    ) -> Result<()> {
-        self.write_group(vec![StagedWrite {
-            nodes,
-            meta,
-            drop_meta,
-        }])
+    /// Collect a tree's new nodes as `(content_key, frame)` pairs (children
+    /// first) and its root key — pure, no I/O. Linked trees are collected with
+    /// it. The caller batches these with the root record so nodes land
+    /// **with** the root that references them (crash-safety).
+    pub fn collect_tree<K, V, M>(&self, tree: &Tree<K, V, M>) -> (Option<ContentKey>, Vec<(ContentKey, Vec<u8>)>)
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        let mut sink = Sink { gran: self, out: Vec::new() };
+        // The root record holds bare content keys, so a displaced root is
+        // written normalized: the root node opened into this frame, every
+        // subtree beneath it shared. Below the root, dsps ride the edges.
+        let ck = collect_nodes(&tree.normalized(), &mut sink);
+        self.encoded.fetch_add(sink.out.len() as u64, Ordering::Relaxed);
+        (ck, sink.out)
     }
 
     /// **Group commit (the durability half).** Apply several already-encoded
@@ -264,18 +431,14 @@ impl Granfilade {
     /// in series. Amortising one fsync across a group is the largest single win
     /// available, and it does **not** weaken the patch–edition law: the law
     /// demands one atomic durable write *per edition*, not one *per committer*.
-    /// A batch containing editions `e..=e+k` still lands entirely or not at all.
     ///
-    /// `group` must be in **edition order**. Later entries overwrite earlier ones
-    /// for a repeated meta key (the clock, a relation's log root), which is
-    /// exactly right: the last edition in the group is the state the batch
-    /// leaves behind. Writing them out of order would durably record a stale
-    /// clock; skipping one would leave a hole in the history a reopen could not
-    /// see past.
+    /// `group` must be in **staging order**. Each entry's root record is the
+    /// whole world as of that stage, so the last one wins, which is exactly
+    /// right; writing them out of order would durably record a stale root.
     pub fn write_group(&self, group: Vec<StagedWrite>) -> Result<()> {
-        if group.is_empty() {
+        let Some(root) = group.last().map(|s| encode_root(&s.root)) else {
             return Ok(());
-        }
+        };
         let mut batch = self.db.batch();
         let mut written = Vec::new();
         for staged in group {
@@ -283,13 +446,8 @@ impl Granfilade {
                 batch.insert(&self.nodes, k.to_vec(), v);
                 written.push(k);
             }
-            for (k, v) in staged.meta {
-                batch.insert(&self.meta, k, v);
-            }
-            for k in staged.drop_meta {
-                batch.remove(&self.meta, k);
-            }
         }
+        batch.insert(&self.meta, ROOT_KEY.to_vec(), root);
         batch.commit().map_err(store_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
         self.syncs.fetch_add(1, Ordering::Relaxed);
@@ -299,119 +457,140 @@ impl Granfilade {
         Ok(())
     }
 
-    /// A meta value.
-    pub fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .meta
-            .get(key)
-            .map_err(store_err)?
-            .map(|s| s.as_ref().to_vec()))
+    fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.meta.get(key).map_err(store_err)?.map(|s| s.as_ref().to_vec()))
     }
 
-    /// All meta `(key, value)` pairs whose key starts with `prefix`.
-    pub fn meta_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut out = Vec::new();
-        for kv in self.meta.prefix(prefix) {
-            let (k, v) = kv.into_inner().map_err(store_err)?;
-            out.push((k.as_ref().to_vec(), v.as_ref().to_vec()));
-        }
-        Ok(out)
-    }
-
-    /// Persist `tree`, returning its root content key (`None` if empty). Every
-    /// node is content-keyed, so a node already present by content is re-inserted
-    /// idempotently and unchanged subtrees of a prior version are shared on disk;
-    /// the store grows by only the edited path. One atomic batch + `SyncAll`.
+    /// Persist `tree`'s nodes, returning its root content key (`None` if
+    /// empty), **without** naming it from the root record — so the next GC
+    /// collects it. For tests and tools that exercise the node store directly.
     pub fn persist<K, V, M>(&self, tree: &Tree<K, V, M>) -> Result<Option<ContentKey>>
     where
-        K: Persist + Ord + Displace,
-        V: Persist + Clone,
-        M: Measure<K, V>,
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
     {
-        let (ck, out) = self.collect_tree(tree);
-        self.write(out, Vec::new())?;
+        let (ck, nodes) = self.collect_tree(tree);
+        let mut batch = self.db.batch();
+        for (k, v) in &nodes {
+            batch.insert(&self.nodes, k.to_vec(), v.clone());
+        }
+        batch.commit().map_err(store_err)?;
+        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.present.lock().unwrap().extend(nodes.into_iter().map(|(k, _)| k));
         Ok(ck)
     }
 
-    /// Reconstruct the tree rooted at `ck` (its exact persisted shape). `O(state)`
-    /// eager load; lazy paging is a later refinement.
-    pub fn load<K, V, M>(&self, ck: Option<ContentKey>) -> Result<Tree<K, V, M>>
+    /// The tree rooted at `ck`, reading **one** frame: its root node is
+    /// resident and everything beneath it is paged.
+    pub fn load<K, V, M>(self: &Arc<Self>, ck: Option<ContentKey>) -> Result<Tree<K, V, M>>
     where
-        K: Persist + Ord + Displace,
-        V: Persist + Clone,
-        M: Measure<K, V>,
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
     {
-        let ck = match ck {
-            None => return Ok(Tree::new()),
-            Some(ck) => ck,
-        };
-        let bytes = self
+        let Some(ck) = ck else { return Ok(Tree::new()) };
+        let tree = self.read_node::<K, V, M>(&ck)?;
+        if let Some(cell) = tree.ck_cell() {
+            let _ = cell.set(ck);
+        }
+        self.present.lock().unwrap().insert(ck);
+        Ok(tree)
+    }
+
+    /// Decode the frame under `ck` into a resident node whose children (and
+    /// links) are paged.
+    fn read_node<K, V, M>(self: &Arc<Self>, ck: &ContentKey) -> Result<Tree<K, V, M>>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        let frame = self
             .nodes
             .get(ck)
             .map_err(store_err)?
             .ok_or_else(|| Error::Store("granfilade: node key not found".into()))?;
-        let bytes = bytes.as_ref();
-        let (tag, child_keys, pos) = decode_header(bytes)?;
-        let (count, mut pos) = decode_u32(bytes, pos)?;
+        self.paged_in.fetch_add(1, Ordering::Relaxed);
+        let bytes = frame.as_ref();
+        let (tag, refs, pos) = decode_header(bytes)?;
+        let mut d = Dec { bytes, pos, refs: &refs, next_ref: 0, gran: self };
+        let count = u32::decode(&mut d)? as usize;
         match tag {
             TAG_LEAF => {
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let (key, p) = K::decode(bytes, pos)?;
-                    let (val, p) = V::decode(bytes, p)?;
+                    let key = K::decode(&mut d)?;
+                    let val = V::decode(&mut d)?;
                     entries.push((key, val));
-                    pos = p;
                 }
-                let tree = Tree::leaf_of(entries);
-                self.note_loaded(&tree, ck);
-                Ok(tree)
+                if d.next_ref != refs.len() {
+                    return Err(Error::Codec("granfilade: leaf links disagree with its references".into()));
+                }
+                Ok(Tree::leaf_of(entries))
             }
             TAG_INTERNAL => {
                 let mut keys = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let (key, p) = K::decode(bytes, pos)?;
-                    keys.push(key);
-                    pos = p;
+                    keys.push(K::decode(&mut d)?);
                 }
-                let mut children = Vec::with_capacity(child_keys.len());
-                for c in child_keys {
-                    let (dsp, p) = i64::decode(bytes, pos)?;
-                    pos = p;
-                    let child: Tree<K, V, M> = self.load(Some(c))?;
-                    children.push(child.relocate(dsp));
-                }
-                if keys.len() + 1 != children.len() {
+                if keys.len() + 1 != refs.len() {
                     return Err(Error::Codec("granfilade: malformed internal node".into()));
                 }
-                let tree = Tree::internal_of(keys, children);
-                self.note_loaded(&tree, ck);
-                Ok(tree)
+                let pager = self.pager::<K, V, M>();
+                let mut children = Vec::with_capacity(refs.len());
+                for c in &refs {
+                    let dsp = i64::decode(&mut d)?;
+                    let size = u64::decode(&mut d)? as usize;
+                    let measure = M::decode(&mut d)?;
+                    children.push(self.stub(*c, size, measure, &pager).relocate(dsp));
+                }
+                Ok(Tree::internal_of(keys, children))
             }
             _ => Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
         }
     }
 
-    /// A just-loaded node already has a content key and is by definition durable:
-    /// memoize both, so re-persisting a reloaded tree writes nothing.
-    fn note_loaded<K, V, M>(&self, tree: &Tree<K, V, M>, ck: ContentKey)
+    fn pager<K, V, M>(self: &Arc<Self>) -> Arc<dyn Pager<K, V, M>>
     where
-        K: Persist + Ord + Displace,
-        V: Persist + Clone,
-        M: Measure<K, V>,
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
     {
-        if let Some(cell) = tree.ck_cell() {
-            let _ = cell.set(ck);
-        }
+        Arc::new(GranPager { gran: Arc::clone(self), _types: PhantomData })
+    }
+
+    /// A paged node for the frame under `ck`, which is durable (a durable frame
+    /// references it), and remembered so GC keeps its frame while it is unread.
+    fn stub<K, V, M>(&self, ck: ContentKey, size: usize, measure: M, pager: &Arc<dyn Pager<K, V, M>>) -> Tree<K, V, M>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        let tree = Tree::paged(ck, size, measure, Arc::clone(pager));
         self.present.lock().unwrap().insert(ck);
+        if let Some(weak) = tree.residency() {
+            let mut rem = self.remembered.lock().unwrap();
+            rem.nodes.push((ck, weak));
+            if rem.nodes.len() >= rem.prune_at {
+                rem.nodes.retain(|(_, w)| w.upgrade().is_some_and(|n| !n.resident()));
+                rem.prune_at = (rem.nodes.len() * 2).max(1024);
+            }
+        }
+        tree
     }
 
     /// Node frames serialized and hashed since this handle was opened — the
-    /// [`encoded`](Self::encoded) ops counter. A commit's delta is the *work* it
-    /// did, as distinct from the nodes it added: before G-1 the two diverged
-    /// wildly, because an untouched subtree was re-serialized to rediscover a
-    /// key the store already had.
+    /// [`encoded`](Self::encoded) ops counter.
     pub fn frames_encoded(&self) -> u64 {
         self.encoded.load(Ordering::Relaxed)
+    }
+
+    /// Node frames read from disk since this handle was opened.
+    pub fn frames_paged(&self) -> u64 {
+        self.paged_in.load(Ordering::Relaxed)
     }
 
     /// `SyncAll`s issued since this handle was opened — the durability cost of
@@ -426,168 +605,228 @@ impl Granfilade {
         Ok(self.nodes.iter().count())
     }
 
-    /// **Reachability GC (E3).** Collect every node unreachable from a live root
-    /// (the `log:*`, `fact:*` and `ctx:*` roots recorded in meta): mark reachable nodes by
-    /// walking their child keys from the roots, then sweep the rest. Returns the
-    /// number of nodes collected. Type-agnostic — it reads only the leading child
-    /// keys of each frame. (Serialize this with commits at the store level.)
+    /// **Reachability GC (E3).** Collect every node unreachable from the root
+    /// record and from every paged node still unread in memory: mark by walking
+    /// each frame's reference run (children and links alike), then sweep the
+    /// rest. Returns the number of nodes collected. Type-agnostic — it reads only
+    /// the leading reference run of each frame.
+    ///
+    /// The caller must keep new roots from being written while this runs (the
+    /// store holds its root lock).
     pub fn gc(&self) -> Result<usize> {
-        // Roots: every content key referenced by a meta entry.
-        let mut stack: Vec<ContentKey> = Vec::new();
-        // `ctx:` is a root too: the catalog and schema registry live in the
-        // context enfilade, and collecting them would lose the world's names.
-        for prefix in [b"log:".as_ref(), b"fact:".as_ref(), b"ctx:".as_ref()] {
-            for (_k, v) in self.meta_prefix(prefix)? {
-                if v.first() == Some(&1) {
-                    if let Some(b) = v.get(1..1 + CK_LEN) {
-                        stack.push(b.try_into().unwrap());
-                    }
-                }
-            }
+        let mut stack: Vec<ContentKey> = self.root()?.into_iter().flatten().collect();
+        {
+            let mut rem = self.remembered.lock().unwrap();
+            rem.nodes.retain(|(_, w)| w.upgrade().is_some_and(|n| !n.resident()));
+            stack.extend(rem.nodes.iter().map(|(ck, _)| *ck));
         }
-        // Mark.
-        let mut marked: std::collections::HashSet<ContentKey> = std::collections::HashSet::new();
+        let mut marked: HashSet<ContentKey> = HashSet::new();
         while let Some(ck) = stack.pop() {
             if !marked.insert(ck) {
                 continue;
             }
             if let Some(frame) = self.nodes.get(ck).map_err(store_err)? {
-                stack.extend(children_of(frame.as_ref())?);
+                stack.extend(refs_of(frame.as_ref())?);
             }
         }
-        // Sweep.
-        let mut collected = 0usize;
+        let mut swept = Vec::new();
         let mut batch = self.db.batch();
         for kv in self.nodes.iter() {
             let (k, _v) = kv.into_inner().map_err(store_err)?;
             let key: ContentKey = k.as_ref().try_into().map_err(|_| trunc("node key"))?;
             if !marked.contains(&key) {
                 batch.remove(&self.nodes, k.as_ref().to_vec());
-                collected += 1;
+                swept.push(key);
             }
         }
         batch.commit().map_err(store_err)?;
         self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        Ok(collected)
+        // A swept key is no longer on disk; a resident node still holding it
+        // must be written again if a later root reaches it.
+        let mut present = self.present.lock().unwrap();
+        for k in &swept {
+            present.remove(k);
+        }
+        Ok(swept.len())
+    }
+
+    fn is_present(&self, ck: &ContentKey) -> bool {
+        self.present.lock().unwrap().contains(ck)
     }
 }
 
-/// A leaf frame: a run of `(key, value)` entries, no children.
+/// The tree type a [`GranPager`] decodes, held as a function pointer so the
+/// pager is `Send + Sync` whatever `K`, `V` and `M` are.
+type TreeType<K, V, M> = PhantomData<fn() -> (K, V, M)>;
+
+/// Pages nodes of one tree type in from a granfilade.
+struct GranPager<K, V, M> {
+    gran: Arc<Granfilade>,
+    _types: TreeType<K, V, M>,
+}
+
+impl<K, V, M> Pager<K, V, M> for GranPager<K, V, M>
+where
+    K: PersistKey,
+    V: PersistVal,
+    M: PersistMeasure<K, V>,
+{
+    fn page(&self, ck: &ContentKey) -> Tree<K, V, M> {
+        self.gran
+            .read_node(ck)
+            .unwrap_or_else(|e| panic!("granfilade: paging in node {}: {e}", hex(ck)))
+    }
+}
+
+/// A leaf frame: a run of `(key, value)` entries; its references are the links
+/// its values hold, in order.
 const TAG_LEAF: u8 = 0;
-/// An internal frame: child content keys, the separators dividing them (in the
-/// node's local frame), then each child's dsp.
+/// An internal frame: separators in the node's local frame, then for each child
+/// its dsp, size and measure; its references are the children.
 const TAG_INTERNAL: u8 = 1;
 
-/// The child content keys of a node frame, read **without decoding the payload**
-/// — the frame puts the tag and the child-key run first precisely so GC can walk
-/// references without knowing `K` or `V`. Used by [`Granfilade::gc`].
-fn children_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
-    let (_tag, children, _pos) = decode_header(frame)?;
-    Ok(children)
+/// The reference run of a node frame, read **without decoding the payload** —
+/// the frame puts it first precisely so GC can walk references without knowing
+/// `K`, `V` or `M`.
+fn refs_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
+    let (_tag, refs, _pos) = decode_header(frame)?;
+    Ok(refs)
 }
 
-/// Frame header: `version(1) || tag(1) || n_children(u32 BE) || [content_key]*n`.
-/// Returns the tag, the child keys, and the offset where the payload count
-/// begins. The child-key run leads the frame so GC can walk references without
-/// knowing `K` or `V`.
+/// Frame header: `version(1) || tag(1) || n_refs(u32 BE) || [content_key]*n`.
+/// Returns the tag, the references, and the offset where the payload begins.
 fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
-    match frame.first() {
-        Some(&NODE_FORMAT_VERSION) => {}
-        Some(v) => {
-            return Err(Error::Codec(format!(
-                "granfilade: unsupported node format version {v} (expected {}; \
-                 v5 requires a fresh store and has no migrator)",
-                NODE_FORMAT_VERSION
-            )))
-        }
-        None => return Err(trunc("node version")),
-    }
+    check_version(frame.first().copied())?;
     let tag = *frame.get(1).ok_or_else(|| trunc("node tag"))?;
-    let (n, mut pos) = decode_u32(frame, 2)?;
-    let mut children = Vec::with_capacity(n);
+    let n = u32::from_be_bytes(frame.get(2..6).ok_or_else(|| trunc("count"))?.try_into().unwrap()) as usize;
+    let mut pos = 6;
+    let mut refs = Vec::with_capacity(n);
     for _ in 0..n {
         let end = pos + CK_LEN;
         let b = frame.get(pos..end).ok_or_else(|| trunc("content key"))?;
-        children.push(b.try_into().unwrap());
+        refs.push(b.try_into().unwrap());
         pos = end;
     }
-    Ok((tag, children, pos))
+    Ok((tag, refs, pos))
 }
 
-fn decode_u32(bytes: &[u8], pos: usize) -> Result<(usize, usize)> {
-    let end = pos + 4;
-    let b = bytes.get(pos..end).ok_or_else(|| trunc("count"))?;
-    Ok((u32::from_be_bytes(b.try_into().unwrap()) as usize, end))
-}
-
-fn encode_header(out: &mut Vec<u8>, tag: u8, children: &[ContentKey]) {
-    out.push(NODE_FORMAT_VERSION);
-    out.push(tag);
-    out.extend_from_slice(&(children.len() as u32).to_be_bytes());
-    for c in children {
-        out.extend_from_slice(c);
+fn check_version(v: Option<u8>) -> Result<()> {
+    match v {
+        Some(NODE_FORMAT_VERSION) => Ok(()),
+        Some(v) => Err(Error::Codec(format!(
+            "granfilade: unsupported node format version {v} (expected {NODE_FORMAT_VERSION}; \
+             v{NODE_FORMAT_VERSION} requires a fresh store and has no migrator)"
+        ))),
+        None => Err(trunc("node version")),
     }
 }
 
-/// Recurse the tree, appending each node's `(content_key, frame_bytes)` and
-/// returning the root key. Children first, so a node's frame carries its
-/// children's content keys. Collects the *node* under `tree`; the handle's own
-/// dsp belongs to the edge that points at it.
+/// Root record: `version(1) || n(u8) || [present(1) || content_key?]*n`.
+fn encode_root(slots: &[Option<ContentKey>]) -> Vec<u8> {
+    let mut out = vec![NODE_FORMAT_VERSION, slots.len() as u8];
+    for slot in slots {
+        match slot {
+            None => out.push(0),
+            Some(ck) => {
+                out.push(1);
+                out.extend_from_slice(ck);
+            }
+        }
+    }
+    out
+}
+
+fn decode_root(bytes: &[u8]) -> Result<Vec<Option<ContentKey>>> {
+    check_version(bytes.first().copied())?;
+    let n = *bytes.get(1).ok_or_else(|| trunc("root record"))? as usize;
+    let mut pos = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        match bytes.get(pos) {
+            Some(0) => {
+                out.push(None);
+                pos += 1;
+            }
+            Some(1) => {
+                let b = bytes.get(pos + 1..pos + 1 + CK_LEN).ok_or_else(|| trunc("root record"))?;
+                out.push(Some(b.try_into().unwrap()));
+                pos += 1 + CK_LEN;
+            }
+            _ => return Err(trunc("root record")),
+        }
+    }
+    Ok(out)
+}
+
+/// Recurse the tree, appending each new node's `(content_key, frame_bytes)` to
+/// the sink and returning the root key. Children (and links) first, so a node's
+/// frame carries their content keys. Collects the *node* under `tree`; the
+/// handle's own dsp belongs to the edge that points at it.
 ///
 /// One frame is one **node**, and a node holds a whole run of entries
 /// ([`grmpl_ent::tree::B`](crate::tree::B) of them), so the store keeps one
 /// record per run rather than one per tuple.
-fn collect_nodes<K, V, M>(
-    tree: &Tree<K, V, M>,
-    out: &mut Vec<(ContentKey, Vec<u8>)>,
-    present: &HashSet<ContentKey>,
-) -> Option<ContentKey>
+fn collect_nodes<K, V, M>(tree: &Tree<K, V, M>, sink: &mut Sink<'_>) -> Option<ContentKey>
 where
-    K: Persist + Ord + Displace,
-    V: Persist + Clone,
-    M: Measure<K, V>,
+    K: PersistKey,
+    V: PersistVal,
+    M: PersistMeasure<K, V>,
 {
     let cell = tree.ck_cell()?;
     // **Path-only work (G-1).** A node whose key is memoized *and* already
     // durable here needs neither re-serializing nor revisiting — and neither do
     // any of its descendants, since a node's key closes over its children's.
-    // That turns a commit from an O(n) re-walk of the whole tree into O(log n):
-    // only the path copied by the edit is new.
+    // Every paged node qualifies, so persisting never pages anything in.
     if let Some(ck) = cell.get() {
-        if present.contains(ck) {
+        if sink.gran.is_present(ck) {
             return Some(*ck);
         }
     }
-    let mut bytes = Vec::new();
-    match tree.node()? {
+    let mut e = Enc { buf: Vec::new(), refs: Vec::new(), sink };
+    let tag = match tree.node()? {
         NodeRef::Leaf(entries) => {
-            encode_header(&mut bytes, TAG_LEAF, &[]);
-            bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            (entries.len() as u32).encode(&mut e);
             for (k, v) in entries {
-                k.encode(&mut bytes);
-                v.encode(&mut bytes);
+                k.encode(&mut e);
+                v.encode(&mut e);
             }
+            TAG_LEAF
         }
         NodeRef::Internal(keys, children) => {
-            let cks: Vec<ContentKey> = children
-                .iter()
-                .filter_map(|c| collect_nodes(c, out, present))
-                .collect();
-            encode_header(&mut bytes, TAG_INTERNAL, &cks);
-            bytes.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+            for c in children {
+                let ck = collect_nodes(c, e.sink).expect("a child is never empty");
+                e.refs.push(ck);
+            }
+            (keys.len() as u32).encode(&mut e);
             for k in keys {
-                k.encode(&mut bytes);
+                k.encode(&mut e);
             }
             for c in children {
-                c.dsp().encode(&mut bytes);
+                c.dsp().encode(&mut e);
+                (c.len() as u64).encode(&mut e);
+                c.local_measure().expect("a child is never empty").encode(&mut e);
             }
+            TAG_INTERNAL
         }
+    };
+    let Enc { buf, refs, sink } = e;
+    let mut bytes = Vec::with_capacity(6 + refs.len() * CK_LEN + buf.len());
+    bytes.push(NODE_FORMAT_VERSION);
+    bytes.push(tag);
+    bytes.extend_from_slice(&(refs.len() as u32).to_be_bytes());
+    for r in &refs {
+        bytes.extend_from_slice(r);
     }
+    bytes.extend_from_slice(&buf);
     let ck = grmpl_core::hash::sha256(&bytes);
     let _ = cell.set(ck);
-    out.push((ck, bytes));
+    sink.out.push((ck, bytes));
     Some(ck)
+}
+
+fn hex(ck: &ContentKey) -> String {
+    ck.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn trunc(what: &str) -> Error {
@@ -601,12 +840,17 @@ fn store_err<E: std::fmt::Display>(e: E) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measure::Count;
 
     type FactTree = Tree<Tuple, i64, Count>;
+    /// A directory of trees, as the store keeps them: each value is a link.
+    type DirTree = Tree<u64, FactTree, Count>;
 
     fn t(n: i64) -> Tuple {
         Tuple::from([Value::Int(n)])
+    }
+
+    fn contents(t: &FactTree) -> Vec<(Tuple, i64)> {
+        t.iter().map(|(k, v)| (k, *v)).collect()
     }
 
     #[test]
@@ -621,9 +865,7 @@ mod tests {
         }
         let ck0 = gran.persist(&v0).unwrap();
         let reloaded: FactTree = gran.load(ck0).unwrap();
-        let orig: Vec<(Tuple, i64)> = v0.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        let back: Vec<(Tuple, i64)> = reloaded.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        assert_eq!(orig, back, "reload did not reproduce the tree's contents");
+        assert_eq!(contents(&v0), contents(&reloaded), "reload did not reproduce the tree's contents");
 
         // A new version shares every untouched subtree: persisting it adds only
         // the O(log n) nodes on the edited path, not a full copy.
@@ -632,18 +874,122 @@ mod tests {
         gran.persist(&v1).unwrap();
         let added = gran.node_count().unwrap() - before;
         assert!(added > 0, "nothing was stored for the new version");
-        assert!(
-            added < v1.len(),
-            "no structural sharing: added {added} nodes for a {}-node tree",
-            v1.len()
-        );
+        assert!(added < v1.len(), "no structural sharing: added {added} nodes for a {}-node tree", v1.len());
+    }
+
+    /// A load reads one frame; the rest pages in only as a read reaches it, and
+    /// counts and measures of untouched subtrees come from their parents.
+    #[test]
+    fn a_load_pages_in_only_what_a_read_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let gran = Granfilade::open(dir.path()).unwrap();
+        let mut tree = FactTree::new();
+        for k in 0..50_000i64 {
+            tree = tree.insert(t(k), 1);
+        }
+        let ck = gran.persist(&tree).unwrap();
+
+        let before = gran.frames_paged();
+        let back: FactTree = gran.load(ck).unwrap();
+        assert_eq!(gran.frames_paged() - before, 1, "a load read more than its root");
+        assert_eq!(back.len(), 50_000);
+        assert_eq!(back.measure(), Count(50_000));
+        assert_eq!(gran.frames_paged() - before, 1, "a whole-tree measure paged nodes in");
+
+        // A range measure walks only the two boundary spines: every subtree
+        // wholly inside the span answers from the measure its parent recorded.
+        assert_eq!(back.measure_range(&t(1_000), &t(40_000)), Count(39_000));
+        let range = gran.frames_paged() - before;
+        assert!(range <= 5, "a range measure paged in {range} frames");
+
+        // A point read pages in one root-to-leaf path.
+        assert_eq!(back.get(&t(31_337)), Some(&1));
+        let point = gran.frames_paged() - before - range;
+        assert!(point <= 2, "a point read paged in {point} frames");
+
+        // Re-persisting a paged tree writes and pages nothing.
+        let (encoded, paged) = (gran.frames_encoded(), gran.frames_paged());
+        gran.persist(&back).unwrap();
+        assert_eq!((gran.frames_encoded(), gran.frames_paged()), (encoded, paged));
+
+        // A full walk reads it all, and it is the same map.
+        assert_eq!(contents(&back), contents(&tree));
+    }
+
+    /// Trees may hold trees: a directory's values are links, persisted with it,
+    /// followed by GC, and reloaded paged.
+    #[test]
+    fn linked_trees_persist_reload_and_survive_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let gran = Granfilade::open(dir.path()).unwrap();
+        let mut d = DirTree::new();
+        for e in 0..200u64 {
+            let mut f = FactTree::new();
+            for k in 0..(e as i64 % 7) * 40 {
+                f = f.insert(t(k), e as i64);
+            }
+            d = d.insert(e, f.relocate(0));
+        }
+        let (ck, nodes) = gran.collect_tree(&d);
+        gran.write_group(vec![StagedWrite { nodes, root: vec![ck] }]).unwrap();
+        // Everything is reachable through the links: GC keeps it all.
+        assert_eq!(gran.gc().unwrap(), 0, "GC collected a linked tree");
+
+        let back: DirTree = gran.load(gran.root().unwrap()[0]).unwrap();
+        assert_eq!(back.len(), 200);
+        for e in [0u64, 6, 13, 199] {
+            assert_eq!(contents(back.get(&e).unwrap()), contents(d.get(&e).unwrap()), "dir entry {e}");
+        }
+    }
+
+    /// GC keeps the frames of paged nodes that are still reachable from memory
+    /// but not from the root, so a reader holding an old version can keep
+    /// reading it after the root has moved on.
+    #[test]
+    fn gc_keeps_unread_paged_nodes_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let gran = Granfilade::open(dir.path()).unwrap();
+        let mut tree = FactTree::new();
+        for k in 0..5_000i64 {
+            tree = tree.insert(t(k), 1);
+        }
+        let (ck, nodes) = gran.collect_tree(&tree);
+        gran.write_group(vec![StagedWrite { nodes, root: vec![ck] }]).unwrap();
+        let held: FactTree = gran.load(ck).unwrap();
+
+        // The root moves to an empty world; only `held` still reaches the old one.
+        gran.write_group(vec![StagedWrite { nodes: Vec::new(), root: vec![None] }]).unwrap();
+        gran.gc().unwrap();
+        assert_eq!(held.len(), 5_000);
+        assert_eq!(held.iter().count(), 5_000, "GC swept a frame a live handle still needed");
+
+        // Once nothing holds it, it goes.
+        drop(held);
+        assert!(gran.gc().unwrap() > 0);
+        assert_eq!(gran.node_count().unwrap(), 0);
+    }
+
+    /// A store from before the root record keeps its roots under keys this
+    /// version never reads; opening it must fail loudly, not look empty.
+    #[test]
+    fn a_store_without_a_root_record_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::builder(dir.path()).open().unwrap();
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+            meta.insert(b"cur:\0\0\0\0\0\0\0\0".to_vec(), 7u64.to_be_bytes().to_vec()).unwrap();
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+        let err = Granfilade::open(dir.path()).err().expect("an old store opened").to_string();
+        assert!(err.contains("no root record"), "{err}");
+        assert!(err.contains("fresh store"), "{err}");
     }
 
     #[test]
-    fn pre_v5_node_is_rejected_with_fresh_store_guidance() {
-        let old = [4, TAG_LEAF, 0, 0, 0, 0];
+    fn pre_v6_node_is_rejected_with_fresh_store_guidance() {
+        let old = [5, TAG_LEAF, 0, 0, 0, 0];
         let err = decode_header(&old).unwrap_err().to_string();
-        assert!(err.contains("unsupported node format version 4"));
+        assert!(err.contains("unsupported node format version 5"));
         assert!(err.contains("fresh store"));
         assert!(err.contains("no migrator"));
     }

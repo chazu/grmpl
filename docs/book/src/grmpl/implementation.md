@@ -83,6 +83,23 @@ This is the mechanism behind cheap history *on disk*, not just in memory: a
 commit grows the store by only the edited path, and reachability GC from retained
 roots reclaims what no live edition points at.
 
+**One root, everything beneath it.** The granfilade has a single mutable slot,
+the **root record** — Gold's turtle. It links to two trees, the branch DAG and
+the branch enfilade, which are Gold's `fulltrace` and `oroots`; everything else
+hangs from those. That works because a tree can hold trees: a leaf's value may be
+a **link**, whose content key rides in the frame's reference run beside an
+internal node's children. GC reads only that run, so it follows a link exactly as
+it follows a child.
+
+**Demand paging.** An internal frame records each child's size and measure as
+well as its key and dsp, so a node read back from disk comes with **paged**
+children: counted, measured and comparable by content key, their contents still
+on disk until a walk enters them. Opening a world reads the root record and two
+frames whatever its size, and a point read pages in one path. Every paged node
+handed out is remembered weakly, and GC treats the ones still unread as roots —
+their frames are the only copy of what they hold — so a reader pinned to an
+edition keeps reading it after consolidation retires it.
+
 > The hash is part of the on-disk format, so it is pinned: SHA-256
 > (`grmpl_core::hash`), vendored and
 > checked against the FIPS vectors. The previous `DefaultHasher` had neither
@@ -135,12 +152,15 @@ And the four directories that hold them, each an enfilade in its own right:
 Beside them sit the **context enfilade** — carrying the durable catalog and the
 edition-versioned schema registry as bindings at the root scope, so `schema_at`
 is a WID range walk over the relation's `(rel, edition)` span rather than a scan
-— the **canopy**, and the **branch enfilade** of the `DagWood`. The context and
-branch enfilades are persisted and are live GC roots; the canopy and the
-fired-interest enfilade are in memory only, rebuilt empty on open and on fork.
+— the **canopy**, and the **branch enfilade** of the `DagWood`. All of them are
+persisted. A branch's whole state — its clock, Rel enfilade, context enfilade,
+canopy and fired-set — is one value in the branch enfilade, so an interest and
+the commits routed to it land in the same root and survive a reopen together; a
+fork starts with an empty canopy.
 
 A single commit opens one transaction over the granfilade, writes the touched
-nodes of the relation's enfilades plus the edition bump, and issues one durable sync —
+nodes of the relation's enfilades and the directories above them plus a new root
+record, and issues one durable sync —
 the Patch–edition law realized as one atomic batch. A commit writes only the
 version it created, not every live one. The store contract this satisfies —
 determinism, the patch–edition law, history and consolidation, fork identity — is
@@ -221,9 +241,10 @@ is the pair `(branch, edition)` — Gold's `TracePosition`.
 
 `fork_at(at)` returns a store on a new branch that **shares structure** with its
 ancestor — an `O(edit)` virtual copy of the *world*, not an `O(state)` deep copy.
-Every branch lives in one granfilade with its roots namespaced by branch, so the
-fork writes roots naming nodes already present and encodes **zero** node frames;
-a 5000-row world forks for the cost of the roots. The branch registry is itself
+Every branch lives in one granfilade under one root record, so a fork at the
+present adds its state to the branch enfilade and its record to the DAG — two
+frames — and names nodes already present for everything else; a 5000-row world
+forks for the same two frames as a 50-row one. The branch registry is itself
 an enfilade like every other directory in the store's state — not a `BTreeMap`
 beside them — so "how many branches" is a measure, iteration is ordered, and a
 retained `Dag` is a persistent version of the graph that a later fork cannot
@@ -265,8 +286,9 @@ negative would be a lost update, and the lattice makes that unrepresentable.
 It is a real enfilade: interests live in the same persistent measured tree as
 everything else, keyed `(rel, lo, id)` so one relation's interests are a
 contiguous low-endpoint-ordered span. Registering is an `O(log n)` persistent
-insert. It is **not persisted**: the store rebuilds it empty on open and on
-fork, and watchers re-register their interests.
+insert. It is **persisted** with its branch's state, so a registered interest
+survives a reopen and keeps routing precisely; a fork starts with an empty
+canopy.
 
 **Routing is load-bearing, but by a coarser mechanism than the canopy.** The
 reactive pump no longer re-evaluates its view on every pump: it asks the

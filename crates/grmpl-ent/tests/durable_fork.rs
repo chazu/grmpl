@@ -6,9 +6,10 @@
 //! the Ent's headline capability — `O(edit)` virtual copy of a whole world —
 //! unavailable to anything that had to survive a restart.
 //!
-//! All branches now live in **one** granfilade with their roots namespaced by
-//! branch. So a fork writes roots pointing at nodes that are already there, and
-//! writes **no nodes at all** — where the LSM's fork copies `O(state)` bytes.
+//! All branches now live in **one** granfilade, under one root record. A fork
+//! adds its branch to the DagWood and its state to the branch enfilade — a
+//! couple of directory frames — and names nodes that are already there for
+//! everything else, where the LSM's fork copies `O(state)` bytes.
 
 use grmpl_core::{Edition, EditionStore, RelId, TraceStore, Tuple, Value};
 use grmpl_ent::{Dag, EntStore};
@@ -25,26 +26,28 @@ fn seed(store: &EntStore, rows: i64) {
     store.commit(&updates).unwrap();
 }
 
-/// The defining property: forking a 5000-row world adds **no** stored nodes,
-/// because the fork's roots name nodes the granfilade already holds.
+/// The defining property: a fork's cost is its directory entries, and it does
+/// not grow with the world. Forking a 5000-row world encodes exactly as many
+/// frames as forking a 50-row one — the new DAG and branch-enfilade spines —
+/// because every relation's nodes are shared, not copied.
 #[test]
-fn forking_a_durable_world_writes_roots_not_nodes() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
-    seed(&store, 5_000);
+fn forking_a_durable_world_writes_directories_not_facts() {
+    let mut costs = Vec::new();
+    for rows in [50i64, 5_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
+        seed(&store, rows);
 
-    let encoded_before = store.frames_encoded();
-    let fork = store.fork_at(store.current()).unwrap();
+        let encoded_before = store.frames_encoded();
+        let fork = store.fork_at(store.current()).unwrap();
+        costs.push(store.frames_encoded() - encoded_before);
 
-    assert_eq!(
-        store.frames_encoded(),
-        encoded_before,
-        "the fork encoded node frames — it copied instead of sharing"
-    );
-    assert_ne!(fork.branch_id(), store.branch_id(), "a fork is a new branch");
-
-    // The fork sees the whole world it was cut from.
-    assert_eq!(fork.read_at(REL, fork.current()).unwrap().len(), 5_000);
+        assert_ne!(fork.branch_id(), store.branch_id(), "a fork is a new branch");
+        // The fork sees the whole world it was cut from.
+        assert_eq!(fork.read_at(REL, fork.current()).unwrap().len(), rows as usize);
+    }
+    assert!(costs[0] <= 3, "a fork encoded {} frames; it should write directory entries only", costs[0]);
+    assert_eq!(costs[0], costs[1], "fork cost grew with the world: {costs:?} — it copied instead of sharing");
 }
 
 /// The two branches evolve independently, and neither disturbs the other.

@@ -463,9 +463,14 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   instancing is a graft (`O(log n)` new nodes, one log entry); fork and
   consolidation cut history by split. Laws: the displaced-tree oracle in
   `grmpl-ent/src/lib.rs` and `grmpl-ent/tests/virtual_copy.rs`.
-* **Open, in order:** persist the version and relation directories, the canopy
-  and the branch DAG as granfilade trees (node frames that reference other
-  trees' roots, followed by GC); lazy node paging (the eager `O(state)` reopen);
-  a transactional graft effect in a patch (phase 3A of the world-package plan);
-  DSP-inherited context once the language declares scopes; version compare
-  across a graft without the merge fallback.
+* **Landed:** one root record for the whole world, linking the branch DAG and
+  the branch enfilade; every directory, the context enfilade and the canopy are
+  trees beneath it, and nodes page in on demand (5→6, a fresh-store cutover).
+  Opening a world reads two frames at any size. Laws:
+  `grmpl-ent/tests/whole_ent.rs`.
+* **Open, in order:** extent summaries beyond `Count`, then a reverse index over
+  grafts (Green's spanfilade question — the D4M associative-array model, an
+  array stored beside its transpose, is a reference for this), which also lets
+  version compare across a graft skip the merge fallback; a transactional graft
+  effect in a patch (phase 3A of the world-package plan); DSP-inherited context
+  once the language declares scopes; merges in the branch DAG.

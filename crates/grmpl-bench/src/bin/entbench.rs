@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::EntStore;
+use grmpl_ent::{EntStore, Granfilade};
 
 const REL: RelId = RelId(1);
 const OTHER: RelId = RelId(2);
@@ -45,7 +45,7 @@ fn main() {
     // ---------------------------------------------------------------- fork ---
     header(
         "Fork — O(edit) virtual copy",
-        "A fork is a new branch whose roots name nodes already stored.",
+        "A fork adds a branch to the DAG and branch enfilade; every relation's nodes are shared.",
     );
     for &n in &sizes {
         let dir = tempfile::tempdir().unwrap();
@@ -224,8 +224,8 @@ fn main() {
 
     // -------------------------------------------------------------- reopen ---
     header(
-        "Reopen — recovery is a root lookup, but the load is eager",
-        "Open a store holding N rows. No replay; but every node is read back.",
+        "Reopen — recovery is a root lookup, and nodes page in on demand",
+        "Open a store holding N rows, then read 10 of them. fjall's own open, alone, for comparison.",
     );
     for &n in &sizes {
         let dir = tempfile::tempdir().unwrap();
@@ -233,10 +233,22 @@ fn main() {
             let _ = seeded(dir.path(), n);
         }
         let start = Instant::now();
+        drop(Granfilade::open(dir.path()).unwrap());
+        let fjall = start.elapsed().as_nanos() as f64;
+        row("open fjall alone", n, fjall, "");
+
+        let start = Instant::now();
         let store = EntStore::open(dir.path()).unwrap();
         let ns = start.elapsed().as_nanos() as f64;
+        let opened = store.frames_paged();
+        row("open EntStore", n, ns, &format!("{opened} frames paged"));
+
+        let start = Instant::now();
+        let rows = store.read_range(REL, store.current(), &t(n / 2), &t(n / 2 + 10)).unwrap();
+        let ns = start.elapsed().as_nanos() as f64;
+        assert_eq!(rows.len(), 10);
+        row("first 10-row read", n, ns, &format!("{} frames paged", store.frames_paged() - opened));
         assert_eq!(store.read_at(REL, store.current()).unwrap().len(), n as usize);
-        row("open + rebuild", n, ns, "");
     }
 
     // ------------------------------------------------------------- routing ---

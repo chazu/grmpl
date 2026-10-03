@@ -21,6 +21,11 @@
 //!   children (internal), not one. A node is one content-addressed granfilade
 //!   record, so a wide node means one record per **run** of tuples rather than
 //!   one record per tuple.
+//! * **Demand-paged.** A node read back from the granfilade is resident, but
+//!   its children are [`paged`](Tree::paged): known by content key, size and
+//!   measure, read from disk only when a walk enters them. Counts, measures,
+//!   version identity and persistence never page anything in; a lookup pages
+//!   in one path. See [`Pager`].
 //! * **Deterministic.** Shape is a pure function of the operation sequence — no
 //!   randomness, no clock, no pointer input — so replay reproduces it exactly
 //!   (the Replay law).
@@ -74,7 +79,13 @@ enum Kind<K, V, M> {
 }
 
 struct Node<K, V, M> {
-    kind: Kind<K, V, M>,
+    /// The node's contents. Empty only for a **paged** node — one known by its
+    /// content key, size and measure, whose frame is still on disk; the first
+    /// read that needs its contents pages them in through `pager`.
+    kind: OnceLock<Kind<K, V, M>>,
+    /// Where a paged node's contents come from. `None` for a node built in
+    /// memory, which is resident from birth.
+    pager: Option<Arc<dyn Pager<K, V, M>>>,
     /// Entries in the whole subtree.
     size: usize,
     /// The subtree's cached [`Measure`], in the node's local frame — the upward
@@ -86,6 +97,50 @@ struct Node<K, V, M> {
     /// names no hash of a *frame*, only the cell), and it is what lets a commit
     /// skip subtrees it has already persisted instead of re-serializing them.
     ck: OnceLock<ContentKey>,
+}
+
+impl<K, V, M> Node<K, V, M> {
+    /// The node's contents, paging them in on first use.
+    ///
+    /// A page-in that fails panics: a paged node's frame is referenced by a
+    /// durable parent and protected from GC while any handle can still reach
+    /// it, so a missing frame means the store is damaged, not that a read raced.
+    fn kind(&self) -> &Kind<K, V, M> {
+        self.kind.get_or_init(|| {
+            let pager = self.pager.as_ref().expect("a non-resident node has a pager");
+            let ck = self.ck.get().expect("a paged node knows its content key");
+            let loaded = pager.page(ck);
+            debug_assert_eq!(
+                loaded.root.as_ref().map_or(0, |n| n.size),
+                self.size,
+                "paged node size disagrees with its parent"
+            );
+            let node = loaded.root.and_then(|n| Arc::try_unwrap(n).ok());
+            node.and_then(|n| n.kind.into_inner()).expect("a pager returns a fresh, resident node")
+        })
+    }
+}
+
+/// **Demand paging.** The source a paged node's contents are read from — the
+/// granfilade, which decodes the frame under a content key into a node whose
+/// own children are paged in turn. This is how a tree larger than memory is
+/// walked: only the nodes a read reaches are ever decoded.
+pub trait Pager<K, V, M>: Send + Sync {
+    /// The node stored under `ck`, resident, at displacement `0`.
+    fn page(&self, ck: &ContentKey) -> Tree<K, V, M>;
+}
+
+/// Whether a node's contents are in memory. The granfilade keeps a weak handle
+/// on every paged node it hands out and treats the ones still unread as GC
+/// roots: their frames are the only copy of what they hold.
+pub trait Resident: Send + Sync {
+    fn resident(&self) -> bool;
+}
+
+impl<K: Send + Sync, V: Send + Sync, M: Send + Sync> Resident for Node<K, V, M> {
+    fn resident(&self) -> bool {
+        self.kind.get().is_some()
+    }
 }
 
 /// A persistent measured ordered map from `K` to `V` with subtree measure `M`:
@@ -209,7 +264,7 @@ where
         loop {
             let n = cur.root.as_deref()?;
             off = off.wrapping_add(cur.dsp);
-            match &n.kind {
+            match n.kind() {
                 Kind::Leaf(entries) => {
                     return entries
                         .binary_search_by(|(x, _)| x.cmp_displaced(off, key))
@@ -417,10 +472,46 @@ where
     /// The view is in the node's local frame — this handle's [`dsp`](Self::dsp)
     /// is not applied.
     pub fn node(&self) -> Option<NodeRef<'_, K, V, M>> {
-        match &self.root.as_deref()?.kind {
+        match self.root.as_deref()?.kind() {
             Kind::Leaf(entries) => Some(NodeRef::Leaf(entries)),
             Kind::Internal { keys, children } => Some(NodeRef::Internal(keys, children)),
         }
+    }
+
+    /// The root node's measure in its own local frame (this handle's dsp not
+    /// applied) — what a parent frame records for a child.
+    pub fn local_measure(&self) -> Option<&M> {
+        Some(&self.root.as_deref()?.measure)
+    }
+
+    /// A **paged** tree: a node known by its content key, entry count and local
+    /// measure, whose contents stay on disk until a read reaches them. Length,
+    /// measure, content key and version identity are all answerable without
+    /// paging it in.
+    pub fn paged(ck: ContentKey, size: usize, measure: M, pager: Arc<dyn Pager<K, V, M>>) -> Self {
+        Tree {
+            root: Some(Arc::new(Node {
+                kind: OnceLock::new(),
+                pager: Some(pager),
+                size,
+                measure,
+                ck: OnceLock::from(ck),
+            })),
+            dsp: 0,
+        }
+    }
+
+    /// A weak handle on the root node's residency, for the granfilade's GC
+    /// roots (see [`Resident`]).
+    pub fn residency(&self) -> Option<std::sync::Weak<dyn Resident>>
+    where
+        K: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+        M: Send + Sync + 'static,
+    {
+        let node = self.root.as_ref()?;
+        let weak: std::sync::Weak<Node<K, V, M>> = Arc::downgrade(node);
+        Some(weak)
     }
 
     /// Rebuild a leaf from its exact persisted entries — no rebalancing, so a
@@ -447,7 +538,8 @@ where
             root: Some(Arc::new(Node {
                 size: entries.len(),
                 measure,
-                kind: Kind::Leaf(entries),
+                kind: OnceLock::from(Kind::Leaf(entries)),
+                pager: None,
                 ck: OnceLock::new(),
             })),
             dsp: 0,
@@ -465,7 +557,8 @@ where
             root: Some(Arc::new(Node {
                 size,
                 measure,
-                kind: Kind::Internal { keys, children },
+                kind: OnceLock::from(Kind::Internal { keys, children }),
+                pager: None,
                 ck: OnceLock::new(),
             })),
             dsp: 0,
@@ -502,7 +595,7 @@ where
     fn open(t: &Self) -> Open<K, V, M> {
         let n = t.root.as_deref().expect("open on a non-empty tree");
         let d = t.dsp;
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => Open::Leaf(if d == 0 {
                 entries.clone()
             } else {
@@ -522,7 +615,7 @@ where
         let mut cur = self;
         while let Some(n) = cur.root.as_deref() {
             h += 1;
-            match &n.kind {
+            match n.kind() {
                 Kind::Leaf(_) => break,
                 Kind::Internal { children, .. } => cur = &children[0],
             }
@@ -536,7 +629,7 @@ where
         let mut off = 0i64;
         loop {
             off = off.wrapping_add(cur.dsp);
-            match &cur.root.as_deref().expect("min_key of an empty tree").kind {
+            match cur.root.as_deref().expect("min_key of an empty tree").kind() {
                 Kind::Leaf(entries) => return entries[0].0.displace(off),
                 Kind::Internal { children, .. } => cur = &children[0],
             }
@@ -549,7 +642,7 @@ where
         let mut off = 0i64;
         loop {
             off = off.wrapping_add(cur.dsp);
-            match &cur.root.as_deref().expect("max_key of an empty tree").kind {
+            match cur.root.as_deref().expect("max_key of an empty tree").kind() {
                 Kind::Leaf(entries) => return entries[entries.len() - 1].0.displace(off),
                 Kind::Internal { children, .. } => cur = &children[children.len() - 1],
             }
@@ -605,7 +698,7 @@ where
     fn rem(t: &Self, key: &K, off: i64) -> Option<Self> {
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => {
                 let i = entries.binary_search_by(|(k, _)| k.cmp_displaced(off, key)).ok()?;
                 let Open::Leaf(mut e) = Self::open(t) else { unreachable!() };
@@ -627,7 +720,7 @@ where
     /// an internal root down to one child becomes that child, and an emptied
     /// leaf root becomes the empty tree.
     fn shrink_root(t: Self) -> Self {
-        match t.root.as_deref().map(|n| &n.kind) {
+        match t.root.as_deref().map(|n| n.kind()) {
             Some(Kind::Internal { children, .. }) if children.len() == 1 => {
                 children[0].relocate(t.dsp)
             }
@@ -690,7 +783,7 @@ where
 
     /// Occupancy below the floor — entries for a leaf, children for an internal.
     fn underflows(&self) -> bool {
-        match self.root.as_deref().map(|n| &n.kind) {
+        match self.root.as_deref().map(|n| n.kind()) {
             Some(Kind::Leaf(e)) => e.len() < MIN,
             Some(Kind::Internal { children, .. }) => children.len() < MIN,
             None => true,
@@ -818,7 +911,7 @@ where
         if contained(nlo, nhi, lo, hi) {
             return acc.combine(&n.measure.displace(off));
         }
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => {
                 let mut acc = acc;
                 for (k, v) in entries {
@@ -846,7 +939,7 @@ where
             Some(n) => n,
         };
         let off = off.wrapping_add(t.dsp);
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => {
                 for (k, v) in entries {
                     if in_span(k, off, lo, hi) {
@@ -874,7 +967,7 @@ where
             return n.size > 0;
         }
         let off = off.wrapping_add(t.dsp);
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => entries.iter().any(|(k, _)| in_span(k, off, lo, hi)),
             Kind::Internal { keys, children } => span(keys, children, off, lo, hi).any(|(idx, c)| {
                 let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
@@ -887,7 +980,7 @@ where
     fn last_le_in<'a>(t: &'a Self, key: &K, off: i64) -> Option<(K, &'a V)> {
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => {
                 let i = entries.partition_point(|(k, _)| k.cmp_displaced(off, key) != Ordering::Greater);
                 (i > 0).then(|| {
@@ -925,7 +1018,7 @@ where
                 }
             }
         }
-        match (a.root.as_deref().map(|n| &n.kind), b.root.as_deref().map(|n| &n.kind)) {
+        match (a.root.as_deref().map(|n| n.kind()), b.root.as_deref().map(|n| n.kind())) {
             (
                 Some(Kind::Internal { keys: ak, children: ac }),
                 Some(Kind::Internal { keys: bk, children: bc }),
@@ -1017,7 +1110,7 @@ where
             lo.is_none_or(|(l, o)| l.cmp_displaced(o, &k) != Ordering::Greater)
                 && hi.is_none_or(|(h, o)| h.cmp_displaced(o, &k) == Ordering::Greater)
         };
-        match &n.kind {
+        match n.kind() {
             Kind::Leaf(entries) => {
                 assert!(!entries.is_empty(), "empty leaf");
                 assert!(entries.len() <= B, "leaf over arity");
@@ -1119,7 +1212,7 @@ impl<'a, K, V, M> Iter<'a, K, V, M> {
         let mut off = off;
         while let Some(n) = cur.root.as_deref() {
             off = off.wrapping_add(cur.dsp);
-            match &n.kind {
+            match n.kind() {
                 Kind::Leaf(entries) => {
                     self.leaf = Some((entries, 0, off));
                     return;

@@ -16,8 +16,11 @@ here, because each one was on this page as future work and is now load-bearing:
 
 - **Path-only persistence** — a commit's *work*, not just its on-disk growth, is
   flat in relation size.
-- **Durable forks sharing one granfilade** — a 5000-row fork encodes zero node
-  frames.
+- **Durable forks sharing one granfilade** — a 5000-row fork encodes the same
+  two directory frames as a 50-row one.
+- **The whole world in the Ent, paged** — one root record, every directory and
+  the canopy a tree beneath it, nodes read on demand; opening a world reads two
+  frames whatever its size.
 - **Multi-order arrangements** — alternate column orderings per relation, so a
   *trailing*-column equality prunes at the source too, not just a lead-column
   one. It was, as predicted, purely "more measured trees."

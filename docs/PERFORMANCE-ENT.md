@@ -24,25 +24,32 @@ now the only substrate, so these numbers are the system's numbers, not one leg's
 ## 1. The short version
 
 The Ent buys you **cheap history, cheap copies, and sublinear questions**. It
-pays for that with **a fixed per-commit durability cost and an eager reopen**. A
-full scan costs about twice a flat array — a constant, not an asymptotic loss.
+pays for that with **a fixed per-commit durability cost and a few directory
+frames per commit**. A full scan costs about twice a flat array — a constant,
+not an asymptotic loss.
+
+> Rows marked † were re-measured after format v6 (one root record, every
+> structure a tree beneath it, nodes paged on demand) on an Apple-silicon laptop,
+> where an fsync costs ~4 ms rather than ~1 ms; frame and node counts are
+> hardware-independent. §6 has the before-and-after on that machine.
 
 | The Ent is good at | Measured |
 |---|---|
-| Forking a whole world | **0 node frames**, ~2.4 ms, flat from 1k to 100k rows |
-| Instancing a template (DSP virtual copy) | **11–18 node frames**, flat from 1k to 100k facts — a row-by-row copy writes 70–6,460 |
+| Forking a whole world † | **2 node frames**, one fsync, flat from 1k to 100k rows |
+| Instancing a template (DSP virtual copy) † | **14–21 node frames**, flat from 1k to 100k facts — a row-by-row copy writes 73–6,463 |
+| Opening a large world † | **2 frames read** at any size; a 10-row read then pages in 4–6 |
 | Answering "how many" over a span | **1.3 µs** at 100k rows — **2,050×** cheaper than the scan |
 | Reading a key span instead of a relation | **24.5 µs** for 1% of 100k — **109×** cheaper than the scan |
 | Proving a watcher is unaffected | **162 ns**, vs a ≥2.7 ms re-evaluation |
 | Reading the deep past | **89 ns** at edition 1 of 10,000 |
-| Commit work independent of relation size | 4.1 → 8.1 frames as rows go 1k → 100k |
+| Commit work independent of relation size † | 7.8 → 11.8 frames as rows go 1k → 100k |
 
 | The Ent is not good at | Measured |
 |---|---|
 | Single-row commit latency | **~1 ms**, fsync-bound — ~1,000 commits/s |
 | Reading a whole relation | **1.9× a flat `Vec` clone** — 27 ns/row vs 14 ns/row |
-| Reopening a large world | **40 ms** at 100k rows — eager, `O(state)` |
-| Unconsolidated history | ~4 nodes per commit; 1,000 commits → 3,930 nodes |
+| Opening fjall itself † | grows with the data — 5 ms at 1k rows, 13 ms at 100k; the Ent adds nothing to it |
+| Unconsolidated history † | ~8 nodes per commit; 1,000 commits → 7,896 nodes |
 | Consolidation itself | **89 ms** to fold and collect 5,000 editions |
 
 ---
@@ -52,15 +59,16 @@ full scan costs about twice a flat array — a constant, not an asymptotic loss.
 ### Fork is genuinely free
 
 ```
-fork whole world      1,000 rows    2,195,857 ns    0 node frames written
-fork whole world     10,000 rows    2,533,012 ns    0 node frames written
-fork whole world    100,000 rows    2,375,068 ns    0 node frames written
+fork whole world      1,000 rows    4,836,500 ns    2 node frames written   †
+fork whole world     10,000 rows    4,895,250 ns    2 node frames written   †
+fork whole world    100,000 rows    4,337,875 ns    2 node frames written   †
 ```
 
-Flat, and **zero nodes written** at every size. A fork is a new branch in the
-same granfilade whose roots name nodes already stored, so the only work is
-writing those roots. The ~2.4 ms is entirely the `SyncAll` — the same ~1 ms floor
-every commit pays, twice (roots, then the branch graph).
+Flat, and **two frames written** at every size: the new leaves of the branch DAG
+and of the branch enfilade, which link to the parent's Rel enfilade unchanged.
+Every relation's nodes are shared. The time is one `SyncAll` (~4 ms on this
+machine); before v6 a fork wrote no nodes but issued three syncs (flush, roots,
+branch graph) and took 12 ms here.
 
 This is the single clearest case for the whole design. A copying store makes
 forking a 100k-row world proportional to 100k rows; here it is proportional to
@@ -71,12 +79,12 @@ at the tip.)
 ### Instancing is a virtual copy
 
 ```
-instance_template (graft)      1,000 facts     4,935,709 ns    11 node frames written
-copy by commit (row by row)    1,000 facts     7,062,875 ns    70 node frames written
-instance_template (graft)     10,000 facts     3,950,625 ns    12 node frames written
-copy by commit (row by row)   10,000 facts    30,921,500 ns   650 node frames written
-instance_template (graft)    100,000 facts     4,364,750 ns    18 node frames written
-copy by commit (row by row)  100,000 facts   531,339,792 ns  6,460 node frames written
+instance_template (graft)      1,000 facts     4,789,958 ns    14 node frames written
+copy by commit (row by row)    1,000 facts     8,202,125 ns    73 node frames written
+instance_template (graft)     10,000 facts     4,928,750 ns    15 node frames written
+copy by commit (row by row)   10,000 facts    31,833,042 ns   653 node frames written
+instance_template (graft)    100,000 facts     6,145,583 ns    21 node frames written
+copy by commit (row by row)  100,000 facts   550,257,042 ns  6,463 node frames written
 ```
 
 A template block in the middle of a relation is copied to a fresh block. The
@@ -84,7 +92,8 @@ graft splits the block out, relocates it by one dsp, and joins it back in, so
 the instance shares every interior node with the template: the frames written
 grow with the tree's depth, and the time is the commit's `SyncAll`. Committing
 the same rows as copies grows linearly — about one frame per 15 facts and
-~5 µs per fact at 100k. (Measured later than the rest of this report, on an
+~5 µs per fact at 100k. Both sides now also write the three directory frames
+every v6 commit writes. (Measured later than the rest of this report, on an
 Apple-silicon laptop; the frame counts are hardware-independent.)
 
 ### Measures answer without materializing
@@ -132,13 +141,16 @@ the canopy.
 ### Commit work is flat in relation size
 
 ```
-single-row commit   1,000 rows     906,323 ns   4.1 frames/commit
-single-row commit  10,000 rows     993,975 ns   6.1 frames/commit
-single-row commit 100,000 rows   1,146,128 ns   8.1 frames/commit
+single-row commit   1,000 rows     906,323 ns   7.8 frames/commit   (frames †)
+single-row commit  10,000 rows     993,975 ns   9.8 frames/commit
+single-row commit 100,000 rows   1,146,128 ns  11.8 frames/commit
 ```
 
-100× the rows costs 2 extra node frames — one per extra level of tree depth. The
-wall-clock rise is the fsync moving more bytes, not more algorithmic work.
+100× the rows costs 4 extra node frames — one per extra level of the Fact tree
+and the edition log. The wall-clock rise is the fsync moving more bytes, not
+more algorithmic work. The frames are v6 counts, about 3.7 more than v5 at
+every size: the directories above the edited trees (version enfilade, Rel
+enfilade, branch enfilade) are now copied on the path and written too.
 
 ---
 
@@ -175,33 +187,36 @@ does plus node-chasing between leaves. Worth knowing in both directions — the
 Ent's read path is built to *avoid* full scans (range, measure, routing), but
 when you do want every row it is not a disaster, just a constant.
 
-### Reopen is eager
+### Opening a store is fjall's cost now, not the Ent's
 
 ```
-open + rebuild     1,000 rows    2,207,770 ns
-open + rebuild    10,000 rows    6,370,748 ns
-open + rebuild   100,000 rows   40,279,846 ns
+open fjall alone      100,000 rows   13,244,333 ns                     †
+open EntStore         100,000 rows   11,282,375 ns   2 frames paged
+first 10-row read     100,000 rows       20,875 ns   6 frames paged
 ```
 
-Recovery is a root lookup — no log replay — but `load` then reads the *entire*
-tree back eagerly, one KV `get` per node. So open is `O(state)`: 40 ms for 100k
-rows, and it would be 400 ms for a million. Lazy paging (fault nodes in on
-demand, keep only the root resident) is the obvious fix and is not implemented.
+Before v6, open read the *entire* tree back eagerly, one KV `get` per node: 40 ms
+for 100k rows on the original machine, 22 ms on this one. Now it reads the root
+record and two frames, and everything else pages in as reads reach it. What
+remains is fjall opening its own database, which grows with the data (5 ms at
+1k rows, 13 ms at 100k) and is the same with or without the Ent on top.
 
 ### Unconsolidated history accumulates
 
 ```
-1,000 single-row commits →  3,930 nodes   (~3.9 nodes/commit)
-5,000 single-row commits → 26,026 nodes   (~5.2 nodes/commit)
+1,000 single-row commits →  7,896 nodes   (~7.9 nodes/commit)   †
+5,000 single-row commits → 49,040 nodes   (~9.8 nodes/commit)
 ```
 
 Every commit path-copies, and every copied node is retained until GC. The cost is
 bounded and predictable — a few nodes per commit — but it is not free, and it
-grows with tree depth. Consolidation reclaims essentially all of it:
+grows with tree depth. Since v6 it is about twice what it was (3,930 and 26,026
+nodes), because the directories are trees on disk and each edition copies their
+spines too. Consolidation reclaims essentially all of it:
 
 ```
-consolidate + gc   1,000 editions    11.5 ms    3,930 → 32 nodes   (99.2% collected)
-consolidate + gc   5,000 editions    88.9 ms   26,026 → 161 nodes  (99.4% collected)
+consolidate + gc   1,000 editions    17.0 ms    7,896 → 36 nodes   (99.5% collected)   †
+consolidate + gc   5,000 editions    54.4 ms   49,040 → 165 nodes  (99.7% collected)
 ```
 
 but it is a stop-the-world sweep that holds the commit lock, and it is `O(stored
@@ -309,8 +324,8 @@ It is the wrong shape when:
   time in `fsync`, not in the tree;
 - the dominant read is "give me every row" — a flat array wins, though only by
   ~1.9×, so this is a reason to prefer something else, not a reason to avoid this;
-- worlds are enormous and restarts must be fast — reopen is eager and linear
-  until lazy paging lands.
+- history is kept unconsolidated for a long time — every edition retains a
+  few directory nodes as well as its data path, ~8 nodes per single-row commit.
 
 ### Follow-ups, in the order the numbers justify them
 
@@ -319,8 +334,8 @@ It is the wrong shape when:
    fsync across concurrent committers is the largest single win available and does
    not weaken the Patch–edition law — the law demands one atomic durable write per
    edition, not one per committer.
-2. **Lazy node paging.** Fixes the 40 ms reopen *and* the resident-memory floor,
-   both of which are `O(state)` for the same reason: `load` is eager.
+2. ~~**Lazy node paging.**~~ Done in v6: open reads two frames, and only the
+   nodes a read reaches are resident.
 3. **Background consolidation.** Moves the 89 ms sweep off the commit path.
 4. **Retry backoff**, if fairness under contention ever matters — the protocol is
    correct but currently starves losers.
@@ -330,3 +345,31 @@ Two things the report deliberately does not claim. The scan penalty is a measure
 it was measured. And the P13 precondition axis is still *titled* as though
 `holds_at` scans the relation tail; it does not, and the title is stale — the
 numbers there are flat in history and should be read as an fsync measurement.
+
+---
+
+## 6. Format v6: the whole world in the Ent, before and after
+
+v6 moved every directory into the granfilade under one root record and made
+nodes page in on demand (`docs/ENT-AND-XANADU.md` §3). Both builds were run on
+the same Apple-silicon laptop, one after the other (`entbench`, release; an
+fsync costs ~4 ms here):
+
+| Axis | v5 | v6 |
+|---|---|---|
+| Fork, 100k rows | 0 frames, 3 syncs, 12.4 ms | **2 frames, 1 sync, 4.3 ms** |
+| Open, 100k rows | 21.9 ms, every node read | **11.3 ms, 2 frames read** (fjall alone: 13.2 ms) |
+| First 10-row read after open, 100k rows | — (already resident) | 21 µs, 6 frames paged |
+| Single-row commit, frames | 4.1 / 6.1 / 8.1 | 7.8 / 9.8 / 11.8 (1k / 10k / 100k rows) |
+| Single-row commit, time, 100k rows | 4.8 ms | 4.9 ms |
+| Instance a 100k-fact template | 18 frames, 5.0 ms | 21 frames, 6.1 ms |
+| 1,000 unconsolidated commits | 3,930 nodes | 7,896 nodes |
+| Consolidate + GC, 5,000 editions | 38 ms | 54 ms |
+| `read_at` / `read_range` / `count_at`, 100k rows | 760 µs / 5.6 µs / 648 ns | 734 µs / 5.7 µs / 626 ns |
+
+What it bought: open no longer reads the world, and the canopy, the branch DAG
+and every directory survive a reopen as the same structures they were. What it
+cost: each commit copies and writes the directory spines above the edited trees
+— about 3.7 more frames — so unconsolidated history takes twice the nodes, and
+consolidation has twice as many to sweep. Commit latency, which is the fsync, did
+not move. Reads of resident data are unchanged within this run's noise.

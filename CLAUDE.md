@@ -38,9 +38,12 @@ granfilade's on-disk node frame. `grmpl-ent` does **not** keep a private copy.
 Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
 
 * `message   = version(1) || inbox(u32, BE) || encoded_tuple`
-* `node frame = version(1) || tag(1) || n_children(u32, BE) || [content_key]*n
-                || count(u32, BE) || payload` — a leaf's payload is its entries;
-  an internal node's is its separators then each child's dsp (`i64`, BE)
+* `node frame = version(1) || tag(1) || n_refs(u32, BE) || [content_key]*n
+                || count(u32, BE) || payload` — an internal node's refs are its
+  children and its payload is its separators, then each child's dsp (`i64`),
+  size (`u64`) and measure; a leaf's payload is its entries and its refs are the
+  **links** its values hold (a value may be a whole tree), in order
+* `root record = version(1) || n(u8) || [present(1) || content_key?]*n`
 
 Node content keys are **SHA-256** (`grmpl_core::hash`), vendored and pinned
 against the FIPS vectors: the hash is part of the on-disk format, so it may not
@@ -66,6 +69,21 @@ parent); nodes store keys in their local frame. Two rules keep it correct:
 
 `instance_template` is a graft: an occupied target block is refused, never
 merged into.
+
+### One root, paged (`grmpl-ent::granfilade`, `store`)
+
+The granfilade has **one** mutable slot, the root record. Everything durable is
+a tree reachable from it: the branch DAG and the branch enfilade, whose values
+are each branch's whole state (clock, Rel enfilade, context enfilade, canopy).
+**Never add a second meta key**; link a new tree from an existing one instead.
+
+* **Root records land in staging order.** Every branch rewrites the one root, so
+  staging takes the family's root lock and the group-commit queue is shared by
+  every branch of a world. Lock order is edition → root → durability.
+* **A paged node's frame outlives every handle that can still page it in.** GC
+  roots are the root record *and* every paged node still unread in memory; a
+  sweep removes swept keys from the granfilade's `present` set, so a resident
+  node that loses its frame is written again if a later root reaches it.
 
 ### Determinism
 

@@ -19,9 +19,12 @@ structural sharing, versions as roots, version compare that costs the size of
 the change, content-addressed persistence, interest routing — and, since the
 tree gained displacements, Gold's **dsps on pointers**, with persistent
 split/join and an `O(log n)` **virtual copy** that the store uses for template
-instancing. What remains short of the Ent is listed in §5: DSP-inherited
-context, persisting the directories that are still rebuilt on open, lazy
-loading, and Green's 2D enfilades.
+instancing. And the whole world is now *in* the Ent: one root record links to
+the branch DAG and to the per-branch state, every directory and the canopy are
+trees beneath it, and nodes page in on demand, so opening a world reads two
+frames whatever its size. What remains short of the Ent is listed in §5:
+summaries richer than a count, DSP-inherited context, a reverse index over
+grafts, merges in the branch DAG, and Green's 2D enfilades.
 
 ---
 
@@ -141,20 +144,43 @@ persists all of them through one node store, the `granfilade`.
 
 **Structures built on it:**
 
-| Structure | What it is | Persisted how |
-|---|---|---|
-| Fact trees | one `Tree<Tuple, Diff, Count>` per relation per live edition | nodes in the granfilade; the root pointer per edition in fjall's `meta` keyspace |
-| Edition log | `(edition, index) → update`, or one `Graft` entry per relation for a virtual copy | granfilade; root pointer in `meta` |
-| Version / relation directories | `edition → Fact root`, the live-relation set | **in memory**, rebuilt from the `meta` root pointers on open |
-| Context tree | the name→`RelId` catalog and edition-versioned schemas, at the root scope | granfilade; root pointer in `meta` |
-| Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs | **in memory**, rebuilt empty on open and fork; watchers re-register |
-| Branch DAG | branches with at most one parent (a tree; no merges), and common-ancestor lookup | a hand-encoded blob in `meta` |
-| Granfilade | `SHA-256(frame) → frame`, with mark-and-sweep GC | fjall `nodes` keyspace; loaded **eagerly** on open, so the world is RAM-resident |
+Every structure is a tree, and every tree hangs from one root record:
+
+```
+root record ──► branch DAG         Tree<BranchId, Branch>          (Gold's fulltrace DagWood)
+            └─► branch enfilade    Tree<BranchId, BranchState>     (Gold's oroots)
+                  BranchState = clock, watermark,
+                    ├─► Rel enfilade       Tree<RelId, RelRoots>
+                    │     RelRoots ─► Version enfilade  Tree<edition, Fact tree>
+                    │              ─► Edition log       Tree<(edition, i), update | graft>
+                    │              ─► Arrangements      Tree<column, Fact tree>
+                    ├─► context enfilade   catalog + schemas
+                    └─► canopy, fired-set, interest registry
+```
+
+| Structure | What it is |
+|---|---|
+| Fact trees | one `Tree<Tuple, Diff, Count>` per relation per live edition |
+| Edition log | `(edition, index) → update`, or one `Graft` entry per relation for a virtual copy |
+| Version / relation directories | `edition → Fact root`, `relation → its roots` |
+| Context tree | the name→`RelId` catalog and edition-versioned schemas, at the root scope |
+| Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs; persisted with the commits routed to it |
+| Branch DAG | branches with at most one parent (a tree; no merges), and common-ancestor lookup |
+| Granfilade | `SHA-256(frame) → frame` in fjall's `nodes` keyspace, one root record in `meta`, mark-and-sweep GC |
+
+A tree holds another tree as a **link**: the linked root's content key rides in
+the frame's reference run beside an internal node's children, so GC follows a
+link exactly as it follows a child, and the payload records the linked tree's
+dsp, size and measure. Internal frames likewise record each child's size and
+measure, so a child read back from disk is a **paged** node: counted, measured
+and comparable by key without being read. Opening a world reads the root record
+and two frames; a read pages in the paths it walks. GC treats the root record
+and every paged node still unread in memory as roots, so a pinned reader keeps
+its version after consolidation retires it.
 
 Everything the language stores goes through these trees: world relations,
 inboxes, cursors, timers, counters, outboxes and materialized views are all
-ordinary relations in the Fact trees. The edition clock, watermark and root
-pointers are raw values in fjall's `meta` keyspace.
+ordinary relations in the Fact trees.
 
 **Operations:**
 
@@ -162,12 +188,12 @@ pointers are raw values in fjall's `meta` keyspace.
   differential engine) skips any subtree the two versions share, by pointer or
   content key, so it costs the size of the difference. This is the Ent's
   version-comparison idea, realized.
-* **Fork** (`EntStore::fork_at`) shares every fact node and writes none; it cuts
-  each relation's version directory and log at the fork edition with a persistent
-  split, so it costs `O(relations × log n)`.
+* **Fork** (`EntStore::fork_at`) shares every fact node and writes none. Forking
+  at the present shares the whole Rel enfilade and writes two frames (the new DAG
+  and branch-enfilade leaves); forking into the past cuts each relation's version
+  directory and log with a persistent split, `O(relations × log n)`.
 * **Template instancing** (`EntStore::instance_template`) is a **graft** per
-  relation: `O(log n)` new nodes and one log entry however large the template is
-  (a 20 000-fact instance adds 5 nodes). The edition log records a `Graft` entry
+  relation: `O(log n)` new nodes and one log entry however large the template is. The edition log records a `Graft` entry
   and `scan_updates` expands it from that edition's Fact root, so watchers and
   replay see ordinary updates; the canopy routes it by span.
 
@@ -188,14 +214,15 @@ runtime uses it yet.
 | Patch = guarded, atomic next edition | ✅ semantic center | ✅ `commit_if`, group-committed |
 | Structural sharing / path copy | ✅ | ✅ `O(log n)` new nodes per commit |
 | Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees |
-| Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd; eager load |
+| Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd, paged on demand |
+| One root; every structure a tree beneath it | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
 | Measured tree with upward summaries | ✅ "WIDative summaries" | ⚠️ cached measures over ordered keys; `Count` only |
 | **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
 | **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
 | **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
 | DSP-inherited context down scopes | ✅ Context enfilades | ❌ catalog and schemas only, at the root scope |
-| Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ branch tree, no merges; stored as a blob |
-| Canopy indexing interest | ✅ Canopy enfilades | ⚠️ real interval routing, but in memory |
+| Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ a persisted enfilade, but a tree of branches: no merges |
+| Canopy indexing interest | ✅ Canopy enfilades | ✅ interval routing, persisted with the commits routed to it |
 | Derived state in the Ent | ✅ Derived enfilades | ⚠️ `Materialized` exists, unwired; engine state in memory |
 | Sequences as measured enfilades (§6 parsing) | ✅ | ❌ |
 | Udanax Green 2D enfilades (poom/span) | — | ❌ |
@@ -205,29 +232,41 @@ runtime uses it yet.
 ## 5. Verdict
 
 The design is a faithful, ambitious generalization of the Ent, and the
-implementation now has both halves of the Ent's core: its **versioning**
-(immutable versions, path copying, cheap history, comparison that costs the
-change, content-addressed persistence) and its **coordinate system** (dsps on
-pointers, `O(1)` relocation, `O(log n)` virtual copy by graft). It differs from
-Udanax in what the coordinates are: ordered tuples whose entity cells move,
-rather than tumbler widths.
+implementation now has the Ent's core: its **versioning** (immutable versions,
+path copying, cheap history, comparison that costs the change,
+content-addressed persistence), its **coordinate system** (dsps on pointers,
+`O(1)` relocation, `O(log n)` virtual copy by graft), and its **shape on disk**
+(one root, `oroots` and `fulltrace` beneath it, every structure a tree, nodes
+paged in on demand). It differs from Udanax in what the coordinates are:
+ordered tuples whose entity cells move, rather than tumbler widths.
 
 What is still short of the Ent:
 
-1. **DSP-inherited context.** Context enfilades that carry namespace, authority
+1. **Summaries are thin.** The only measure is `Count`. Gold's wids also carry a
+   subtree's extent in its coordinate space, which is what prunes a search in
+   more than one dimension; ordered keys get by on separators, two dimensions
+   would not.
+2. **No reverse index.** Nothing answers "which instances share this template's
+   nodes" — Green's spanfilade question. A graft points one way only, and
+   **version compare across a graft** falls back to an in-order merge of the
+   subtrees whose separators differ, costing the instance's size rather than its
+   node count.
+3. **DSP-inherited context.** Context enfilades that carry namespace, authority
    or placement down a scope tree are not built, and nothing in the language
    declares scopes yet; building the mechanism first would only produce another
    unused placeholder.
-2. **Directories rebuilt on open.** The version and relation directories are
-   rebuilt from per-edition root pointers in fjall's `meta` keyspace, the canopy
-   is rebuilt empty, and the branch DAG is a blob. Persisting them as trees in the
-   granfilade needs node frames that can reference other trees' roots, which GC
-   must then follow.
-3. **Eager load.** Opening a store loads every node; nothing is paged in.
-4. **Version compare across a graft** falls back to an in-order merge of the
-   subtrees whose separators differ, so comparing across an instance costs the
-   instance's size rather than its node count.
+4. **The branch DAG has no merges.** It is a tree of branches, each with one
+   parent.
 5. **Green's 2D enfilades** (poom/span) have no counterpart.
+
+Three costs of the paged layout are worth naming. A page-in that fails panics:
+a paged node's frame is referenced by a durable parent and protected from GC
+while any handle can reach it, so a missing frame means a damaged store, not a
+race. Every branch rewrites the one root, so staging a commit takes a world-wide
+lock (the `fsync` is still shared by the group, as before). And opening the
+store's fjall database grows with the data — 4 ms at 1,000 rows, 90 ms at
+200,000 — which is fjall's own recovery; the Ent's part of an open is two
+frames at every size.
 
 `store.rs` and everything above it — the `TraceStore` contract, the language,
 the laws — were untouched by the coordinate change, which is what the bright line

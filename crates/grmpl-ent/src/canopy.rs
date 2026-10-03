@@ -19,8 +19,9 @@
 //!
 //! It is an enfilade rather than an array-plus-segment-tree (G-4) so that
 //! registering an interest is an `O(log n)` persistent insert instead of an
-//! `O(n log n)` rebuild. It is **not persisted**: `EntStore` rebuilds it empty on
-//! open and on fork, and watchers re-register their interests.
+//! `O(n log n)` rebuild. It is **persisted** with the rest of its branch's
+//! state, so a registered interest and the commits routed to it survive a
+//! reopen; a fork starts with an empty canopy.
 //!
 //! Each interest carries an **endorsement** (a monotone flag-lattice element);
 //! [`route_endorsed`] gates delivery on an interest holding every required flag —
@@ -30,6 +31,7 @@
 
 use grmpl_core::{Diff, RelId, Tuple};
 
+use crate::granfilade::{Dec, Enc, Persist};
 use crate::measure::Measure;
 use crate::tree::{NodeRef, Tree};
 
@@ -107,16 +109,46 @@ pub type CanopyEnf = Tree<InterestKey, InterestVal, Reach>;
 
 /// An endorsement persists as its flag word, so a canopy can be written to the
 /// granfilade like any other enfilade.
-impl crate::granfilade::Persist for Endorsement {
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.0.to_be_bytes());
+impl Persist for Endorsement {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.0.encode(e);
     }
-    fn decode(bytes: &[u8], pos: usize) -> grmpl_core::Result<(Self, usize)> {
-        let end = pos + 8;
-        let b = bytes
-            .get(pos..end)
-            .ok_or_else(|| grmpl_core::Error::Codec("canopy: truncated endorsement".into()))?;
-        Ok((Endorsement(u64::from_be_bytes(b.try_into().unwrap())), end))
+    fn decode(d: &mut Dec<'_>) -> grmpl_core::Result<Self> {
+        Ok(Endorsement(u64::decode(d)?))
+    }
+}
+
+/// The canopy's measure persists with it: an internal frame records each
+/// child's reach, so a stab prunes a paged subtree without reading it.
+impl Persist for Reach {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.max_hi.encode(e);
+        self.endorse.encode(e);
+    }
+    fn decode(d: &mut Dec<'_>) -> grmpl_core::Result<Self> {
+        Ok(Reach { max_hi: Option::decode(d)?, endorse: Endorsement::decode(d)? })
+    }
+}
+
+/// An interest id persists as its number.
+impl Persist for InterestId {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.0.encode(e);
+    }
+    fn decode(d: &mut Dec<'_>) -> grmpl_core::Result<Self> {
+        Ok(InterestId(u64::decode(d)?))
+    }
+}
+
+/// A canopy persists as its id counter and a link to its enfilade, so the
+/// standing interests are part of the durable world.
+impl Persist for Canopy {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.next.encode(e);
+        e.link(&self.enf);
+    }
+    fn decode(d: &mut Dec<'_>) -> grmpl_core::Result<Self> {
+        Ok(Canopy { next: u64::decode(d)?, enf: d.link()? })
     }
 }
 

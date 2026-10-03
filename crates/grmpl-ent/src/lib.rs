@@ -9,8 +9,15 @@
 //! a local frame, so [`relocate`](tree::Tree::relocate) is `O(1)` and
 //! [`graft`](tree::Tree::graft) — the virtual copy behind
 //! [`EntStore::instance_template`] — costs `O(log n)` new nodes. What a
-//! displacement does to a key is [`Displace`]. See `docs/ENT-AND-XANADU.md` for
-//! how this compares with Xanadu's `Ent` and what is still missing.
+//! displacement does to a key is [`Displace`].
+//!
+//! **Everything is in the Ent.** The granfilade has one mutable slot, its root
+//! record, linking to the branch DAG and the branch enfilade; each branch's
+//! state — its relations' versions, logs and Arrangements, its context enfilade,
+//! its canopy — is trees linked from there. Nodes page in on demand, so opening
+//! a world reads a couple of frames whatever its size. See
+//! `docs/ENT-AND-XANADU.md` for how this compares with Xanadu's `Ent` and what
+//! is still missing.
 
 pub mod canopy;
 pub mod context;

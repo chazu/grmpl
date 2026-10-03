@@ -20,6 +20,9 @@
 //! The DAG is deterministic — branch ids are allocated by a monotone counter, no
 //! clock or randomness — so it is Replay-safe like every other enfilade.
 
+use grmpl_core::Result;
+
+use crate::granfilade::{Dec, Enc, Persist};
 use crate::measure::Count;
 use crate::tree::Tree;
 
@@ -34,6 +37,20 @@ pub struct Branch {
     pub id: BranchId,
     /// `None` for the root; `Some((parent, at))` for a fork.
     pub parent: Option<(BranchId, u64)>,
+}
+
+/// A branch record persists as its id and fork point. The DagWood is the
+/// fulltrace's branch structure, so it is durable like every other part of the
+/// world — a reopened store that forgot its forks would have forgotten its
+/// history.
+impl Persist for Branch {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        self.id.encode(e);
+        self.parent.encode(e);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok(Branch { id: u64::decode(d)?, parent: Option::decode(d)? })
+    }
 }
 
 /// The branch enfilade: `branch id → its fork point`.
@@ -124,56 +141,19 @@ impl Dag {
         false
     }
 
-    /// Encode the whole branch graph: `count || [id, has_parent, parent, at]*`.
-    /// The DagWood is the fulltrace's branch structure, so it is durable like
-    /// every other part of the world — a reopened store that forgot its forks
-    /// would have forgotten its history.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(self.branches.len() as u32).to_be_bytes());
-        for (_, b) in self.branches.iter() {
-            out.extend_from_slice(&b.id.to_be_bytes());
-            match b.parent {
-                None => out.push(0),
-                Some((p, at)) => {
-                    out.push(1);
-                    out.extend_from_slice(&p.to_be_bytes());
-                    out.extend_from_slice(&at.to_be_bytes());
-                }
-            }
-        }
-        out
+    /// The branch enfilade itself — what the Ent's root record links to.
+    pub(crate) fn tree(&self) -> &BranchTree {
+        &self.branches
     }
 
-    /// Decode a graph written by [`encode`](Self::encode). An empty or absent
-    /// blob is a fresh DAG holding only the root branch.
-    pub fn decode(bytes: &[u8]) -> Option<Dag> {
-        if bytes.is_empty() {
-            return Some(Dag::new());
+    /// The DAG held in a (reloaded) branch enfilade. An empty tree is a fresh
+    /// DAG holding only the root branch.
+    pub(crate) fn from_tree(branches: BranchTree) -> Dag {
+        if branches.is_empty() {
+            return Dag::new();
         }
-        let n = u32::from_be_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
-        let mut branches = BranchTree::new();
-        let mut next = 0u64;
-        let mut pos = 4;
-        for _ in 0..n {
-            let id = u64::from_be_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?);
-            pos += 8;
-            let parent = match bytes.get(pos)? {
-                0 => {
-                    pos += 1;
-                    None
-                }
-                _ => {
-                    let p = u64::from_be_bytes(bytes.get(pos + 1..pos + 9)?.try_into().ok()?);
-                    let at = u64::from_be_bytes(bytes.get(pos + 9..pos + 17)?.try_into().ok()?);
-                    pos += 17;
-                    Some((p, at))
-                }
-            };
-            branches = branches.insert(id, Branch { id, parent });
-            next = next.max(id + 1);
-        }
-        Some(Dag { branches, next })
+        let next = branches.last_le(&BranchId::MAX).map_or(1, |(id, _)| id + 1);
+        Dag { branches, next }
     }
 
     /// The latest point shared by `(ba, ea)` and `(bb, eb)` — their merge base:
