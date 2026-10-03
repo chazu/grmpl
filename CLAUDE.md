@@ -104,6 +104,12 @@ The spanfilade records every graft by source span and by target span, per
 branch. It is **append-only** — retraction and consolidation leave it alone — and
 a fork into the past keeps only the grafts made by the fork edition.
 
+Version compare (`Tree::diff`) skips a subtree only when both sides hold **the
+same node at the same absolute position** (parent offset plus dsp). The same
+node relocated holds different entries. `compare_spans` splices each graft's
+source, as of the edition before it, into the earlier version, so the copy
+compares as unchanged and is reported by span.
+
 ### Context and derived enfilades (`context`/`inherit`, `materialized view`)
 
 * **A materialized view never changes an answer.** `Query::Materialized` means

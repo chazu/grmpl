@@ -69,10 +69,12 @@ const MIN: usize = B / 2;
 /// A node is either a run of entries or a run of children with separators, all
 /// in the node's **local frame**.
 ///
-/// Internal invariant: `keys.len() + 1 == children.len()`, and `keys[i]` is the
-/// least key in `children[i + 1]` (in this node's frame, i.e. after that child's
-/// dsp) — so `children[i]` covers the half-open span `[keys[i - 1], keys[i])`,
-/// unbounded at the ends.
+/// Internal invariant: `keys.len() + 1 == children.len()`, and `children[i]`
+/// holds only keys in the half-open span `[keys[i - 1], keys[i])` (in this
+/// node's frame, i.e. after that child's dsp), unbounded at the ends. A
+/// separator is written as the least key of the child to its right, but a
+/// removal can leave it below that child's least key, so it is a bound, not
+/// the key.
 enum Kind<K, V, M> {
     Leaf(Vec<(K, V)>),
     Internal { keys: Vec<K>, children: Vec<Tree<K, V, M>> },
@@ -414,21 +416,23 @@ where
     /// descending: by pointer when the two are the same in-memory node, and by
     /// **memoized content key** when they are the same node reached through
     /// different handles (a reloaded version, a fork) — in both cases only at
-    /// the same displacement. Pruning happens at *every* level, not just the
-    /// root, which is what makes version-compare cost the edit rather than the
-    /// relation.
+    /// the same *absolute* position. Pruning happens at *every* level, not just
+    /// the root, which is what makes version-compare cost the edit rather than
+    /// the relation.
     ///
-    /// The descent pairs children only when the two nodes sit at the same
-    /// displacement and carry the **same separators** — then each pair covers
-    /// exactly the same key span and can be compared independently. That is the
-    /// ordinary case for a path copy. Otherwise *that subtree pair* falls back to
-    /// an in-order merge, which is always correct.
+    /// **Shape-independent.** Each side is walked as a *frontier*: its
+    /// unvisited entries as a key-ordered run of whole subtrees. Two heads that
+    /// are the same node at the same position are dropped together, whatever
+    /// their parents look like; two that differ are both opened. So a shared
+    /// subtree is found however the spines above it were rebuilt: by a split,
+    /// a join, or a graft's seams. Comparing across a graft costs the copy and
+    /// its seams, not the relation.
     pub fn diff(&self, other: &Self) -> Vec<EntryDiff<K, V>>
     where
         V: PartialEq,
     {
         let mut out = Vec::new();
-        Self::diff_into(self, other, 0, &mut out);
+        Self::diff_into(self, other, &mut out);
         out
     }
 
@@ -1089,86 +1093,160 @@ where
         }
     }
 
-    fn diff_into(a: &Self, b: &Self, off: i64, out: &mut Vec<EntryDiff<K, V>>)
+    fn diff_into(a: &Self, b: &Self, out: &mut Vec<EntryDiff<K, V>>)
     where
         V: PartialEq,
     {
-        // The same in-memory node at the same position: nothing beneath differs.
-        if a.same_version(b) {
-            return;
-        }
-        // The same *content* at the same position, reached by different handles
-        // — the cross-version form of the same fact, available because nodes
-        // memoize their key.
-        if a.dsp == b.dsp {
-            if let (Some(x), Some(y)) =
-                (a.ck_cell().and_then(|c| c.get()), b.ck_cell().and_then(|c| c.get()))
-            {
-                if x == y {
-                    return;
+        let (mut xs, mut ys) = (Self::frontier(a), Self::frontier(b));
+        loop {
+            let step = match (xs.last(), ys.last()) {
+                (None, None) => return,
+                (Some(_), None) => Step::Left,
+                (None, Some(_)) => Step::Right,
+                (Some(x), Some(y)) => Self::step(x, y),
+            };
+            match step {
+                Step::Skip => {
+                    xs.pop();
+                    ys.pop();
+                }
+                Step::Left => Self::emit(xs.pop().expect("a head"), true, out),
+                Step::Right => Self::emit(ys.pop().expect("a head"), false, out),
+                Step::Pair => {
+                    let (Some(Head::Entry(k, off, va)), Some(Head::Entry(.., vb))) = (xs.pop(), ys.pop()) else {
+                        unreachable!("a pair is two entries")
+                    };
+                    if va != vb {
+                        out.push((moved(k, off).into_owned(), Some(va.clone()), Some(vb.clone())));
+                    }
+                }
+                Step::OpenLeft => Self::open_onto(&mut xs),
+                Step::OpenRight => Self::open_onto(&mut ys),
+                Step::OpenBoth => {
+                    Self::open_onto(&mut xs);
+                    Self::open_onto(&mut ys);
                 }
             }
-        }
-        match (a.root.as_deref().map(|n| n.kind()), b.root.as_deref().map(|n| n.kind())) {
-            (
-                Some(Kind::Internal { keys: ak, children: ac }),
-                Some(Kind::Internal { keys: bk, children: bc }),
-            ) if a.dsp == b.dsp && ak == bk && ac.len() == bc.len() => {
-                // Identical frames and separators ⇒ child `i` of each covers the
-                // same span.
-                let local_off = off.wrapping_add(a.dsp);
-                for (x, y) in ac.iter().zip(bc.iter()) {
-                    Self::diff_into(x, y, local_off, out);
-                }
-            }
-            _ => Self::merge_diff(a, b, off, out),
         }
     }
 
-    /// The in-order merge of two subtrees' entries — the always-correct base the
-    /// pruned descent falls back to.
-    fn merge_diff(a: &Self, b: &Self, off: i64, out: &mut Vec<EntryDiff<K, V>>)
-    where
-        V: PartialEq,
-    {
-        fn walk<K: Displace, V, M>(t: &Tree<K, V, M>, off: i64) -> Vec<(K, &V)> {
-            let mut it = Iter { stack: Vec::new(), leaf: None };
-            it.descend(t, off);
-            it.collect()
+    /// A whole tree as a one-item frontier.
+    fn frontier(t: &Self) -> Vec<Head<'_, K, V, M>> {
+        if t.is_empty() {
+            return Vec::new();
         }
-        let (av, bv) = (walk(a, off), walk(b, off));
-        let (mut i, mut j) = (0, 0);
-        while i < av.len() || j < bv.len() {
-            match (av.get(i), bv.get(j)) {
-                (Some((ak, aval)), Some((bk, bval))) => match ak.cmp(bk) {
-                    std::cmp::Ordering::Less => {
-                        out.push((ak.clone(), Some((*aval).clone()), None));
-                        i += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        out.push((bk.clone(), None, Some((*bval).clone())));
-                        j += 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        if aval != bval {
-                            out.push((ak.clone(), Some((*aval).clone()), Some((*bval).clone())));
-                        }
-                        i += 1;
-                        j += 1;
-                    }
-                },
-                (Some((ak, aval)), None) => {
-                    out.push((ak.clone(), Some((*aval).clone()), None));
-                    i += 1;
+        vec![Head::Node(t, 0, None)]
+    }
+
+    /// What to do with the two frontiers' heads. Every answer either consumes a
+    /// head or opens one, and only claims a key is absent from a side when
+    /// every key left on that side is greater.
+    ///
+    /// Opening every node that is not shared may open a subtree the other side
+    /// holds one level deeper, but the walk realigns by itself: once both sides
+    /// have opened down to a shared leaf, the right siblings on each side are
+    /// the same nodes again. So a misstep costs one path, never a subtree.
+    fn step(x: &Head<'_, K, V, M>, y: &Head<'_, K, V, M>) -> Step {
+        match (x, y) {
+            (Head::Entry(ka, i, _), Head::Entry(kb, j, _)) => match moved(*ka, *i).cmp(&moved(*kb, *j)) {
+                Ordering::Less => Step::Left,
+                Ordering::Greater => Step::Right,
+                Ordering::Equal => Step::Pair,
+            },
+            (Head::Node(a, i, _), Head::Node(b, j, _)) if same_at(a, *i, b, *j) => Step::Skip,
+            (Head::Node(..), Head::Node(..)) => Step::OpenBoth,
+            // A node whose separator bound lies above the entry holds nothing
+            // at or below it, which spares opening the leaf after an edit.
+            (Head::Entry(k, i, _), Head::Node(.., Some((lo, o)))) if above(*lo, *o, *k, *i) => Step::Left,
+            (Head::Node(.., Some((lo, o))), Head::Entry(k, i, _)) if above(*lo, *o, *k, *i) => Step::Right,
+            (Head::Entry(..), Head::Node(..)) => Step::OpenRight,
+            (Head::Node(..), Head::Entry(..)) => Step::OpenLeft,
+        }
+    }
+
+    /// Report everything under `head` as present on one side only.
+    fn emit(head: Head<'_, K, V, M>, left: bool, out: &mut Vec<EntryDiff<K, V>>) {
+        let mut push = |k: K, v: &V| {
+            out.push(if left { (k, Some(v.clone()), None) } else { (k, None, Some(v.clone())) });
+        };
+        match head {
+            Head::Entry(k, off, v) => push(moved(k, off).into_owned(), v),
+            Head::Node(t, off, _) => {
+                let mut it = Iter { stack: Vec::new(), leaf: None };
+                it.descend(t, off);
+                for (k, v) in it {
+                    push(k, v);
                 }
-                (None, Some((bk, bval))) => {
-                    out.push((bk.clone(), None, Some((*bval).clone())));
-                    j += 1;
-                }
-                (None, None) => break,
             }
         }
     }
+
+    /// Replace the frontier's head node with its contents, in key order:
+    /// entries for a leaf, children (each with its separator bound) for an
+    /// internal node.
+    fn open_onto<'a>(stack: &mut Vec<Head<'a, K, V, M>>) {
+        let Some(Head::Node(t, off, lo)) = stack.pop() else { unreachable!("only a node is opened") };
+        let off = off.wrapping_add(t.dsp);
+        match t.root.as_deref().expect("no empty node on a frontier").kind() {
+            Kind::Leaf(entries) => {
+                stack.extend(entries.iter().rev().map(|(k, v)| Head::Entry(k, off, v)));
+            }
+            Kind::Internal { keys, children } => {
+                for (i, c) in children.iter().enumerate().rev() {
+                    let lo = if i == 0 { lo } else { Some((&keys[i - 1], off)) };
+                    stack.push(Head::Node(c, off, lo));
+                }
+            }
+        }
+    }
+}
+
+/// One item on a [`Tree::diff`] frontier: an entry, or a whole subtree not yet
+/// opened. A frontier lists its items in key order, each wholly below the next.
+enum Head<'a, K, V, M> {
+    /// An entry, with the offset carrying its key to the absolute frame.
+    Entry(&'a K, i64, &'a V),
+    /// A subtree, the offset of its parent's frame, and the separator that
+    /// bounds it below (with the offset carrying it to the absolute frame).
+    /// Removals leave separators stale, so the bound may lie below the
+    /// subtree's least key, never above it.
+    Node(&'a Tree<K, V, M>, i64, Bound<'a, K>),
+}
+
+/// Separator `lo` (at offset `o`) lies above key `k` (at offset `i`).
+fn above<K: Displace>(lo: &K, o: i64, k: &K, i: i64) -> bool {
+    *moved(lo, o) > *moved(k, i)
+}
+
+/// `a` (under a parent frame at `i`) and `b` (at `j`) are the same node at the
+/// same absolute position, so hold the same entries: by pointer, or by
+/// memoized content key for one node reached through two handles (a reloaded
+/// version, a fork).
+fn same_at<K, V, M>(a: &Tree<K, V, M>, i: i64, b: &Tree<K, V, M>, j: i64) -> bool {
+    if i.wrapping_add(a.dsp) != j.wrapping_add(b.dsp) {
+        return false;
+    }
+    match (a.root.as_deref(), b.root.as_deref()) {
+        (Some(x), Some(y)) => std::ptr::eq(x, y) || matches!((x.ck.get(), y.ck.get()), (Some(p), Some(q)) if p == q),
+        _ => false,
+    }
+}
+
+/// What [`Tree::diff`] does with its two heads.
+enum Step {
+    /// The same subtree on both sides: nothing under it differs.
+    Skip,
+    /// The left head lies below every key left on the right, so it is absent
+    /// there.
+    Left,
+    /// The mirror of `Left`.
+    Right,
+    /// Two entries with one key.
+    Pair,
+    /// Replace a head node with its contents.
+    OpenLeft,
+    OpenRight,
+    OpenBoth,
 }
 
 #[cfg(test)]

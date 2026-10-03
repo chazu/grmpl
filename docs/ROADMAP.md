@@ -485,8 +485,12 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   current. Join maintenance reads the unchanged side by key
   (`TraceStore::lookup`). Laws: `grmpl-ent/tests/{join_maintenance,scopes}.rs`,
   `grmpl-session/tests/{materialized,scopes}.rs`.
-* **Open, in order:** version compare across a graft without the merge fallback
-  (the spanfilade knows the source; `diff` does not consult it yet); a
-  transactional graft effect in a patch (phase 3A of the world-package plan);
-  DSP-inherited context once the language declares scopes; merges in the branch
-  DAG.
+* **Landed:** version compare across a graft (Ent-fidelity gap 4). `Tree::diff`
+  walks both versions as frontiers of whole subtrees, so a shared subtree is
+  skipped however the spines above it were rebuilt; `EntStore::compare_spans`
+  names each graft by its span from the spanfilade. Law and cost:
+  `grmpl-ent/tests/graft_compare.rs`.
+* **Open, in order:** a transactional graft effect in a patch (phase 3A of the
+  world-package plan); DSP-inherited context once the language declares scopes;
+  merges in the branch DAG. The full list of fidelity gaps is
+  [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).

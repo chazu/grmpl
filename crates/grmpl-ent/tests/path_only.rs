@@ -170,8 +170,8 @@ fn count_is_answered_from_the_measure() {
 /// changed — which is the part that would break if the pruned descent ever
 /// paired the wrong subtrees. The pruning itself is structural rather than
 /// measured here: identical subtrees are dismissed by pointer and by memoized
-/// content key at every level, and only a subtree pair whose separators differ
-/// falls back to the in-order merge.
+/// content key at every level, however the spines above them were rebuilt.
+/// The cost is measured in `graft_compare.rs`.
 #[test]
 fn version_compare_costs_the_edit_not_the_relation() {
     let store = EntStore::new();

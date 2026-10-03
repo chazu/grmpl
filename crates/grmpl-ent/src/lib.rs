@@ -36,7 +36,7 @@ pub use dsp::Displace;
 pub use granfilade::{Granfilade, Persist};
 pub use measure::{Count, Extent, Measure};
 pub use spanfilade::{GraftSpan, Spanfilade};
-pub use store::EntStore;
+pub use store::{EntStore, SpanCompare};
 pub use tree::Tree;
 
 #[cfg(test)]

@@ -502,3 +502,52 @@ The extents' bounds on the `first` and `last` columns prune like an interval
 tree's, so a stab reads one path. An `inherit` over a view's rows is linear in
 those rows while the scopes are unchanged. A change to a scope recomputes both
 ends, because one binding can change any entity's answer.
+
+## 9. Version compare after Ent-fidelity gap 4
+
+`Tree::diff` used to pair two nodes' children only when their separators were
+identical, and to merge the whole subtree pair entry by entry otherwise. It now
+walks both versions as frontiers of whole subtrees and skips any node both hold
+at the same position, however the spines above it were rebuilt.
+`EntStore::compare_spans` also names each graft by its span, from the
+spanfilade (`ENT-FIDELITY-GAPS.md`, gap 4).
+
+### Frames paged, cold
+
+A relation of 100k rows thinned by a seventh (so its separators are stale), on
+a reopened store, before and after each edit:
+
+| edit compared | old `diff` | new `diff` | `compare_spans` |
+|---|---|---|---|
+| graft of a 5,000-row block | 4,688 | **164** | **20** |
+| one row inserted | 8 | 8 | — |
+| forty scattered rows | 162 | 162 | — |
+| 3,000 rows inserted densely (splits nodes) | 4,942 | **228** | — |
+| ~14k rows refilled (output-bound) | 4,513 | 4,491 | — |
+
+* Across a graft, the old descent merged from the root, because the graft's
+  join rebuilds the spine there, and so read the whole relation. The new one
+  reads the copy's leaves and the seams; `compare_spans` reads only the seams,
+  however large the copy.
+* A dense insert splits nodes, which changes separators high in the tree; the
+  old descent merged everything below the first changed separator.
+* Small edits cost what they did: one path per edited row in each version.
+
+### In memory, one row changed
+
+| rows | insert: old | insert: new | removal: old | removal: new |
+|---|---|---|---|---|
+| 1k | 0.77 µs | 0.78 µs | 15 µs | **1.0 µs** |
+| 10k | 0.77 µs | 0.81 µs | 145 µs | **1.5 µs** |
+| 100k | 0.86 µs | 0.96 µs | 1.68 ms | **2.2 µs** |
+
+A removal that underflows a leaf fuses it with a sibling, and in a tree built
+by sequential inserts every parent is at its floor, so the fuse cascades to the
+root. Every separator on the way changed, so the old descent merged the whole
+relation. Inserts are within 10%: the frontier pushes each opened node's
+children where the old descent zipped them in place.
+
+The warm compare of a materialized view's copy (§8), over repeated
+`viewbench` runs, was 3.1–3.2 / 4.8–8.6 / 8.7–12.2 µs before and 3.5–4.3 /
+6.5–8.0 / 11.3–13.4 µs after, at 1k / 10k / 100k things. The ranges overlap at
+10k and 100k; at 1k the new compare is about half a microsecond slower.

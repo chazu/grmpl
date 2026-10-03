@@ -47,6 +47,21 @@ type FactTree = Tree<Tuple, Diff, FactMeasure>;
 /// commit order.
 type LogTree = Tree<(u64, u64), LogEntry, Count>;
 
+/// A version compare with its virtual copies named
+/// ([`EntStore::compare_spans`]).
+///
+/// To rebuild `rel` at `b` from `rel` at `a`: replace each copy's target
+/// block, oldest first, with its source block as of the edition before the
+/// copy, shifted; then apply `rows`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpanCompare {
+    /// The grafts into the relation made in `(a, b]`, oldest first.
+    pub copies: Vec<GraftSpan>,
+    /// Every other difference, `(tuple, weight before, weight at b)` against
+    /// `a` with the copies spliced in, tuple-sorted.
+    pub rows: Vec<crate::tree::EntryDiff<Tuple, Diff>>,
+}
+
 /// One record of the Edition enfilade.
 #[derive(Clone, PartialEq, Debug)]
 enum LogEntry {
@@ -578,6 +593,53 @@ impl EntStore {
         }
         let root_at = |ed: u64| inner.fact_at(rel, ed).cloned().unwrap_or_default();
         Ok(root_at(a.0).diff(&root_at(b.0)))
+    }
+
+    /// **Version compare that names copies (Green's compare).** How `rel`
+    /// differs between editions `a < b`, with every graft made in `(a, b]`
+    /// reported as the span it copied rather than as its rows.
+    ///
+    /// The relation's log finds the grafts (each logs its target span), and the
+    /// [`Spanfilade`] says where each came from. Each copy is spliced into `a`'s
+    /// version from the source block of the edition before the graft: the same
+    /// nodes the graft shared, at the same displacement. So the row comparison
+    /// that follows recognizes every copied subtree as unchanged, and the whole
+    /// call costs `O(log n)` per graft plus the edits around it, however large
+    /// the copies are. [`compare`](TraceStore::compare) lists the copied rows.
+    pub fn compare_spans(&self, rel: RelId, a: Edition, b: Edition) -> Result<SpanCompare> {
+        let inner = self.inner.lock().unwrap();
+        for at in [a, b] {
+            if at.0 < inner.watermark {
+                return Err(door("compare", at.0, inner.watermark));
+            }
+        }
+        if a > b {
+            return Err(Error::Store(format!("compare_spans: {a:?} is after {b:?}")));
+        }
+        let root_at = |ed: u64| inner.fact_at(rel, ed).cloned().unwrap_or_default();
+        let mut base = root_at(a.0);
+        let mut copies = Vec::new();
+        if let Some(log) = inner.log_of(rel) {
+            for ((g, _), entry) in log.range_collect(&(a.0 + 1, 0), &(b.0 + 1, 0)) {
+                let LogEntry::Graft(tlo, thi) = entry else { continue };
+                let Some(Value::Ent(Entity(to))) = tlo.as_slice().first() else {
+                    return Err(Error::Store(format!("graft at edition {g} has no entity target")));
+                };
+                let copy = inner
+                    .grafts
+                    .sources_of(*to, to.wrapping_add(1), Edition(g))
+                    .into_iter()
+                    .find(|s| s.edition.0 == g && s.target.0 == *to && s.rels.contains(&rel))
+                    .ok_or_else(|| Error::Store(format!("graft at edition {g} is not in the spanfilade")))?;
+                let (slo, shi) =
+                    (Tuple::from([Value::Ent(Entity(copy.source.0))]), Tuple::from([Value::Ent(Entity(copy.source.1))]));
+                let block = root_at(g - 1).split(&slo).1.split(&shi).0.relocate(copy.shift());
+                let (below, rest) = base.split(&tlo);
+                base = FactTree::join(&FactTree::join(&below, &block), &rest.split(&thi).1);
+                copies.push(copy);
+            }
+        }
+        Ok(SpanCompare { copies, rows: base.diff(&root_at(b.0)) })
     }
 
     /// Node frames serialized+hashed since this store was opened — the G-0a ops

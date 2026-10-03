@@ -27,10 +27,12 @@ bounding box in entity space — so a search prunes on any entity column, and a
 **spanfilade** records every graft from both ends, so a template knows its
 instances and an instance its template. Context is inherited down nested
 entity blocks and travels with a graft, and a materialized view keeps its
-derived state in the Ent, so maintaining it costs the change. What remains
-short of the Ent is listed in §5: version compare across a graft, scopes
-beyond entity blocks, merges in the branch DAG, and Green's 2-D enfilades
-proper.
+derived state in the Ent, so maintaining it costs the change. A version
+compare recognizes a shared subtree however the spines above it were rebuilt,
+and can name a graft by its span from the spanfilade. What remains short of
+the Ent is listed in §5 and kept current in
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md): scopes beyond entity blocks,
+merges in the branch DAG, and Green's 2-D enfilades proper.
 
 ---
 
@@ -200,9 +202,15 @@ ordinary relations in the Fact trees.
 **Operations:**
 
 * **Version compare** (`Tree::diff`, used by `EntStore::compare` and the
-  differential engine) skips any subtree the two versions share, by pointer or
-  content key, so it costs the size of the difference. This is the Ent's
-  version-comparison idea, realized.
+  differential engine) skips any subtree the two versions share at the same
+  position, by pointer or content key, so it costs the size of the difference.
+  It walks each version as a frontier of whole subtrees rather than pairing
+  nodes by their separators, so a shared subtree is found however the spines
+  above it were rebuilt, by a split, a fuse, a join or a graft's seams.
+  `EntStore::compare_spans` goes one step further, as Green's compare does: it
+  reports each graft in the interval as the span it copied, read from the
+  spanfilade, and lists only the rows that differ beyond the copies. This is
+  the Ent's version-comparison idea, realized.
 * **Fork** (`EntStore::fork_at`) shares every fact node and writes none. Forking
   at the present shares the whole Rel enfilade and writes two frames (the new DAG
   and branch-enfilade leaves); forking into the past cuts each relation's version
@@ -277,7 +285,7 @@ recomputes both ends of every interval.
 | Opaque edition identity | ✅ explicit law | ✅ `Edition` is opaque to the language |
 | Patch = guarded, atomic next edition | ✅ semantic center | ✅ `commit_if`, group-committed |
 | Structural sharing / path copy | ✅ | ✅ `O(log n)` new nodes per commit |
-| Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees |
+| Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees at any depth; `compare_spans` names grafts by span |
 | Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd, paged on demand |
 | One root; every structure a tree beneath it | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
 | Measured tree with upward summaries | ✅ "WIDative summaries" | ✅ `Count`, and an `Extent` per entity column that `search` prunes on |
@@ -320,17 +328,13 @@ What is still short of the Ent:
    of entity ids, which is where the dsps act. Namespace, authority or schema
    inherited down package or authority scopes are not built: those scopes do
    not nest in the language.
-2. **Version compare across a graft** still falls back to an in-order merge of
-   the subtrees whose separators differ, costing the instance's size rather than
-   its node count. The spanfilade knows where a copy came from, but `diff` does
-   not consult it.
-3. **Extents cover entity cells only.** Text and number columns are not
+2. **Extents cover entity cells only.** Text and number columns are not
    summarized, so a search on them reads and filters, or uses an Arrangement.
    That keeps a frame's measures fixed-size; summarizing text would put
    arbitrary strings in every internal frame.
-4. **The branch DAG has no merges.** It is a tree of branches, each with one
+3. **The branch DAG has no merges.** It is a tree of branches, each with one
    parent.
-5. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
+4. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
    but as two 1-D interval trees each measured by a hull, not as one enfilade
    with 2-D wids. The Fact trees' extents are n-dimensional boxes, but they ride
    a tree ordered by its whole key, so they prune only as well as each column
