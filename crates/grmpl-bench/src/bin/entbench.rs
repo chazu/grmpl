@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use grmpl_core::{Diff, Edition, EditionStore, RelId, TraceStore, Tuple, Value};
+use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 use grmpl_ent::EntStore;
 
 const REL: RelId = RelId(1);
@@ -57,6 +57,54 @@ fn main() {
         let frames = store.frames_encoded() - before;
         assert_eq!(fork.read_at(REL, fork.current()).unwrap().len(), n as usize);
         row("fork whole world", n, ns, &format!("{frames} node frames written"));
+    }
+
+    // ------------------------------------------------------- virtual copy ---
+    header(
+        "Instance — DSP virtual copy of a template",
+        "An N-fact template block copied to a fresh block: graft vs. committing the copies.",
+    );
+    for &n in &sizes {
+        // The template sits between unrelated facts, so the graft really has to
+        // cut it out of the middle of the relation.
+        let ent = |e: u64, room: u64| Tuple::from([Value::Ent(Entity(e)), Value::Ent(Entity(room))]);
+        let base = 1_000_000u64;
+        let mut rows: Vec<(RelId, Tuple, Diff)> = Vec::new();
+        for i in 0..n as u64 {
+            rows.push((REL, ent(i, i % 13), 1));
+            rows.push((REL, ent(base + i, base + i % 97), 1));
+            rows.push((REL, ent(10 * base + i, i % 7), 1));
+        }
+        let (lo, hi) = (base, base + n as u64);
+        let shift = 4 * base as i64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
+        store.commit(&rows).unwrap();
+        let before = store.frames_encoded();
+        let start = Instant::now();
+        store.instance_template(&[REL], lo, hi, shift).unwrap();
+        let ns = start.elapsed().as_nanos() as f64;
+        let frames = store.frames_encoded() - before;
+        row("instance_template (graft)", n, ns, &format!("{frames} node frames written"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = EntStore::open(dir.path()).unwrap();
+        store.commit(&rows).unwrap();
+        let lo_t = Tuple::from([Value::Ent(Entity(lo))]);
+        let hi_t = Tuple::from([Value::Ent(Entity(hi))]);
+        let before = store.frames_encoded();
+        let start = Instant::now();
+        let copies: Vec<(RelId, Tuple, Diff)> = store
+            .range_at(REL, store.current(), &lo_t, &hi_t)
+            .unwrap()
+            .into_iter()
+            .map(|(t, d)| (REL, grmpl_ent::Displace::displace(&t, shift), d))
+            .collect();
+        store.commit(&copies).unwrap();
+        let ns = start.elapsed().as_nanos() as f64;
+        let frames = store.frames_encoded() - before;
+        row("copy by commit (row by row)", n, ns, &format!("{frames} node frames written"));
     }
 
     // ------------------------------------------------------------- commits ---

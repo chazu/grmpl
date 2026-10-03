@@ -30,8 +30,9 @@ bootstrap {
 
 Bootstrap facts and a package-private marker commit together as edition 1.
 Opening the exact package is an edition-preserving no-op. A changed or corrupt
-marker, or an unmarked nonzero store, fails closed. v4 is a fresh-store cutover;
-there is no v3 decoder or migration command.
+marker, or an unmarked nonzero store, fails closed. Format bumps (v4, then v5
+for displaced tree nodes) are fresh-store cutovers; there is no decoder for an
+older format and no migration command.
 
 Compilation checks entity uniqueness, schemas, duplicate facts, allocator
 ranges and exact seeds, nonzero RNG seeds, and a canonical SHA-256 digest that

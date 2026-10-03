@@ -21,7 +21,7 @@ sequences, instantiate the same behaviors, and use the same retry policy.
 modules with intentionally narrow interfaces; merging them would reduce
 locality without reducing the public surface.
 
-Kasumi Shotengai uses the same v4 package compiler, atomic installer, and actor
+Kasumi Shotengai uses the same package compiler, atomic installer, and actor
 driver. Its remaining native DSP, fork, shuffle, and presentation seams are the
 explicit phase-3 boundary, not a second bootstrap/runtime path.
 
@@ -94,7 +94,8 @@ the operation, not because the transport owns a second world:
 - TCP accept/read/write and terminal input/output.
 - Card shuffling/dealing. Sampling without replacement remains a phase-3
   collection/shuffle capability, distinct from scalar random draws.
-- Private vault creation through Ent DSP relocation, instance selection, and
+- Private vault creation through an Ent DSP graft (a virtual copy of the
+  template), instance selection, and
   teardown in the terminal adapter.
 
 The first four items are world-runtime capabilities. The rest are presentation
@@ -131,6 +132,7 @@ intentionally bounded. The roadmap and transaction laws are in
   routing, deterministic collection/shuffle semantics, and richer presentation
   values.
 
-The v4 tranche deliberately has no v3 migrator. Existing v3 stores remain
-untouched and require a matching v3 build; v4 packages install only into fresh
-stores.
+Format changes are fresh-store cutovers with no migrator: v4 (floats and
+serialized behavior IR) and v5 (displaced tree nodes, which carry each child's
+dsp). A store written by an older format needs a matching build; packages
+install only into fresh stores.

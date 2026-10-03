@@ -86,7 +86,9 @@ existing clock/randomness driver. The first combat slice is deterministic.
 
 `enter basement` relocates the whole dungeon template into a fresh entity block
 with `EntStore::instance_template`. Every entity-valued coordinate in the
-template moves together. The instance and its return room are recorded as world
+template moves together. The instance is a DSP graft — a virtual copy that
+shares the template's tree nodes and diverges copy-on-write — so entering costs
+the same however large the dungeon is. The instance and its return room are recorded as world
 facts so leaving and reconnecting do not depend on process memory.
 
 `leave` removes the instance facts and returns the player to the surface.
@@ -117,7 +119,7 @@ retirement before allowing unlimited activations.
 
 All setting rules, relation declarations, views, parsers, patch-producing
 behaviors, initial conditions, and finite rule tables live in
-`worlds/shotengai.grmpl` and install atomically as a v4 package.
+`worlds/shotengai.grmpl` and install atomically as a package.
 
 `grmpl-cli` provides a `shotengai [STORE_DIR]` command. Its remaining native
 responsibilities are terminal rendering, committed-time sampling/actor driving,

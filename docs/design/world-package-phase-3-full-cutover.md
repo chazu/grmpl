@@ -21,9 +21,18 @@ selection, store/driver operation, input, and rendering.
 Instancing stays within one active branch and should satisfy the normal
 patch–edition law.
 
-Refactor `EntStore::instance_template` into a deterministic planning interface
-that, from a pinned snapshot and a granted immutable template, produces the
-relocated updates. Fold those updates into the requesting behavior's patch with:
+`EntStore::instance_template` is now a structural operation: each relation's
+template block is grafted (split out, relocated by one dsp, joined back in), the
+instance shares the template's nodes, and the edition log records one `Graft`
+entry that `scan_updates` expands. That answers the feasibility question below:
+materializing the copy as ordinary updates in a patch would **not** preserve the
+structural sharing — it is the row-by-row copy the graft replaced (6,460 node
+frames against 18 for a 100k-fact template, `docs/PERFORMANCE-ENT.md`).
+
+So the store needs a **transactional graft effect**: a patch may carry
+`graft(source range, target range, shift)` alongside its ordinary writes, and
+`commit_if` applies both as one edition under the patch's preconditions. Fold the
+instance into the requesting behavior's patch with:
 
 - a guarded instance-range allocation;
 - player placement and durable return route;
@@ -39,9 +48,10 @@ after bootstrap. Retirement accepts a recorded instance identity, not an
 arbitrary entity interval from package code, and preconditions every row it
 retracts.
 
-The feasibility spike must answer whether a materialized patch preserves the
-Ent's structural-sharing advantage. If not, the store needs a transactional
-structural-effect API rather than a host sequence of commits.
+The graft effect is checked at the commit boundary like any write — the target
+range under the patch's authority and every grafted row against its relation's
+schema — and the target block must be empty, as `instance_template` already
+requires.
 
 Acceptance: counter allocation, relocation, ownership, and player movement all
 commit or none do; concurrent entries retry without leaked template rows; two

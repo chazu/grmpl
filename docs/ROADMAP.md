@@ -452,3 +452,20 @@ corresponding tickets for detail.
   `grmpl-diff/tests/compare_delta_law.rs`.
 * **P14 — Diff generalization** (abelian groups).
 * **P15 — Distribution.**
+
+### The substrate (the Ent)
+
+Not a numbered phase; tracked against Xanadu's `Ent` in
+[`ENT-AND-XANADU.md`](ENT-AND-XANADU.md).
+
+* **Landed:** the tree carries a dsp on every pointer, with persistent split,
+  join and graft (`wire::FORMAT_VERSION` 4→5, a fresh-store cutover); template
+  instancing is a graft (`O(log n)` new nodes, one log entry); fork and
+  consolidation cut history by split. Laws: the displaced-tree oracle in
+  `grmpl-ent/src/lib.rs` and `grmpl-ent/tests/virtual_copy.rs`.
+* **Open, in order:** persist the version and relation directories, the canopy
+  and the branch DAG as granfilade trees (node frames that reference other
+  trees' roots, followed by GC); lazy node paging (the eager `O(state)` reopen);
+  a transactional graft effect in a patch (phase 3A of the world-package plan);
+  DSP-inherited context once the language declares scopes; version compare
+  across a graft without the merge fallback.

@@ -322,8 +322,8 @@ bootstrap {
 `Runtime::load_package` resolves relation IDs through the durable catalog,
 checks host grants, and commits the sorted bootstrap facts plus an installation
 marker as edition 1. The exact package reopens without allocating an edition;
-a mismatch or unmarked nonzero store is rejected. The shared v4 format is a
-fresh-store cutover and has no v3 migration path.
+a mismatch or unmarked nonzero store is rejected. The shared format (now v5) is
+a fresh-store cutover with no migration path from older versions.
 
 Allocation counters must have exact schema `(next: Int)` and an exact bootstrap
 seed. RNG state must have `(owner: Ent, state: Int)` and a nonzero seed. Both

@@ -172,6 +172,6 @@ The goal is not “all Rust” or “all language.” It is a clear rule:
 </div>
 </div>
 
-Manor and Shotengai now install through the same v4 package path. Shotengai's patrol and combat continuation use package actors; its remaining native seams are phase-3 structural, collection, and presentation work—not another bootstrap path or engine.
+Manor and Shotengai now install through the same package path. Shotengai's patrol and combat continuation use package actors; its remaining native seams are phase-3 structural, collection, and presentation work—not another bootstrap path or engine.
 
 <p class="small">Capability report: docs/RUNTIME-CAPABILITIES.md · Remaining-work design: docs/WORLD-PACKAGE-REMAINING-WORK.md</p>

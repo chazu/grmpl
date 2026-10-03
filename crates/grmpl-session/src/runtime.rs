@@ -213,8 +213,9 @@ impl Runtime {
             [] => {
                 if store.current() != Edition::ZERO {
                     return Err(format!(
-                        "store is at edition {} but has no package marker; use a fresh v4 store",
-                        store.current().0
+                        "store is at edition {} but has no package marker; use a fresh v{} store",
+                        store.current().0,
+                        grmpl_core::wire::FORMAT_VERSION
                     ));
                 }
                 let mut updates: Vec<(RelId, Tuple, Diff)> = package

@@ -1,6 +1,6 @@
 # What the Ent is good at, and what it is not
 
-Measured on the ent-native substrate after the v5 gap work
+Measured on the ent-native substrate after the gap work of plan v5
 ([`archive/ENT-GAPS-PLAN.md`](archive/ENT-GAPS-PLAN.md)), with `grmpl-store` deleted — the Ent is
 now the only substrate, so these numbers are the system's numbers, not one leg's.
 
@@ -30,6 +30,7 @@ full scan costs about twice a flat array — a constant, not an asymptotic loss.
 | The Ent is good at | Measured |
 |---|---|
 | Forking a whole world | **0 node frames**, ~2.4 ms, flat from 1k to 100k rows |
+| Instancing a template (DSP virtual copy) | **11–18 node frames**, flat from 1k to 100k facts — a row-by-row copy writes 70–6,460 |
 | Answering "how many" over a span | **1.3 µs** at 100k rows — **2,050×** cheaper than the scan |
 | Reading a key span instead of a relation | **24.5 µs** for 1% of 100k — **109×** cheaper than the scan |
 | Proving a watcher is unaffected | **162 ns**, vs a ≥2.7 ms re-evaluation |
@@ -63,7 +64,28 @@ every commit pays, twice (roots, then the branch graph).
 
 This is the single clearest case for the whole design. A copying store makes
 forking a 100k-row world proportional to 100k rows; here it is proportional to
-nothing.
+nothing. (The fork cuts each relation's version directory and log at the fork
+edition with a persistent split, which shares the trees outright when the fork is
+at the tip.)
+
+### Instancing is a virtual copy
+
+```
+instance_template (graft)      1,000 facts     4,935,709 ns    11 node frames written
+copy by commit (row by row)    1,000 facts     7,062,875 ns    70 node frames written
+instance_template (graft)     10,000 facts     3,950,625 ns    12 node frames written
+copy by commit (row by row)   10,000 facts    30,921,500 ns   650 node frames written
+instance_template (graft)    100,000 facts     4,364,750 ns    18 node frames written
+copy by commit (row by row)  100,000 facts   531,339,792 ns  6,460 node frames written
+```
+
+A template block in the middle of a relation is copied to a fresh block. The
+graft splits the block out, relocates it by one dsp, and joins it back in, so
+the instance shares every interior node with the template: the frames written
+grow with the tree's depth, and the time is the commit's `SyncAll`. Committing
+the same rows as copies grows linearly — about one frame per 15 facts and
+~5 µs per fact at 100k. (Measured later than the rest of this report, on an
+Apple-silicon laptop; the frame counts are hardware-independent.)
 
 ### Measures answer without materializing
 
@@ -274,8 +296,8 @@ close to the substrate's claims.
 The Ent is a **read-and-branch-optimised** substrate with a **fixed durability
 floor**. It is the right shape when:
 
-- worlds are forked, snapshotted, and rewound — those are free here and
-  proportional elsewhere;
+- worlds are forked, snapshotted, and rewound, or sub-worlds are instanced from
+  templates — those are free or `O(log n)` here and proportional elsewhere;
 - reads are *questions about spans* ("how many things in this room", "what is in
   this key range") rather than full-relation sweeps;
 - many observers watch a large world and most changes concern few of them;

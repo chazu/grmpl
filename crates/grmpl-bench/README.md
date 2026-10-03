@@ -19,6 +19,15 @@ engine. `cargo test -p grmpl-bench` runs every scenario at a tiny size and
 asserts its invariants (so the harness cannot bit-rot), plus a behavioural
 characterization of the arrangement memo's ABA hazard.
 
+A second binary, `entbench`, measures the substrate's shape rather than the
+engine's semantics — fork, template instancing (graft vs. row-by-row copy),
+commit path work, range and measure reads, as-of reads, reopen, routing, and
+history. Its results are written up in `docs/PERFORMANCE-ENT.md`:
+
+```sh
+cargo run -p grmpl-bench --release --bin entbench
+```
+
 ## The five axes and what they surface
 
 * **Churn throughput** (`churn`) — raw `commit` vs the `commit_patch` process

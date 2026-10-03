@@ -4,10 +4,13 @@
 //! measured, versioned trees over a shared content-addressed node store (the
 //! [`granfilade`]), modeled on Xanadu Gold's `Ent`.
 //!
-//! The trees ([`tree::Tree`]) are path-copied B+trees keyed by absolute tuples,
-//! with monoidal subtree measures. They are not yet enfilades in the Udanax
-//! sense: nodes carry no displacements, so relocation and virtual copy are not
-//! `O(1)`. See `docs/ENT-AND-XANADU.md` for the gap.
+//! The trees ([`tree::Tree`]) are path-copied B+trees with monoidal subtree
+//! measures and, as in Gold, a **dsp on every pointer**: nodes keep their keys in
+//! a local frame, so [`relocate`](tree::Tree::relocate) is `O(1)` and
+//! [`graft`](tree::Tree::graft) — the virtual copy behind
+//! [`EntStore::instance_template`] — costs `O(log n)` new nodes. What a
+//! displacement does to a key is [`Displace`]. See `docs/ENT-AND-XANADU.md` for
+//! how this compares with Xanadu's `Ent` and what is still missing.
 
 pub mod canopy;
 pub mod context;
@@ -57,9 +60,8 @@ mod tests {
         map.range(lo..hi).count() as u64
     }
 
-    /// Black-height-ish sanity: a weight-balanced tree of n entries has depth
-    /// O(log n). We assert the in-order walk is sorted and length matches — the
-    /// balance itself is exercised by keeping operations O(log n) under churn.
+    /// The in-order walk is sorted and the length matches; balance itself is
+    /// checked structurally by `Tree::check` in the churn oracles below.
     #[test]
     fn ordered_and_sized() {
         let mut t = T::new();

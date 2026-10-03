@@ -144,7 +144,7 @@ fn marker_mismatch_and_unmarked_history_fail_closed() {
         .expect("unmarked history must fail")
         .to_string();
     assert!(error.contains("no package marker"));
-    assert!(error.contains("fresh v4 store"));
+    assert!(error.contains(&format!("fresh v{} store", grmpl_core::wire::FORMAT_VERSION)));
 }
 
 #[test]
