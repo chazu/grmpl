@@ -97,7 +97,7 @@ impl Displace for Tuple {
 }
 
 /// Coordinates with no displacement: edition numbers, relation ids, interest and
-/// branch ids.
+/// branch ids, and content keys.
 macro_rules! fixed_coordinate {
     ($($t:ty),*) => {
         $(impl Displace for $t {
@@ -108,7 +108,7 @@ macro_rules! fixed_coordinate {
     };
 }
 
-fixed_coordinate!(u64, u32, i64);
+fixed_coordinate!(u64, u32, i64, [u8; 32]);
 
 impl<A: Displace, B: Displace> Displace for (A, B) {
     fn displace(&self, by: i64) -> Self {

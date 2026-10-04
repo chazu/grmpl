@@ -104,10 +104,35 @@ impl<T: Persist + Clone + Send + Sync + 'static> PersistVal for T {}
 pub trait PersistMeasure<K, V>: Measure<K, V> + Persist + Send + Sync + 'static {}
 impl<K, V, T: Measure<K, V> + Persist + Send + Sync + 'static> PersistMeasure<K, V> for T {}
 
-/// Where encoded frames collect during one [`Granfilade::collect_tree`].
+/// Where encoded frames collect during one [`Granfilade::collect_tree`], or
+/// during [`content_key`] with no node store behind it.
 struct Sink<'g> {
-    gran: &'g Granfilade,
+    gran: Option<&'g Granfilade>,
     out: Vec<(ContentKey, Vec<u8>)>,
+}
+
+impl Sink<'_> {
+    /// Whether a node already memoizing `ck` needs no new frame: it is durable
+    /// in this granfilade, or (with no granfilade) it has simply been hashed.
+    fn known(&self, ck: &ContentKey) -> bool {
+        self.gran.is_none_or(|g| g.is_present(ck))
+    }
+}
+
+/// **The content key of an in-memory tree**, computed and memoized without a
+/// node store: every node is framed and hashed exactly as the granfilade would
+/// store it, so a key computed here equals the key the node gets on disk. Nodes
+/// already memoizing a key are not revisited. `None` for an empty tree.
+///
+/// The root is keyed **normalized**, as the root record stores it.
+pub fn content_key<K, V, M>(tree: &Tree<K, V, M>) -> Option<ContentKey>
+where
+    K: PersistKey,
+    V: PersistVal,
+    M: PersistMeasure<K, V>,
+{
+    let mut sink = Sink { gran: None, out: Vec::new() };
+    collect_nodes(&tree.normalized(), &mut sink)
 }
 
 /// One node frame's payload under construction: its bytes, and the content keys
@@ -221,6 +246,17 @@ macro_rules! fixed_width {
     )*};
 }
 fixed_width!(i64, u64, u32);
+
+/// A content key held as data (the history index keys nodes by it), not as a
+/// link: GC does not follow it.
+impl Persist for ContentKey {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        e.put(self);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        Ok(d.take(CK_LEN)?.try_into().unwrap())
+    }
+}
 
 impl Persist for () {
     fn encode(&self, _e: &mut Enc<'_, '_>) {}
@@ -438,7 +474,7 @@ impl Granfilade {
         V: PersistVal,
         M: PersistMeasure<K, V>,
     {
-        let mut sink = Sink { gran: self, out: Vec::new() };
+        let mut sink = Sink { gran: Some(self), out: Vec::new() };
         // The root record holds bare content keys, so a displaced root is
         // written normalized: the root node opened into this frame, every
         // subtree beneath it shared. Below the root, dsps ride the edges.
@@ -810,7 +846,7 @@ where
     // any of its descendants, since a node's key closes over its children's.
     // Every paged node qualifies, so persisting never pages anything in.
     if let Some(ck) = cell.get() {
-        if sink.gran.is_present(ck) {
+        if sink.known(ck) {
             return Some(*ck);
         }
     }
@@ -852,7 +888,9 @@ where
     bytes.extend_from_slice(&buf);
     let ck = grmpl_core::hash::sha256(&bytes);
     let _ = cell.set(ck);
-    sink.out.push((ck, bytes));
+    if sink.gran.is_some() {
+        sink.out.push((ck, bytes));
+    }
     Some(ck)
 }
 

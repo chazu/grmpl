@@ -493,8 +493,13 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
 * **Audited:** Gold's source read line by line against `grmpl-ent`
   ([`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md)). The fidelity gaps are now the
   Gold mechanisms it found missing ([`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)).
-* **Open, in order:** Gold's history layer (upward links, backfollow,
-  identity-based compare); merges in the version trace; the canopies,
-  recorders and Agenda; splits on any dimension. Also a transactional graft
+* **Landed:** Gold's history layer (Ent-fidelity step 4,
+  [`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md)): an index of every node's
+  containers beside the immutable nodes, built deferred; `backfollow` finds
+  every version holding some content across branches; `shared_region` compares
+  two versions by identity. Laws: `grmpl-ent/src/history_laws.rs`,
+  `grmpl-ent/tests/history.rs`.
+* **Open, in order:** merges in the version trace; the canopies, recorders and
+  a general Agenda; splits on any dimension. Also a transactional graft
   effect in a patch (phase 3A of the world-package plan). The full list of fidelity gaps is
   [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).

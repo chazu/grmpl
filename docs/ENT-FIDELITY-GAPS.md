@@ -5,11 +5,12 @@ Gold's Ent, as the source shows it. Each Gold gap is backed by the line-by-line
 audit [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Gaps against `idea.md`'s
 extrapolations of the Ent are kept separately below, since they are not Gold.
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-03, after the Gold audit.
+**Last updated:** 2026-10-03, after step 4 (the history layer).
 
 The step reports say what each step built and what it cost:
-[`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md) and
-[`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md).
+[`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md),
+[`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md) and
+[`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md).
 
 ---
 
@@ -37,13 +38,13 @@ measurements before it counts as closed, as in steps 2–3.
 
 | # | Gold mechanism | Status |
 |---|---|---|
-| G1 | **History (the H-tree):** every node knows the nodes that contain it, and the versions at the top | 🔨 next |
-| G2 | **Backfollow:** which versions and editions hold this content, transitively, across the whole Ent | 🔨 next (with G1) |
-| G3 | **Identity-based compare** (`sharedRegion`, `mapSharedTo`): what two versions share, wherever it sits | 🔨 next (with G1) |
+| G1 | **History (the H-tree):** every node knows the nodes that contain it, and the versions at the top | ✅ step 4: an index beside the immutable nodes |
+| G2 | **Backfollow:** which versions and editions hold this content, transitively, across the whole Ent | ✅ step 4: `backfollow`, from leaves, across branches |
+| G3 | **Identity-based compare** (`sharedRegion`, `mapSharedTo`): what two versions share, wherever it sits | ✅ step 4: `shared_region` (Gold's upward method) and `shared_region_by_descent`, which measures faster |
 | G4 | **Merges in the trace**, and a trace per derived operation (copy, transform, combine) | ❌ |
 | G5 | **Canopies:** the bert canopy pruning backfollow, the sensor canopy pruning standing-query checks | ❌ (grmpl's "canopy" is an interval index of watchers) |
 | G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ❌ (watches are relational, a different thing) |
-| G7 | **The Agenda:** persistent, crash-resumable background work | ❌ |
+| G7 | **The Agenda:** persistent, crash-resumable background work | ⚠️ one job: history indexing runs deferred, in bounded durable steps |
 | G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ❌ (why extents prune only along the sort order) |
 | G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ❌ |
 | G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
@@ -51,7 +52,7 @@ measurements before it counts as closed, as in steps 2–3.
 
 Already faithful: versions as roots, the persisted version DAG (tree case),
 `isLE`-style ancestry, `O(1)` relocation, copy by sharing subtrees, paged stubs,
-one root with everything beneath it.
+one root with everything beneath it, and since step 4 the history layer.
 
 ## Gaps against `idea.md`'s extrapolations
 

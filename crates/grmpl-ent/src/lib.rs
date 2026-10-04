@@ -24,6 +24,7 @@ pub mod context;
 pub mod dag;
 pub mod dsp;
 pub mod granfilade;
+mod history;
 pub mod measure;
 pub mod spanfilade;
 pub mod store;
@@ -36,7 +37,7 @@ pub use dsp::Displace;
 pub use granfilade::{Granfilade, Persist};
 pub use measure::{Count, Extent, Measure};
 pub use spanfilade::{GraftSpan, Spanfilade};
-pub use store::{EntStore, SpanCompare};
+pub use store::{EntStore, Holding, SpanCompare, Version};
 pub use tree::Tree;
 
 #[cfg(test)]

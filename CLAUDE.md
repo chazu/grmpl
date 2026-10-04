@@ -111,6 +111,27 @@ node relocated holds different entries. `compare_spans` splices each graft's
 source, as of the edition before it, into the earlier version, so the copy
 compares as unchanged and is reported by span.
 
+### History (`grmpl-ent::history`; `backfollow`, `shared_region`)
+
+Gold's H-tree, as an index beside the immutable nodes, hung from root-record
+slots 2–5 (`parents`, `holders`, `born`, `cursor`).
+
+* **Commits never touch it.** `EntRoot::catch_up` indexes deferred; queries
+  catch it up first, so answers are exact; `step_history` does it in durable
+  steps. Indexing is idempotent, so lost progress is only repeated work.
+* **Ancestors first.** Branches are indexed in id order, each from its fork
+  point, so a node inherited through a fork is already born on the lineage and
+  never re-walked; inherited versions are found through the DAG at query time.
+* **`born` is per branch**: content addressing lets one node be built
+  independently on two branches. Pruning by it is sound only as "born on the
+  lineage by then", never as one global cut.
+* **It holds content keys as data, never links**, so GC ignores it; a query
+  skips versions consolidation retired, including ones it folded into the
+  watermark checkpoint (several holders can stand for that one version).
+* **Sharing is identity**: backfollow and `shared_region` find shared nodes,
+  not equal values. Backfollow starts from the leaves of the span, as Gold
+  does.
+
 ### Context and derived enfilades (`context`/`inherit`, `materialized view`)
 
 * **A materialized view never changes an answer.** `Query::Materialized` means

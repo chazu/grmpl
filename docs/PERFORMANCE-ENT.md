@@ -551,3 +551,44 @@ The warm compare of a materialized view's copy (§8), over repeated
 `viewbench` runs, was 3.1–3.2 / 4.8–8.6 / 8.7–12.2 µs before and 3.5–4.3 /
 6.5–8.0 / 11.3–13.4 µs after, at 1k / 10k / 100k things. The ranges overlap at
 10k and 100k; at 1k the new compare is about half a microsecond slower.
+
+## 10. The history index (Ent-fidelity step 4)
+
+A durable 100k-row relation with a 1,000-row template block, ten instances
+grafted from it, then one-row commits. Cold numbers are on a freshly reopened
+store; release build.
+
+### Indexing
+
+| one-row commits | time per commit | edges per commit | nodes per commit |
+|---|---|---|---|
+| 200 | ~200 µs | 82 | 4 |
+| 2,000 | ~220 µs | 91 | 4 |
+
+Commits themselves are unchanged: indexing is deferred and runs on a query or
+in `step_history`. Each new interior node adds an edge per child, so a commit's
+edges are about its new spine times the fan-out.
+
+### Queries
+
+| query | cold cost | answer |
+|---|---|---|
+| backfollow, the 1,000-row template block (200 commits) | 399 frames, 13 ms | 2,266 holdings: every version since each graft, 11 shifts |
+| backfollow, one row (200 commits) | 165 frames, 0.5 ms | 221 holdings |
+| `copies_of` on the spanfilade, for comparison | 1 frame, 4 µs | 10 grafts (one hop, grafts only) |
+
+### Identity compare: Gold's upward method against a downward walk
+
+`shared_region` between the template's edition and the latest, both ways:
+
+| | 200 commits | 2,000 commits |
+|---|---|---|
+| upward through the history index (`shared_region`) | 532–630 frames, ~2 ms | 3,195–4,373 frames, ~23 ms |
+| downward walk (`shared_region_by_descent`) | 119–124 frames, ~0.9 ms | 120–167 frames, ~1.2 ms |
+
+The upward climb from an old node passes through every later version that
+shares it, so its cost grows with history. Born-pruning (Gold's `isLE:`)
+trims about a quarter in the late-against-early direction and costs a little
+in the other. The downward walk reads only interior nodes, because interior
+frames name their children's keys, so its cost is the two versions' interior
+nodes at any history length.

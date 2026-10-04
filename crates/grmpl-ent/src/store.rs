@@ -20,7 +20,7 @@
 //! The **persisted form is the enfilade itself, never a log**. [`EntStore::new`]
 //! is a pure in-memory store (used by the conformance oracle).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use grmpl_core::{
@@ -32,7 +32,8 @@ use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
-use crate::granfilade::{Dec, Enc, Granfilade, Persist, StagedWrite};
+use crate::granfilade::{content_key, ContentKey, Dec, Enc, Granfilade, Persist, StagedWrite};
+use crate::history::{History, Holder};
 use crate::measure::{Count, Extent};
 use crate::spanfilade::{GraftSpan, Spanfilade};
 use crate::tree::Tree;
@@ -60,6 +61,29 @@ pub struct SpanCompare {
     /// Every other difference, `(tuple, weight before, weight at b)` against
     /// `a` with the copies spliced in, tuple-sorted.
     pub rows: Vec<crate::tree::EntryDiff<Tuple, Diff>>,
+}
+
+/// **One version of one relation**: its Fact tree in force at `edition` on
+/// `branch`, the unit the history index answers in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Version {
+    pub branch: BranchId,
+    pub rel: RelId,
+    pub edition: Edition,
+}
+
+/// **What backfollow found** ([`EntStore::backfollow`]): a version whose Fact
+/// tree holds some of the queried content, `shift` away from where the query
+/// holds it, and how many of the queried rows it holds there.
+///
+/// `version.edition` is the edition the version was written at (a key of the
+/// relation's version directory), so one holding stands for every edition up
+/// to the relation's next change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Holding {
+    pub version: Version,
+    pub shift: i64,
+    pub rows: usize,
 }
 
 /// One record of the Edition enfilade.
@@ -262,12 +286,14 @@ impl Durable {
     }
 }
 
-/// **The Ent's root**: the branch DAG (the fulltrace's DagWood) and the branch
-/// enfilade (Gold's `oroots`, one state per branch). The granfilade's root
-/// record links to exactly these two trees.
+/// **The Ent's root**: the branch DAG (the fulltrace's DagWood), the branch
+/// enfilade (one state per branch), and the history index over every branch
+/// (Gold's H-tree, [`crate::history`]). The granfilade's root record links to
+/// these trees.
 struct EntRoot {
     dag: Dag,
     branches: BranchStates,
+    history: History,
 }
 
 /// The branch enfilade: `branch → that branch's whole state`.
@@ -275,14 +301,87 @@ type BranchStates = Tree<BranchId, Inner, Count>;
 
 impl EntRoot {
     fn empty() -> EntRoot {
-        EntRoot { dag: Dag::new(), branches: BranchStates::new() }
+        EntRoot { dag: Dag::new(), branches: BranchStates::new(), history: History::default() }
     }
 
-    /// The root record's trees, paged: one frame read for each.
+    /// The root record's trees, paged: one frame read for each. A record
+    /// written before the history index existed has no history slots, and the
+    /// index is rebuilt from the versions on its first catch-up.
     fn load(gran: &Arc<Granfilade>) -> Result<EntRoot> {
         let slots = gran.root()?;
         let slot = |i: usize| slots.get(i).copied().flatten();
-        Ok(EntRoot { dag: Dag::from_tree(gran.load(slot(0))?), branches: gran.load(slot(1))? })
+        Ok(EntRoot {
+            dag: Dag::from_tree(gran.load(slot(0))?),
+            branches: gran.load(slot(1))?,
+            history: History::from_trees(
+                gran.load(slot(2))?,
+                gran.load(slot(3))?,
+                gran.load(slot(4))?,
+                gran.load(slot(5))?,
+            ),
+        })
+    }
+
+    /// **Bring the history index up to date**, indexing at most `budget`
+    /// versions: the deferred work Gold runs on its Agenda. Branches go in id
+    /// order, so a branch's ancestors are indexed through its fork point before
+    /// it is, and each branch's versions in edition order. A branch starts
+    /// after its fork point: what it inherited is its ancestors' and found
+    /// through the DAG. Returns the versions indexed.
+    fn catch_up(&mut self, budget: usize) -> usize {
+        let mut done = 0;
+        let ids: Vec<BranchId> = self.dag.tree().iter().map(|(b, _)| b).collect();
+        for b in ids {
+            let Some(state) = self.branches.get(&b).cloned() else { continue };
+            let start = self.start_of(b);
+            if state.current <= start {
+                continue;
+            }
+            let mut todo: Vec<(u64, RelId, FactTree)> = Vec::new();
+            for (rel, roots) in state.rels.iter() {
+                for (e, t) in roots.versions.range_collect(&(start + 1), &(state.current + 1)) {
+                    todo.push((e, RelId(rel), t));
+                }
+            }
+            todo.sort_by_key(|(e, rel, _)| (*e, *rel));
+            let mut through = start;
+            let mut i = 0;
+            while i < todo.len() {
+                if done >= budget {
+                    self.history.set_cursor(b, through);
+                    return done;
+                }
+                // A whole edition at a time, so the cursor never splits one.
+                let e = todo[i].0;
+                while i < todo.len() && todo[i].0 == e {
+                    let (_, rel, t) = &todo[i];
+                    self.history.index_version(&self.dag, Holder { branch: b, rel: rel.0, edition: e }, t);
+                    done += 1;
+                    i += 1;
+                }
+                through = e;
+            }
+            self.history.set_cursor(b, state.current);
+        }
+        done
+    }
+
+    /// The edition the history of `branch` is indexed through: its cursor, or
+    /// its fork point before it has been indexed at all.
+    fn start_of(&self, b: BranchId) -> u64 {
+        self.history.cursor(b).unwrap_or_else(|| self.dag.parent(b).map_or(0, |(_, at)| at))
+    }
+
+    /// Versions not yet indexed.
+    fn backlog(&self) -> usize {
+        let mut n = 0;
+        for (b, state) in self.branches.iter() {
+            let start = self.start_of(b);
+            for (_, roots) in state.rels.iter() {
+                n += roots.versions.count_range(&(start + 1), &(state.current + 1));
+            }
+        }
+        n
     }
 
     /// The state of `branch` as last staged, or a fresh one for a branch that
@@ -642,6 +741,193 @@ impl EntStore {
         Ok(SpanCompare { copies, rows: base.diff(&root_at(b.0)) })
     }
 
+    /// **Backfollow (Gold's `rangeTranscluders`, over versions).** Every
+    /// version, on any branch of this world, whose Fact tree holds some of the
+    /// content of `rel` at `at` in `[lo, hi)`, with where it holds it.
+    ///
+    /// As in Gold, the query walks south to the leaves holding the span, then
+    /// climbs north from each leaf through the history index's O-parent sets to
+    /// the roots above it, and from each root to the versions using it. A
+    /// version a fork inherited is found through the DAG. `rows` counts the
+    /// queried rows in the leaves a version shares.
+    /// So this finds **shared nodes**, not equal values: a version that rebuilt
+    /// a leaf around an edit holds that leaf's rows again only by value, and is
+    /// not reported for them. Identity is sharing, as in Gold.
+    ///
+    /// Brings the history index up to date first, so the answer is exact.
+    pub fn backfollow(&self, rel: RelId, at: Edition, lo: &Tuple, hi: &Tuple) -> Result<Vec<Holding>> {
+        let tree = {
+            let inner = self.inner.lock().unwrap();
+            if at.0 < inner.watermark {
+                return Err(door("backfollow", at.0, inner.watermark));
+            }
+            inner.fact_at(rel, at.0).cloned().unwrap_or_default().normalized()
+        };
+        let (history, dag, branches) = self.caught_up();
+        let mut found: BTreeMap<(Version, i64), usize> = BTreeMap::new();
+        let mut memo = HashMap::new();
+        let mut retained: HashMap<(Holder, ContentKey), Vec<Version>> = HashMap::new();
+        for (ck, at_off, rows) in pieces(&tree, lo, hi) {
+            // Consolidation folds several versions into one checkpoint, so two
+            // holders can stand for one retained version: count it once.
+            let mut here: BTreeSet<(Version, i64)> = BTreeSet::new();
+            for (holder, off, root) in history.reach(ck, &mut memo) {
+                let versions =
+                    retained.entry((holder, root)).or_insert_with(|| versions_of(&dag, &branches, holder, &root));
+                for version in versions.iter() {
+                    here.insert((*version, off.wrapping_sub(at_off)));
+                }
+            }
+            for key in here {
+                *found.entry(key).or_insert(0) += rows;
+            }
+        }
+        Ok(found.into_iter().map(|((version, shift), rows)| Holding { version, shift, rows }).collect())
+    }
+
+    /// **Identity compare (Gold's `sharedRegion` / `mapSharedTo`).** What
+    /// version `a` shares with version `b`, wherever it sits: for each
+    /// displacement at which some of `a`'s content appears in `b`, how many of
+    /// `a`'s rows appear there. Sharing means the same nodes, as for
+    /// [`backfollow`](Self::backfollow).
+    ///
+    /// Walks `a` from its root. A node is looked for in `b` by climbing the
+    /// history index towards `b`'s root, admitting only nodes born on `b`'s
+    /// lineage by `b`'s edition (Gold's `isLE:` pruning), and memoized across
+    /// the walk. A node found is reported whole; one not found is opened.
+    pub fn shared_region(&self, a: Version, b: Version) -> Result<Vec<(i64, usize)>> {
+        let (history, dag, branches) = self.caught_up();
+        let tree_at = |v: Version| -> Result<FactTree> {
+            let state = branches
+                .get(&v.branch)
+                .ok_or_else(|| Error::Store(format!("unknown branch {}", v.branch)))?;
+            if v.edition.0 < state.watermark {
+                return Err(door("shared_region", v.edition.0, state.watermark));
+            }
+            Ok(state.fact_at(v.rel, v.edition.0).cloned().unwrap_or_default().normalized())
+        };
+        let (ta, tb) = (tree_at(a)?, tree_at(b)?);
+        let mut out: BTreeMap<i64, usize> = BTreeMap::new();
+        let (Some(_), Some(target)) = (content_key(&ta), content_key(&tb)) else { return Ok(Vec::new()) };
+        let lineage = dag.lineage(b.branch, b.edition.0);
+        let admit = |ck: &ContentKey| history.visible(ck, &lineage);
+        let mut memo = HashMap::new();
+        let mut stack = vec![(&ta, 0i64)];
+        while let Some((t, parent_off)) = stack.pop() {
+            let off = parent_off.wrapping_add(t.dsp());
+            let ck = *t.ck_cell().and_then(|c| c.get()).expect("keyed above");
+            if admit(&ck) {
+                let at = history.offsets_in(ck, &target, &admit, &mut memo);
+                if !at.is_empty() {
+                    for o in at {
+                        *out.entry(o.wrapping_sub(off)).or_insert(0) += t.len();
+                    }
+                    continue;
+                }
+            }
+            if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+                stack.extend(children.iter().map(|c| (c, off)));
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// **The same answer as [`shared_region`](Self::shared_region), without
+    /// the history index.** Collects every node key of `b` from its interior
+    /// frames (a leaf's key is in its parent's frame, so leaves are not read),
+    /// then walks `a` from its root, reporting each node found whole. It costs
+    /// the two versions' interior nodes however long the history is, where the
+    /// upward search costs every later version of a node it climbs from. Kept
+    /// beside Gold's method to measure the two.
+    pub fn shared_region_by_descent(&self, a: Version, b: Version) -> Result<Vec<(i64, usize)>> {
+        let branches = self.family.root.lock().unwrap().branches.clone();
+        let tree_at = |v: Version| -> Result<FactTree> {
+            let state = branches
+                .get(&v.branch)
+                .ok_or_else(|| Error::Store(format!("unknown branch {}", v.branch)))?;
+            if v.edition.0 < state.watermark {
+                return Err(door("shared_region", v.edition.0, state.watermark));
+            }
+            Ok(state.fact_at(v.rel, v.edition.0).cloned().unwrap_or_default().normalized())
+        };
+        let (ta, tb) = (tree_at(a)?, tree_at(b)?);
+        let mut out: BTreeMap<i64, usize> = BTreeMap::new();
+        if content_key(&ta).is_none() || content_key(&tb).is_none() {
+            return Ok(Vec::new());
+        }
+        let key = |t: &FactTree| *t.ck_cell().and_then(|c| c.get()).expect("keyed above");
+        let mut in_b: HashMap<ContentKey, Vec<i64>> = HashMap::new();
+        let mut stack = vec![(&tb, height(&tb), 0i64)];
+        while let Some((t, h, parent_off)) = stack.pop() {
+            let off = parent_off.wrapping_add(t.dsp());
+            in_b.entry(key(t)).or_default().push(off);
+            // Reading an interior node names its children, so a leaf (height
+            // 1) is recorded from its parent's frame and never read.
+            if h > 1 {
+                if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+                    for c in children {
+                        if h == 2 {
+                            in_b.entry(key(c)).or_default().push(off.wrapping_add(c.dsp()));
+                        } else {
+                            stack.push((c, h - 1, off));
+                        }
+                    }
+                }
+            }
+        }
+        let mut stack = vec![(&ta, 0i64)];
+        while let Some((t, parent_off)) = stack.pop() {
+            let off = parent_off.wrapping_add(t.dsp());
+            if let Some(offs) = in_b.get(&key(t)) {
+                let mut offs = offs.clone();
+                offs.sort_unstable();
+                offs.dedup();
+                for o in offs {
+                    *out.entry(o.wrapping_sub(off)).or_insert(0) += t.len();
+                }
+                continue;
+            }
+            if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+                stack.extend(children.iter().map(|c| (c, off)));
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// **Run the deferred history work** (Gold's Agenda, for the one job grmpl
+    /// has so far): index at most `budget` versions not yet in the history
+    /// index, and make the progress durable. Queries catch the index up on
+    /// their own, so this only moves the work off their path. Returns the
+    /// versions indexed.
+    pub fn step_history(&self, budget: usize) -> Result<usize> {
+        let inner = self.inner.lock().unwrap();
+        let (done, seq) = {
+            let mut root = self.family.root.lock().unwrap();
+            let done = root.catch_up(budget);
+            (done, self.stage_in(&mut root, self.branch, &inner)?)
+        };
+        drop(inner);
+        self.await_durable(seq)?;
+        Ok(done)
+    }
+
+    /// Versions written but not yet in the history index.
+    pub fn history_backlog(&self) -> usize {
+        self.family.root.lock().unwrap().backlog()
+    }
+
+    /// Entries in the history index: `(parent edges, root holders, births)`.
+    pub fn history_size(&self) -> (usize, usize, usize) {
+        self.family.root.lock().unwrap().history.sizes()
+    }
+
+    /// Catch the history index up, and take what a query reads from the root.
+    fn caught_up(&self) -> (History, Dag, BranchStates) {
+        let mut root = self.family.root.lock().unwrap();
+        root.catch_up(usize::MAX);
+        (root.history.clone(), root.dag.clone(), root.branches.clone())
+    }
+
     /// Node frames serialized+hashed since this store was opened — the G-0a ops
     /// counter, surfaced so tests can assert the commit path stays path-sized.
     /// `0` for an in-memory store.
@@ -946,6 +1232,17 @@ impl EntStore {
         let (dag, mut nodes) = gran.collect_tree(root.dag.tree());
         let (branches, more) = gran.collect_tree(&root.branches);
         nodes.extend(more);
+        let (parents, holders, born, cursor) = root.history.trees();
+        let mut slots = vec![dag, branches];
+        for (ck, more) in [
+            gran.collect_tree(parents),
+            gran.collect_tree(holders),
+            gran.collect_tree(born),
+            gran.collect_tree(cursor),
+        ] {
+            slots.push(ck);
+            nodes.extend(more);
+        }
         let mut d = self.family.dur.lock().unwrap();
         d.staged += 1;
         let seq = d.staged;
@@ -953,7 +1250,7 @@ impl EntStore {
             seq,
             branch,
             edition: inner.current,
-            write: StagedWrite { nodes, root: vec![dag, branches] },
+            write: StagedWrite { nodes, root: slots },
         });
         Ok(Some(seq))
     }
@@ -1804,6 +2101,114 @@ fn search_box(facts: &FactTree, bounds: &[(usize, u64, u64)]) -> Vec<(Tuple, Dif
     )
 }
 
+/// **The content of `[lo, hi)` in a Fact tree, as leaves**: each leaf holding
+/// rows of the span, as `(content key, offset of the leaf's frame, rows in the
+/// span)`. Interior nodes are walked only to find the leaves, and a leaf
+/// wholly inside the span (by its separators) is counted without being read.
+/// The tree must be normalized; its keys are memoized here.
+fn pieces(t: &FactTree, lo: &Tuple, hi: &Tuple) -> Vec<(ContentKey, i64, usize)> {
+    /// `height` is 1 at a leaf: every leaf sits at one depth.
+    fn walk(
+        t: &FactTree,
+        height: usize,
+        parent_off: i64,
+        bounds: (Option<Tuple>, Option<Tuple>),
+        span: (&Tuple, &Tuple),
+        out: &mut Vec<(ContentKey, i64, usize)>,
+    ) {
+        let off = parent_off.wrapping_add(t.dsp());
+        let ck = *t.ck_cell().and_then(|c| c.get()).expect("keyed by content_key");
+        let (nlo, nhi) = bounds;
+        let (lo, hi) = span;
+        if height == 1 {
+            if nlo.as_ref().is_some_and(|l| l >= lo) && nhi.as_ref().is_some_and(|h| h <= hi) {
+                out.push((ck, off, t.len()));
+                return;
+            }
+            if let Some(crate::tree::NodeRef::Leaf(entries)) = t.node() {
+                let n = entries
+                    .iter()
+                    .filter(|(k, _)| {
+                        let k = k.displace(off);
+                        &k >= lo && &k < hi
+                    })
+                    .count();
+                if n > 0 {
+                    out.push((ck, off, n));
+                }
+            }
+            return;
+        }
+        if let Some(crate::tree::NodeRef::Internal(keys, children)) = t.node() {
+            let last = children.len() - 1;
+            for (i, c) in children.iter().enumerate() {
+                let clo = if i == 0 { nlo.clone() } else { Some(keys[i - 1].displace(off)) };
+                let chi = if i == last { nhi.clone() } else { Some(keys[i].displace(off)) };
+                if chi.as_ref().is_some_and(|h| h <= lo) || clo.as_ref().is_some_and(|l| l >= hi) {
+                    continue;
+                }
+                walk(c, height - 1, off, (clo, chi), span, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if content_key(t).is_some() {
+        walk(t, height(t), 0, (None, None), (lo, hi), &mut out);
+    }
+    out
+}
+
+/// A non-empty tree's height, `1` for a single leaf: every leaf sits at one
+/// depth, so the left spine says it.
+fn height(t: &FactTree) -> usize {
+    let mut h = 1;
+    let mut cur = t.clone();
+    while let Some(crate::tree::NodeRef::Internal(_, children)) = cur.node() {
+        let first = children[0].clone();
+        cur = first;
+        h += 1;
+    }
+    h
+}
+
+/// The versions a history holder stands for, still retained: the holder's own
+/// version on its branch (or, if consolidation folded it into the watermark
+/// checkpoint, that checkpoint), and the same version on every branch forked
+/// from it after it was written.
+fn versions_of(dag: &Dag, branches: &BranchStates, h: Holder, root: &ContentKey) -> Vec<Version> {
+    let mut out = Vec::new();
+    let mut stack = vec![h.branch];
+    while let Some(b) = stack.pop() {
+        if let Some(state) = branches.get(&b) {
+            if let Some(versions) = state.roots(RelId(h.rel)).map(|r| &r.versions) {
+                let key = if versions.get(&h.edition).is_some() {
+                    Some(h.edition)
+                } else if h.edition < state.watermark
+                    && versions.get(&state.watermark).is_some_and(|t| content_key(t).as_ref() == Some(root))
+                {
+                    Some(state.watermark)
+                } else {
+                    None
+                };
+                if let Some(e) = key {
+                    out.push(Version { branch: b, rel: RelId(h.rel), edition: Edition(e) });
+                }
+            }
+        }
+        // A fork after the version was written inherited it.
+        for (c, br) in dag.tree().iter() {
+            if br.parent.is_some_and(|(p, at)| p == b && at >= h.edition) {
+                stack.push(c);
+            }
+        }
+    }
+    out
+}
+
 fn door(op: &str, at: u64, watermark: u64) -> Error {
     Error::Store(format!("{op} at edition {at} below watermark {watermark}"))
 }
+
+#[cfg(test)]
+#[path = "history_laws.rs"]
+mod history_laws;
