@@ -35,11 +35,16 @@ pub type BranchId = u64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Branch {
     pub id: BranchId,
-    /// `None` for the root; `Some((parent, at))` for a fork.
+    /// `None` for the root; `Some((parent, at))` for a fork or a merge: the
+    /// branch whose state the new one starts from, at that edition.
     pub parent: Option<(BranchId, u64)>,
+    /// `Some((other, at, since))` for a merge (Gold's `DagBranch`): the second
+    /// parent, whose history up to `at` was replayed into this branch and is
+    /// all in from edition `since` (where the replay ended) on.
+    pub merged: Option<(BranchId, u64, u64)>,
 }
 
-/// A branch record persists as its id and fork point. The DagWood is the
+/// A branch record persists as its id, fork point and merged parent. The DagWood is the
 /// fulltrace's branch structure, so it is durable like every other part of the
 /// world — a reopened store that forgot its forks would have forgotten its
 /// history.
@@ -47,9 +52,10 @@ impl Persist for Branch {
     fn encode(&self, e: &mut Enc<'_, '_>) {
         self.id.encode(e);
         self.parent.encode(e);
+        self.merged.encode(e);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
-        Ok(Branch { id: u64::decode(d)?, parent: Option::decode(d)? })
+        Ok(Branch { id: u64::decode(d)?, parent: Option::decode(d)?, merged: Option::decode(d)? })
     }
 }
 
@@ -86,7 +92,7 @@ impl Dag {
     /// A fresh DAG with just the root branch.
     pub fn new() -> Dag {
         let branches =
-            BranchTree::new().insert(Self::ROOT, Branch { id: Self::ROOT, parent: None });
+            BranchTree::new().insert(Self::ROOT, Branch { id: Self::ROOT, parent: None, merged: None });
         Dag { branches, next: 1 }
     }
 
@@ -97,8 +103,29 @@ impl Dag {
         assert!(self.branches.get(&parent).is_some(), "fork off unknown branch {parent}");
         let id = self.next;
         self.next += 1;
-        self.branches = self.branches.insert(id, Branch { id, parent: Some((parent, at)) });
+        self.branches = self.branches.insert(id, Branch { id, parent: Some((parent, at)), merged: None });
         id
+    }
+
+    /// Register a **merge** (Gold's `newSuccessorAfter:`): a new branch that
+    /// starts from `parent` at `at` and to which `other`'s history up to
+    /// `other_at` was replayed, ending at edition `since`: from there on it
+    /// comes after both. Returns its fresh id.
+    pub fn merge(&mut self, parent: BranchId, at: u64, other: BranchId, other_at: u64, since: u64) -> BranchId {
+        assert!(self.branches.get(&parent).is_some(), "merge onto unknown branch {parent}");
+        assert!(self.branches.get(&other).is_some(), "merge of unknown branch {other}");
+        let id = self.next;
+        self.next += 1;
+        self.branches = self.branches.insert(
+            id,
+            Branch { id, parent: Some((parent, at)), merged: Some((other, other_at, since)) },
+        );
+        id
+    }
+
+    /// Every branch record, in id order.
+    pub fn branches(&self) -> Vec<Branch> {
+        self.branches.iter().map(|(_, b)| *b).collect()
     }
 
     /// The branch record, if known.
@@ -111,19 +138,37 @@ impl Dag {
         self.branches.get(&b).and_then(|br| br.parent)
     }
 
-    /// The lineage of point `(b, at)`: the chain of `(branch, edition)` segments
-    /// from the point back to the root, newest first. Each entry is the *highest*
-    /// edition of that branch that flows into the point — `at` on `b` itself, then
-    /// each fork edition walking up. This is the exact set of history the point
-    /// descends from, one entry per branch.
+    /// The lineage of point `(b, at)`: every branch whose history flows into
+    /// the point, each with the *highest* edition of it that does, in the order
+    /// first reached walking back (first parents before second). For a tree of
+    /// branches that is the chain from the point to the root: `at` on `b`
+    /// itself, then each fork edition walking up. A merge adds its second
+    /// parent's lineage, from the edition its replay ended at on.
+    /// This is the exact set of history the point descends from, one entry per
+    /// branch.
     pub fn lineage(&self, b: BranchId, at: u64) -> Vec<(BranchId, u64)> {
-        let mut out = Vec::new();
-        let mut cur = Some((b, at));
-        while let Some((br, ed)) = cur {
-            out.push((br, ed));
-            cur = self.parent(br);
+        let mut order: Vec<BranchId> = Vec::new();
+        let mut best: std::collections::BTreeMap<BranchId, u64> = std::collections::BTreeMap::new();
+        let mut stack = vec![(b, at)];
+        while let Some((br, ed)) = stack.pop() {
+            match best.get(&br) {
+                Some(&seen) if seen >= ed => continue,
+                Some(_) => {}
+                None => order.push(br),
+            }
+            best.insert(br, ed);
+            let Some(branch) = self.get(br) else { continue };
+            // The second parent is pushed first, so the first is walked first.
+            if let Some((m, m_at, since)) = branch.merged {
+                if ed >= since {
+                    stack.push((m, m_at));
+                }
+            }
+            if let Some((p, p_at)) = branch.parent {
+                stack.push((p, p_at));
+            }
         }
-        out
+        order.into_iter().map(|br| (br, best[&br])).collect()
     }
 
     /// Does point `(ba, ea)` lie on the history that flows into point `(bb, eb)`?
@@ -192,6 +237,22 @@ mod tests {
         let c = d.fork(a, 3);
         assert_eq!(c, 3);
         d
+    }
+
+    #[test]
+    fn a_merge_brings_its_second_parent_in_where_the_replay_ended() {
+        let mut d = fixture();
+        // m(4): from a(1)@7, with b(2)@9 replayed, ending at m's edition 10.
+        let m = d.merge(1, 7, 2, 9, 10);
+        assert_eq!(m, 4);
+        // At 10 both histories are in: a, its root, and b.
+        let at10: std::collections::BTreeMap<_, _> = d.lineage(m, 10).into_iter().collect();
+        assert_eq!(at10.get(&1), Some(&7));
+        assert_eq!(at10.get(&2), Some(&9));
+        assert_eq!(at10.get(&Dag::ROOT), Some(&8), "root flows in at b's fork (8), the later of 5 and 8");
+        // Mid-replay, b is not yet all in.
+        assert!(!d.lineage(m, 9).iter().any(|(br, _)| *br == 2));
+        assert!(d.is_ancestor(2, 9, m, 10) && !d.is_ancestor(2, 9, m, 9));
     }
 
     #[test]

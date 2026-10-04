@@ -86,6 +86,114 @@ pub struct Holding {
     pub rows: usize,
 }
 
+/// **What a merge did** ([`EntStore::merge`]).
+pub enum MergeOutcome {
+    /// Every patch replayed: the new branch, with both histories behind it.
+    Merged(EntStore),
+    /// A replayed patch's preconditions no longer held (or its graft was
+    /// refused) in the merging state. Nothing was created.
+    Conflict(MergeConflict),
+}
+
+/// The patch a merge could not replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeConflict {
+    /// Where the patch was first committed.
+    pub branch: BranchId,
+    pub edition: Edition,
+    /// What failed: a precondition that no longer holds, or why a graft was
+    /// refused, or a catalog or schema binding the two sides disagree on.
+    pub reason: String,
+}
+
+/// One record of a branch's **patch log**: what each of its editions was, so
+/// another branch can replay it ([`EntStore::merge`]). A commit's updates are
+/// not copied here: each relation's Edition log already holds them, indexed by
+/// their place in the patch.
+#[derive(Clone, PartialEq, Debug)]
+enum PatchRecord {
+    /// A commit: the tuples it required to hold, and the relations it wrote.
+    Commit { pre: Vec<(RelId, Tuple)>, rels: Vec<u32>, origin: Origin },
+    /// A graft: the entity block copied, how far, and the relations asked for.
+    Graft { rels: Vec<u32>, block: (u64, u64), shift: i64, origin: Origin },
+}
+
+/// Where a merge replayed a patch from: the `(branch, edition)` it was first
+/// committed at. `None` for a patch first committed here. A later merge skips
+/// a copy whose original it reaches, so nothing is replayed twice.
+type Origin = Option<(BranchId, u64)>;
+
+impl PatchRecord {
+    fn origin(&self) -> Origin {
+        match self {
+            PatchRecord::Commit { origin, .. } | PatchRecord::Graft { origin, .. } => *origin,
+        }
+    }
+}
+
+/// The patch log: `edition → what it was`.
+type PatchTree = Tree<u64, PatchRecord, Count>;
+
+impl Persist for PatchRecord {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        match self {
+            PatchRecord::Commit { pre, rels, origin } => {
+                0u32.encode(e);
+                (pre.len() as u32).encode(e);
+                for (rel, t) in pre {
+                    rel.0.encode(e);
+                    t.encode(e);
+                }
+                encode_rels(rels, e);
+                origin.encode(e);
+            }
+            PatchRecord::Graft { rels, block, shift, origin } => {
+                1u32.encode(e);
+                encode_rels(rels, e);
+                block.0.encode(e);
+                block.1.encode(e);
+                shift.encode(e);
+                origin.encode(e);
+            }
+        }
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        match u32::decode(d)? {
+            0 => {
+                let n = u32::decode(d)? as usize;
+                let mut pre = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    pre.push((RelId(u32::decode(d)?), Tuple::decode(d)?));
+                }
+                Ok(PatchRecord::Commit { pre, rels: decode_rels(d)?, origin: Option::decode(d)? })
+            }
+            1 => Ok(PatchRecord::Graft {
+                rels: decode_rels(d)?,
+                block: (u64::decode(d)?, u64::decode(d)?),
+                shift: i64::decode(d)?,
+                origin: Option::decode(d)?,
+            }),
+            t => Err(Error::Codec(format!("ent: bad patch record tag {t}"))),
+        }
+    }
+}
+
+fn encode_rels(rels: &[u32], e: &mut Enc<'_, '_>) {
+    (rels.len() as u32).encode(e);
+    for r in rels {
+        r.encode(e);
+    }
+}
+
+fn decode_rels(d: &mut Dec<'_>) -> Result<Vec<u32>> {
+    let n = u32::decode(d)? as usize;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        out.push(u32::decode(d)?);
+    }
+    Ok(out)
+}
+
 /// One record of the Edition enfilade.
 #[derive(Clone, PartialEq, Debug)]
 enum LogEntry {
@@ -472,6 +580,9 @@ struct Inner {
     /// made, by source span and by target span, so a template knows its
     /// instances and an instance its template.
     grafts: Spanfilade,
+    /// **The patch log**: what every edition of this branch's own was, with
+    /// its preconditions, so a merge can replay it on another branch.
+    patches: PatchTree,
 }
 
 /// A branch's state persists as its clock and links to its trees. The canopy
@@ -488,6 +599,7 @@ impl Persist for Inner {
         e.link(&self.interests);
         e.link(&self.registered);
         self.grafts.encode(e);
+        e.link(&self.patches);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         Ok(Inner {
@@ -500,6 +612,7 @@ impl Persist for Inner {
             interests: d.link()?,
             registered: d.link()?,
             grafts: Spanfilade::decode(d)?,
+            patches: d.link()?,
         })
     }
 }
@@ -894,6 +1007,147 @@ impl EntStore {
         Ok(out.into_iter().collect())
     }
 
+    /// **Merge (Gold's `newSuccessorAfter:`, by replay).** A new branch that
+    /// starts from this store's present and replays, in order, every patch of
+    /// `other` that has not already flowed into this store, re-checking each
+    /// one's preconditions against the merging state, as a racing commit would
+    /// be. A graft re-runs its own checks. The new branch's DAG record has
+    /// both parents, so everything behind either store is behind it.
+    ///
+    /// Which patches to replay is the difference of the two lineages: for each
+    /// branch in `other`'s history, its own editions past what this store's
+    /// history already holds of it. So a patch that reached this store through
+    /// an earlier merge is not replayed again, and merging an ancestor replays
+    /// nothing. Patches go branch by branch in id order (an ancestor before its
+    /// descendants), each branch's in edition order, and each becomes one
+    /// edition of the new branch.
+    ///
+    /// **All or nothing**: if any replayed patch fails, nothing is created and
+    /// the conflict names it. The context enfilades (catalog and schemas) are
+    /// united; a key the two sides bind differently is a conflict too. A patch
+    /// below its branch's watermark has been consolidated away and cannot be
+    /// replayed, which is an error.
+    pub fn merge(&self, other: &EntStore) -> Result<MergeOutcome> {
+        if !Arc::ptr_eq(&self.family, &other.family) {
+            return Err(Error::Store("merge: the stores are not branches of one world".into()));
+        }
+        // Two edition locks, always in branch order, so merges cannot deadlock.
+        let (mine, theirs);
+        let (a, b) = if self.branch <= other.branch { (self, other) } else { (other, self) };
+        let ga = a.inner.lock().unwrap();
+        let gb = if a.branch == b.branch { None } else { Some(b.inner.lock().unwrap()) };
+        if self.branch <= other.branch {
+            mine = ga.clone();
+            theirs = gb.as_ref().map_or_else(|| ga.clone(), |g| (*g).clone());
+        } else {
+            theirs = ga.clone();
+            mine = gb.as_ref().map_or_else(|| ga.clone(), |g| (*g).clone());
+        }
+        let mut root = self.family.root.lock().unwrap();
+        let state_of = |br: BranchId| -> Option<Inner> {
+            if br == self.branch {
+                Some(mine.clone())
+            } else if br == other.branch {
+                Some(theirs.clone())
+            } else {
+                root.branches.get(&br).cloned()
+            }
+        };
+        // The patches of `other`'s history this store's history lacks.
+        let have: BTreeMap<BranchId, u64> = root.dag.lineage(self.branch, mine.current).into_iter().collect();
+        let theirs_line: BTreeMap<BranchId, u64> =
+            root.dag.lineage(other.branch, theirs.current).into_iter().collect();
+        let reaches = |line: &BTreeMap<BranchId, u64>, (b, e): (BranchId, u64)| line.get(&b).is_some_and(|x| *x >= e);
+        // Patches this store already holds as copies, by their originals: a
+        // fork taken partway through a merge holds copies of patches whose
+        // branch is not in its lineage. Copies live only in merge branches'
+        // own logs.
+        let mut copied: BTreeSet<(BranchId, u64)> = BTreeSet::new();
+        for (&br, &bound) in &have {
+            if root.dag.get(br).is_some_and(|b| b.merged.is_some()) {
+                let state = state_of(br).ok_or_else(|| Error::Store(format!("merge: branch {br} has no state")))?;
+                let start = root.dag.parent(br).map_or(0, |(_, at)| at);
+                for (_, patch) in state.patches.range_collect(&(start + 1), &(bound + 1)) {
+                    copied.extend(patch.origin());
+                }
+            }
+        }
+        let here = |o: (BranchId, u64)| reaches(&have, o) || copied.contains(&o);
+        let mut todo: Vec<(BranchId, u64, PatchRecord, Inner)> = Vec::new();
+        for (&br, &bound) in &theirs_line {
+            let start = root.dag.parent(br).map_or(0, |(_, at)| at);
+            let from = have.get(&br).copied().unwrap_or(0).max(start);
+            if bound <= from {
+                continue;
+            }
+            let state = state_of(br).ok_or_else(|| Error::Store(format!("merge: branch {br} has no state")))?;
+            // Every edition of a branch's own is a patch, so one at or below
+            // its watermark has been consolidated away.
+            if from < state.watermark {
+                return Err(door("merge", from + 1, state.watermark));
+            }
+            for (e, patch) in state.patches.range_collect(&(from + 1), &(bound + 1)) {
+                // A copy a merge made: its original is replayed from its own
+                // branch, or is already here. Only an unreachable original's
+                // copy stands in for it.
+                let original = patch.origin().unwrap_or((br, e));
+                if here(original) || (patch.origin().is_some() && reaches(&theirs_line, original)) {
+                    continue;
+                }
+                todo.push((br, e, patch, state.clone()));
+            }
+        }
+        todo.sort_by_key(|(br, e, _, _)| (*br, *e));
+        // The merging state: this store's present, as a fork would start.
+        let mut merged = Inner {
+            canopy: Canopy::new(),
+            fired: FiredTree::new(),
+            interests: Tree::new(),
+            registered: Tree::new(),
+            ..mine.clone()
+        };
+        let conflict = |br: BranchId, e: u64, reason: String| {
+            Ok(MergeOutcome::Conflict(MergeConflict { branch: br, edition: Edition(e), reason }))
+        };
+        // Catalog and schemas: united, refusing a key bound two ways.
+        for (k, v) in theirs.ctx.iter() {
+            match merged.ctx.get(&k) {
+                Some(mv) if mv != v => {
+                    return conflict(other.branch, theirs.current, format!("context key {k:?} is bound differently"));
+                }
+                Some(_) => {}
+                None => merged.ctx = merged.ctx.insert(k, v.clone()),
+            }
+        }
+        for (br, e, patch, state) in todo {
+            // A copy keeps naming the true original.
+            let origin = Some(patch.origin().unwrap_or((br, e)));
+            match patch {
+                PatchRecord::Commit { pre, rels, .. } => {
+                    if let Some((rel, t)) = pre.iter().find(|(rel, t)| !merged.holds_now(*rel, t)) {
+                        return conflict(br, e, format!("precondition {t:?} in relation {} no longer holds", rel.0));
+                    }
+                    let updates = patch_updates(&state, e, &rels);
+                    let at = merged.current + 1;
+                    merged.apply(at, &pre, &updates, origin);
+                }
+                PatchRecord::Graft { rels, block, shift, .. } => {
+                    let rels: Vec<RelId> = rels.into_iter().map(RelId).collect();
+                    if let Err(err) = merged.graft(&rels, block.0, block.1, shift, origin) {
+                        return conflict(br, e, err.to_string());
+                    }
+                }
+            }
+        }
+        let branch = root.dag.merge(self.branch, mine.current, other.branch, theirs.current, merged.current);
+        let seq = self.stage_in(&mut root, branch, &merged)?;
+        drop(root);
+        drop(gb);
+        drop(ga);
+        self.await_durable(seq)?;
+        Ok(MergeOutcome::Merged(EntStore::on(Arc::clone(&self.family), branch, merged)))
+    }
+
     /// **Run the deferred history work** (Gold's Agenda, for the one job grmpl
     /// has so far): index at most `budget` versions not yet in the history
     /// index, and make the progress durable. Queries catch the index up on
@@ -1060,6 +1314,9 @@ impl EntStore {
             interests: Tree::new(),
             registered: Tree::new(),
             grafts,
+            // The child's patch log starts empty: what it inherited is its
+            // parent's, reached through the DAG.
+            patches: PatchTree::new(),
         };
         // Graft a new branch onto this one at the fork edition in the shared
         // DagWood and stage its state, under one root lock so no root record
@@ -1158,51 +1415,10 @@ impl EntStore {
     ///
     /// [`scan_updates`]: TraceStore::scan_updates
     pub fn instance_template(&self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64) -> Result<Edition> {
-        let src_lo = Tuple::from([Value::Ent(Entity(block_lo))]);
-        let src_hi = Tuple::from([Value::Ent(Entity(block_hi))]);
-        let (tlo, thi) = (src_lo.displace(shift), src_hi.displace(shift));
-        let mut rels = rels.to_vec();
-        rels.sort();
-        rels.dedup();
         let seq = {
             let mut inner = self.inner.lock().unwrap();
-            let at = inner.current;
-            let mut grafts = Vec::new();
-            for rel in rels {
-                let Some(facts) = inner.fact_at(rel, at) else { continue };
-                if !facts.any_in(&src_lo, &src_hi) {
-                    continue;
-                }
-                // A graft moves every entity cell, so a template fact naming an
-                // entity outside the block would land pointing at the wrong one.
-                // The span's extent proves it does not, reading two spines.
-                if !facts.measure_range(&src_lo, &src_hi).1.within(block_lo, block_hi) {
-                    return Err(Error::Store(format!(
-                        "instance_template: relation {} has template facts naming entities outside \
-                         [{block_lo}, {block_hi}); a graft would move them too",
-                        rel.0
-                    )));
-                }
-                let grafted = facts.graft(&src_lo, &src_hi, shift).ok_or_else(|| {
-                    Error::Store(format!(
-                        "instance_template: relation {} already has facts in the target block \
-                         [{block_lo}+{shift}, {block_hi}+{shift}), or the shift wraps the id space",
-                        rel.0
-                    ))
-                })?;
-                grafts.push((rel, grafted));
-            }
-            inner.apply_grafts(at + 1, &grafts, &tlo, &thi);
-            if !grafts.is_empty() {
-                let to = block_lo.wrapping_add(shift as u64);
-                inner.grafts.record(&GraftSpan {
-                    source: (block_lo, block_hi),
-                    target: (to, to.wrapping_add(block_hi - block_lo)),
-                    edition: Edition(at + 1),
-                    rels: grafts.iter().map(|(rel, _)| *rel).collect(),
-                });
-            }
-            (self.stage(&inner)?, at + 1)
+            let e = inner.graft(rels, block_lo, block_hi, shift, None)?;
+            (self.stage(&inner)?, e)
         };
         self.await_durable(seq.0)?;
         Ok(Edition(seq.1))
@@ -1363,6 +1579,7 @@ impl Inner {
             interests: Tree::new(),
             registered: Tree::new(),
             grafts: Spanfilade::new(),
+            patches: PatchTree::new(),
         }
     }
 
@@ -1400,7 +1617,13 @@ impl Inner {
         }
     }
 
-    fn apply(&mut self, e: u64, updates: &[(RelId, Tuple, Diff)]) {
+    /// Apply a commit as edition `e`, recording it in the patch log (with the
+    /// original it was replayed from, for a merge).
+    fn apply(&mut self, e: u64, pre: &[(RelId, Tuple)], updates: &[(RelId, Tuple, Diff)], origin: Origin) {
+        let mut rels: Vec<u32> = updates.iter().map(|(r, _, _)| r.0).collect();
+        rels.sort_unstable();
+        rels.dedup();
+        self.patches = self.patches.insert(e, PatchRecord::Commit { pre: pre.to_vec(), rels, origin });
         for (i, (rel, tuple, diff)) in updates.iter().enumerate() {
             let mut roots = self.roots(*rel).cloned().unwrap_or_default();
             roots.log = roots.log.insert((e, i as u64), LogEntry::Update(tuple.clone(), *diff));
@@ -1430,6 +1653,60 @@ impl Inner {
             }
         }
         self.current = e;
+    }
+
+    /// **The graft behind [`EntStore::instance_template`]**, as the next
+    /// edition: refused, changing nothing, if a template fact names an entity
+    /// outside the block or the target block is occupied. Recorded in the
+    /// spanfilade and the patch log. Returns the edition.
+    fn graft(&mut self, rels: &[RelId], block_lo: u64, block_hi: u64, shift: i64, origin: Origin) -> Result<u64> {
+        let src_lo = Tuple::from([Value::Ent(Entity(block_lo))]);
+        let src_hi = Tuple::from([Value::Ent(Entity(block_hi))]);
+        let (tlo, thi) = (src_lo.displace(shift), src_hi.displace(shift));
+        let mut rels = rels.to_vec();
+        rels.sort();
+        rels.dedup();
+        let at = self.current;
+        let mut grafts = Vec::new();
+        for rel in &rels {
+            let Some(facts) = self.fact_at(*rel, at) else { continue };
+            if !facts.any_in(&src_lo, &src_hi) {
+                continue;
+            }
+            // A graft moves every entity cell, so a template fact naming an
+            // entity outside the block would land pointing at the wrong one.
+            // The span's extent proves it does not, reading two spines.
+            if !facts.measure_range(&src_lo, &src_hi).1.within(block_lo, block_hi) {
+                return Err(Error::Store(format!(
+                    "instance_template: relation {} has template facts naming entities outside \
+                     [{block_lo}, {block_hi}); a graft would move them too",
+                    rel.0
+                )));
+            }
+            let grafted = facts.graft(&src_lo, &src_hi, shift).ok_or_else(|| {
+                Error::Store(format!(
+                    "instance_template: relation {} already has facts in the target block \
+                     [{block_lo}+{shift}, {block_hi}+{shift}), or the shift wraps the id space",
+                    rel.0
+                ))
+            })?;
+            grafts.push((*rel, grafted));
+        }
+        self.apply_grafts(at + 1, &grafts, &tlo, &thi);
+        if !grafts.is_empty() {
+            let to = block_lo.wrapping_add(shift as u64);
+            self.grafts.record(&GraftSpan {
+                source: (block_lo, block_hi),
+                target: (to, to.wrapping_add(block_hi - block_lo)),
+                edition: Edition(at + 1),
+                rels: grafts.iter().map(|(rel, _)| *rel).collect(),
+            });
+        }
+        self.patches = self.patches.insert(
+            at + 1,
+            PatchRecord::Graft { rels: rels.iter().map(|r| r.0).collect(), block: (block_lo, block_hi), shift, origin },
+        );
+        Ok(at + 1)
     }
 
     fn holds_now(&self, rel: RelId, tuple: &Tuple) -> bool {
@@ -1553,7 +1830,7 @@ impl TraceStore for EntStore {
             // soon as this one's work is staged.
             let mut inner = self.inner.lock().unwrap();
             let e = inner.current + 1;
-            inner.apply(e, updates);
+            inner.apply(e, &[], updates, None);
             (self.stage(&inner)?, e)
         };
         // Durability, shared with everyone else staged behind us. Returning only
@@ -1578,7 +1855,7 @@ impl TraceStore for EntStore {
                 }
             }
             let e = inner.current + 1;
-            inner.apply(e, updates);
+            inner.apply(e, preconditions, updates, None);
             (self.stage(&inner)?, e)
         };
         self.await_durable(seq)?;
@@ -1912,6 +2189,8 @@ impl TraceStore for EntStore {
             // Consolidation retires versions; the Arrangements rebuild on demand.
             inner.put(rel, RelRoots { versions, log, orders: OrderTree::new() });
         }
+        // Patches at or below the watermark can no longer be replayed.
+        inner.patches = inner.patches.split(&(new_wm + 1)).1;
         inner.watermark = new_wm;
         // The retired versions simply leave the Version enfilades; the root
         // record that no longer names them lands atomically, and GC reclaims
@@ -2169,6 +2448,22 @@ fn height(t: &FactTree) -> usize {
         h += 1;
     }
     h
+}
+
+/// A committed patch's updates, in submit order, rebuilt from the Edition logs
+/// of the relations it wrote (each update logged at `(edition, its index)`).
+fn patch_updates(state: &Inner, e: u64, rels: &[u32]) -> Vec<(RelId, Tuple, Diff)> {
+    let mut indexed: Vec<(u64, RelId, Tuple, Diff)> = Vec::new();
+    for rel in rels {
+        let Some(log) = state.log_of(RelId(*rel)) else { continue };
+        for ((_, i), entry) in log.range_collect(&(e, 0), &(e + 1, 0)) {
+            if let LogEntry::Update(t, d) = entry {
+                indexed.push((i, RelId(*rel), t, d));
+            }
+        }
+    }
+    indexed.sort_by_key(|(i, _, _, _)| *i);
+    indexed.into_iter().map(|(_, rel, t, d)| (rel, t, d)).collect()
 }
 
 /// The versions a history holder stands for, still retained: the holder's own

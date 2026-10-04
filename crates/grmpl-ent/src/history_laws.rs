@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
 
 use super::{content_key, pieces, ContentKey, EntStore, FactTree, Holding, Version};
+
 use crate::tree::NodeRef;
 
 const R1: RelId = RelId(1);
@@ -180,6 +181,13 @@ fn churn(branches: &mut Vec<EntStore>, rng: &mut Rng, steps: usize, check: &mut 
                 let at = if rng.below(2) == 0 { hi } else { lo + rng.below(hi - lo + 1) };
                 let child = s.fork_at(Edition(at)).unwrap();
                 branches.push(child);
+            }
+            // A merge: a new branch with two parents, by replay.
+            9 if branches.len() < 6 && rng.below(2) == 0 => {
+                let j = rng.below(branches.len() as u64) as usize;
+                if let Ok(super::MergeOutcome::Merged(m)) = branches[i].merge(&branches[j]) {
+                    branches.push(m);
+                }
             }
             // Clear a block, so later grafts can land in it again.
             7 if rng.below(3) == 1 => {

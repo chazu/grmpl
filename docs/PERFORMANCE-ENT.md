@@ -592,3 +592,20 @@ trims about a quarter in the late-against-early direction and costs a little
 in the other. The downward walk reads only interior nodes, because interior
 frames name their children's keys, so its cost is the two versions' interior
 nodes at any history length.
+
+## 11. Merges (Ent-fidelity step 5)
+
+A durable 100k-row relation forked; the fork commits guarded moves, the parent
+commits ten unrelated rows, then the parent merges the fork. Release build.
+
+| merge | time | frames written |
+|---|---|---|
+| replaying 100 guarded patches | 21 ms | 726 |
+| replaying 1,000 guarded patches | 143 ms | 7,169 |
+| refused at the last of 100 patches | 1.8 ms | 0 |
+| refused at the last of 1,000 patches | 15 ms | 0 |
+
+Each replayed patch becomes its own edition of the merged branch, with its own
+version roots, so a merge writes about seven frames per patch, all in one
+batch with one `fsync`. A refused merge stops at the conflict and writes
+nothing.

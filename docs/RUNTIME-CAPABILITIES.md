@@ -135,6 +135,7 @@ intentionally bounded. The roadmap and transaction laws are in
 Format changes are fresh-store cutovers with no migrator: v4 (floats and
 serialized behavior IR), v5 (displaced tree nodes, which carry each child's
 dsp), v6 (one root record with every structure a tree beneath it, paged on
-demand) and v7 (an entity extent in every Fact frame's measures, and the
-spanfilade). A store written by an older format needs a matching build; packages
+demand), v7 (an entity extent in every Fact frame's measures, and the
+spanfilade) and v8 (each branch's patch log, and merged branches' second
+parent). A store written by an older format needs a matching build; packages
 install only into fresh stores.

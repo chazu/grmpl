@@ -65,9 +65,10 @@ const CK_LEN: usize = 32;
 /// Node frames ride the one workspace format version. v6 added links from
 /// leaves to other trees, each internal child's size and measure, and the
 /// single root record. v7 added the [`Extent`] to every Fact tree's measure
-/// and the spanfilade to each branch's state. Like every cutover before it,
-/// v7 is fresh-store-only: a v7 binary rejects every older persisted node
-/// before interpreting its payload.
+/// and the spanfilade to each branch's state. v8 added each branch's patch log
+/// and a second parent to merged branches. Like every cutover before it, v8 is
+/// fresh-store-only: a v8 binary rejects every older persisted node before
+/// interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// The meta key of the root record — the granfilade's one mutable slot.
@@ -1055,10 +1056,10 @@ mod tests {
     }
 
     #[test]
-    fn pre_v7_node_is_rejected_with_fresh_store_guidance() {
-        let old = [6, TAG_LEAF, 0, 0, 0, 0];
+    fn pre_v8_node_is_rejected_with_fresh_store_guidance() {
+        let old = [7, TAG_LEAF, 0, 0, 0, 0];
         let err = decode_header(&old).unwrap_err().to_string();
-        assert!(err.contains("unsupported node format version 6"));
+        assert!(err.contains("unsupported node format version 7"));
         assert!(err.contains("fresh store"));
         assert!(err.contains("no migrator"));
     }
