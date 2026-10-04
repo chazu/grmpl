@@ -8,8 +8,9 @@
 //! change *could* affect (a superset), never a subset — so no watcher ever misses
 //! a delta (the Snapshot–stream law).
 //!
-//! Routing is answered by a **measured interval enfilade** (Gold's CanopyCrum):
-//! the interests live in the same persistent measured [`Tree`] as everything else
+//! Routing is answered by a **measured interval enfilade**. (It borrows the name
+//! of Gold's canopy, a different structure: `docs/ENT-GOLD-AUDIT.md` §1.4.) The
+//! interests live in the same persistent measured [`Tree`] as everything else
 //! in the plex, keyed by `(rel, lo, id)` so one relation's interests are a
 //! contiguous span in low-endpoint order, and carrying an upward measure of the
 //! **maximum high endpoint** plus the **join of the endorsements** beneath each

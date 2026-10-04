@@ -12,9 +12,8 @@
 //! contents. It need not be commutative (the tree preserves key order).
 //!
 //! Two measures are built in. [`Count`] is the size of a subtree. [`Extent`] is
-//! Gold's wid proper: where in the coordinate space a subtree's keys lie, per
-//! column, which is what lets a search prune on a column the tree is not
-//! ordered by.
+//! where in the coordinate space a subtree's keys lie, per column, which is what
+//! lets a search prune on a column the tree is not ordered by.
 
 use grmpl_core::{Tuple, Value};
 
@@ -86,7 +85,8 @@ impl<K, V> Measure<K, V> for Count {
     }
 }
 
-/// **The extent of a subtree in entity space** — Gold's wid.
+/// **The extent of a subtree in entity space.** grmpl's own summary: Gold's
+/// content trees cache none (`docs/ENT-GOLD-AUDIT.md` §1.2).
 ///
 /// For each column, the least and greatest entity id among the subtree's
 /// entity cells in that column (`None` where the column holds no entity). It

@@ -2,15 +2,21 @@
 
 The previous chapter described *one* measure flowing *up* the tree. The `Ent`'s
 real power comes from having measures flow in **both directions**, with two
-different families that answer two different questions. Gold calls them **wids**
-and **dsps**.
+different families that answer two different questions: **wids** and **dsps**.
 
 ## Wids — summaries that flow up
 
-A **wid** (short for *width*) is the upward measure: every node advertises the
-*range of addresses its subtree covers*, and more generally any monoidal summary
-of what lies below it. Wids are exactly the measures of the last chapter. They
-flow **up**: a parent's wid is the combination of its children's wids.
+A **wid** (short for *width*) is the upward measure: in the classic enfilade,
+every node advertises the *range of addresses its subtree covers*, and more
+generally any monoidal summary of what lies below it. Wids are exactly the
+measures of the last chapter. They flow **up**: a parent's wid is the
+combination of its children's wids.
+
+Gold does not cache wids in its content tree. Its O-tree nodes store no
+summary; a search prunes on each `SplitLoaf`'s distinction and on a region it
+narrows as it descends. Gold's upward summaries are the **canopy crums**: a
+separate shared tree whose flag words are OR-ed upward. grmpl's cached `Count`
+and `Extent` measures are its own design, not Gold's wids.
 
 Wids are what make a sparse, effectively **transfinite** address space
 searchable. Xanadu wanted document addresses that could always be subdivided —
@@ -30,6 +36,11 @@ parent's key *plus a displacement***. The absolute position of a leaf is the sum
 of the displacements along the path from the root down to it. Context flows
 **down** the tree by composition.
 
+Where the dsp sits differs. In Gold it is **a node of its own**: a `DspLoaf` is
+a unary node that displaces its one child, and nested dsps compose rather than
+stack. grmpl instead carries a dsp on every `Tree` handle. The two have the same
+power; the per-handle dsp is grmpl's extrapolation, not Gold's layout.
+
 This sounds like a small bookkeeping choice; it is the source of two of the
 `Ent`'s most striking abilities.
 
@@ -38,7 +49,8 @@ This sounds like a small bookkeeping choice; it is the source of two of the
 Because positions are relative, **moving an entire subtree to a new location is a
 single displacement change at its top** — `O(1)`, or `O(edit)` counting the path
 copy to record it. You do not rewrite the addresses of the (possibly enormous)
-contents. You change the one dsp that sits above them, and every absolute address
+contents. You change the one dsp that sits above them (in Gold, `transformedBy:`
+wraps the subtree in a new `DspLoaf`), and every absolute address
 below shifts by exactly that amount as descents recompute it. Insert a paragraph
 on page 1 of a million-page book and everything after it slides down by one dsp
 adjustment, not a million rewrites.
@@ -72,5 +84,7 @@ The slogan is worth memorizing because Part III returns to it constantly:
 
 A node, then, is a little two-faced thing: it tells its parent a *wid* about what
 it contains, and it receives a *dsp* from its parent about where and in what
-context it sits. An enfilade is a tree of these. The `Ent` is what you build when
+context it sits. An enfilade is a tree of these. (Gold splits the two faces
+across structures: the dsp in a `DspLoaf` node, the upward summary in a canopy
+crum.) The `Ent` is what you build when
 you let that tree hold versions.

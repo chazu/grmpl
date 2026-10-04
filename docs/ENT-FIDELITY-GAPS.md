@@ -1,11 +1,11 @@
 # Ent fidelity: the score
 
-**What this is:** the standing list of where `grmpl-ent` still falls short of
-the Ent/enfilade design. The design is `idea.md` §1 (the enfilade plex) and §6
-and §10, plus Gold's `Ent` as read in [`ENT-AND-XANADU.md`](ENT-AND-XANADU.md).
+**What this is:** the standing list of where `grmpl-ent` falls short of Udanax
+Gold's Ent, as the source shows it. Each Gold gap is backed by the line-by-line
+audit [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Gaps against `idea.md`'s
+extrapolations of the Ent are kept separately below, since they are not Gold.
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-03, after fidelity steps 1–3, gap 4, and gap 2's
-reclassification.
+**Last updated:** 2026-10-03, after the Gold audit.
 
 The step reports say what each step built and what it cost:
 [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md) and
@@ -13,119 +13,103 @@ The step reports say what each step built and what it cost:
 
 ---
 
-## The plex at a glance
+## Deliberate divergences (confirmed 2026-10-03)
 
-| `idea.md` §1 member | Status |
-|---|---|
-| Fact enfilades: stored relations and their indexes | ✅ measured by `(Count, Extent)`; Arrangements as derived indexes |
-| Edition enfilades: roots, patches, branches, ancestry | ⚠️ persisted and forkable, but branches form a tree: no merges (gap 3) |
-| Context enfilades: scope-inherited context | ✅ for core: over nested spans of entity space, carried by grafts; ⏸ authority, namespace and placement wait on a nesting that core lacks (gap 2) |
-| Canopy enfilades: standing interest | ✅ interval routing, persisted with the commits routed to it |
-| Derived enfilades: materialized views, incremental state | ✅ for joins and `distinct`; ⚠️ aggregates and `inherit` recompute (gap 7) |
-| Sequences as measured enfilades (§6) | ❌ not built (gap 1) |
-| Green's spanfilade (reverse index over copies) | ✅ by source and by target; ⚠️ as two 1-D trees (gap 5) |
+* **Content-addressed, immutable nodes.** Gold stores identity-addressed
+  objects and updates them in place; grmpl's nodes are SHA-256-keyed and never
+  overwritten. This gives atomic editions, structural sharing for free and a
+  well-defined crash story. It also rules out Gold's splay, which rewrites
+  shared nodes in place, so grmpl's tree is a balanced, path-copied B+ tree.
+* **Facts are identified by value.** Gold's content identity is range
+  elements: two separately written copies of equal content are different
+  content, and backfollow follows identity. In grmpl two equal tuples are the
+  same fact. So grmpl's provenance can only come from recorded copy
+  operations and from sharing nodes, never from comparing values.
 
-## Open gaps
+Other representation choices, not gaps: tuples whose entity cells move under a
+dsp, rather than regions of coordinate spaces; a dsp on every handle rather
+than a separate `DspLoaf` node.
 
-Ordered by how much of the design they leave out. Gaps 1 and 3 need a design
-decision before code. Gaps 5–7 are refinements of things that already work.
-Gap 2 is complete for core and waits on clustering (see
-[Deferred](#deferred-until-core-has-what-they-need)).
+## Gold gaps
 
-### Gap 1 — Sequences as measured enfilades ❌
+From the most central (audit §4). Each needs its laws and cold-store
+measurements before it counts as closed, as in steps 2–3.
+
+| # | Gold mechanism | Status |
+|---|---|---|
+| G1 | **History (the H-tree):** every node knows the nodes that contain it, and the versions at the top | 🔨 next |
+| G2 | **Backfollow:** which versions and editions hold this content, transitively, across the whole Ent | 🔨 next (with G1) |
+| G3 | **Identity-based compare** (`sharedRegion`, `mapSharedTo`): what two versions share, wherever it sits | 🔨 next (with G1) |
+| G4 | **Merges in the trace**, and a trace per derived operation (copy, transform, combine) | ❌ |
+| G5 | **Canopies:** the bert canopy pruning backfollow, the sensor canopy pruning standing-query checks | ❌ (grmpl's "canopy" is an interval index of watchers) |
+| G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ❌ (watches are relational, a different thing) |
+| G7 | **The Agenda:** persistent, crash-resumable background work | ❌ |
+| G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ❌ (why extents prune only along the sort order) |
+| G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ❌ |
+| G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
+| G11 | **Unloading clean nodes** back to stubs | ❌ (a paged node never unloads) |
+
+Already faithful: versions as roots, the persisted version DAG (tree case),
+`isLE`-style ancestry, `O(1)` relocation, copy by sharing subtrees, paged stubs,
+one root with everything beneath it.
+
+## Gaps against `idea.md`'s extrapolations
+
+These are the design note's generalizations of the Ent, not Gold. They are
+uses of an Ent as much as parts of one.
+
+### Sequences as measured enfilades ❌
 
 * **Design:** `idea.md` §6 holds token sequences in measured enfilades, so
   parsing shares the tree's split, search, summaries and incremental update.
-* **Today:** `grmpl-pattern` parses whatever input it is handed and returns
-  every parse. No sequence lives in the Ent, so editing input means parsing
-  all of it again. The pruning of `prune-to-ent-design` deleted the old
-  differential `parse_stream` prototype, which was the nearest thing.
-* **Needs design:** what a sequence key is (a position that can be displaced,
-  next to entity-keyed facts), and which consumer edits sequences
-  incrementally. A command line is too short to measure anything on.
+* **Today:** `grmpl-pattern` parses whatever input it is handed. No sequence
+  lives in the Ent. A candidate experiment once the Gold gaps are closed.
 
-### Gap 3 — No merges in the edition DAG ⚠️
-
-* **Design:** Gold's `fulltrace` is a DAG of version history.
-* **Today:** branches form a tree; each has exactly one parent.
-* **Needs design:** a merge edition with two parents, and what as-of reads,
-  `compare`, the spanfilade's `as_of` and Replay mean across one.
-
-### Gap 5 — Green's 2-D enfilade is approximated ⚠️
-
-* **Design:** Green answers "where did this go" and "where did this come from"
-  with one enfilade carrying 2-D wids.
-* **Today:** the spanfilade answers both, as two 1-D interval trees each
-  measured by a hull. Fact-tree extents are n-dimensional boxes, but they ride
-  a tree ordered by its whole key. They prune only on columns that follow that
-  order: a scattered column pages every leaf (`PERFORMANCE-ENT.md` §7).
-
-### Gap 6 — Extents cover entity cells only ⚠️
-
-* Text and number columns carry no bounding box, so a search on them reads and
-  filters, or uses an Arrangement.
-* This is deliberate: it keeps every frame's measure fixed-size. Gold's widths
-  have no counterpart for arbitrary strings.
-
-### Gap 7 — Derived state is incremental only for linear views and `distinct` ⚠️
-
-* **Aggregates:** a materialized view with an aggregate reads from its copy
-  but takes deltas by recompute. Fix: store each group's partial fold, the
-  Reduce analogue of storing derivation counts.
-* **`inherit`:** a scope change recomputes every view that inherits through
-  it. Fix: store each entity's winning scope.
-* **Choosing what to materialize** is manual. The extents and counts already
-  in the Ent could drive it.
-
-## Deferred until core has what they need
-
-### Gap 2 — Context beyond entity space ⏸
+### Context beyond entity space ⏸
 
 * **Design:** context inherited down scopes carries authority, namespace,
   schema, permissions, placement and simulation parameters (`idea.md` §1, §10).
+  Gold has no counterpart: its dsps displace, they do not carry context.
 * **Done for core:** `context`/`inherit` bind values over nested inclusive
-  spans of entity space, the coordinate the dsps move, and a graft carries a
-  block's bindings with it. That is the Ent's mechanism: context flowing down
-  the tree, displaced with what it describes.
-* **Why the rest waits:** inheriting authority, namespace or placement needs a
-  scope tree in core to inherit down, and core has none:
-  * authority domains are flat (one in v1);
-  * packages are flat and cannot import each other;
-  * branches nest, but a fork copies its parent whole, so inheriting down them
-    adds nothing.
+  spans of entity space, and a graft carries a block's bindings with it.
+* **Why the rest waits:** it needs a scope tree in core, and core has none.
+  Authority domains and packages are flat, and a fork copies its parent whole.
+  The nesting `idea.md` §10 has in mind comes with clustering, which is
+  deferred. Blocks owned by packages or instances are world policy, not core.
 
-  The nesting `idea.md` §10 has in mind comes with clustering ("scopes are the
-  bridge to clustering"): placement and replication policy inherited down scope
-  covers. Clustering is deferred, so gap 2 reopens with it.
-* **Not a core gap:** giving packages or instances owned blocks of entity ids,
-  with authority and allocation ranges bound over them, is world-building
-  policy. A world can build it today from `context`, `instance_template` and
-  key-range authority scopes. Shotengai's hard-coded instance blocks are an
-  example.
+### Derived state is incremental only for linear views and `distinct` ⚠️
 
-## Closed gaps
+* **Aggregates:** a materialized view with an aggregate takes deltas by
+  recompute. Fix: store each group's partial fold.
+* **`inherit`:** a scope change recomputes every view that inherits through
+  it. Fix: store each entity's winning scope.
+* **Choosing what to materialize** is manual.
 
-### Gap 4 — Version compare across a graft ✅ (closed 2026-10-03)
+### Extents cover entity cells only (grmpl's own summary)
 
-* **Design:** a version compare costs the edit, and recognizes a virtual copy
-  as shared content (Green's compare), so instancing a template is not a
-  thousand new rows.
+* Text and number columns carry no bounding box. Deliberate: it keeps every
+  frame's measure fixed-size. The extent itself is grmpl's, not Gold's.
+
+### Green's 2-D enfilade
+
+* The spanfilade (Udanax Green's, not Gold's) answers both directions as two
+  1-D interval trees rather than one 2-D enfilade. G8 is the Gold-side form of
+  the same weakness.
+
+## Closed
+
+### Version compare across a graft ✅ (closed 2026-10-03)
+
 * **Was:** a compare across a graft read the whole relation, and listed the
   copy row by row.
 * **Now:** it reads the copy and its seams, and `EntStore::compare_spans`
-  names the copy by span at a cost independent of its size. See
-  [the closing note below](#how-gap-4-closed).
-
-## Deliberate departures (not gaps)
-
-* **Tuples, not tumblers.** Coordinates are ordered tuples whose entity cells
-  move under a dsp; Gold's are tumbler widths. A representation choice.
-* **Clustering is deferred.** `idea.md` §10's partitioning along scope covers
-  is not built, and only an in-process transport exists. Gap 2 reopens with it.
+  names the copy by span at a cost independent of its size. This is a
+  positional compare; Gold's identity-based compare is G3. See
+  [the closing note below](#how-the-graft-compare-gap-closed).
 
 ---
 
-## How gap 4 closed
+## How the graft-compare gap closed
 
 **The gap as written:** a compare across a graft "falls back to an in-order
 merge of the subtrees whose separators differ, costing the instance's size

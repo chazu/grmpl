@@ -503,14 +503,14 @@ tree's, so a stab reads one path. An `inherit` over a view's rows is linear in
 those rows while the scopes are unchanged. A change to a scope recomputes both
 ends, because one binding can change any entity's answer.
 
-## 9. Version compare after Ent-fidelity gap 4
+## 9. Version compare across a graft
 
 `Tree::diff` used to pair two nodes' children only when their separators were
 identical, and to merge the whole subtree pair entry by entry otherwise. It now
 walks both versions as frontiers of whole subtrees and skips any node both hold
 at the same position, however the spines above it were rebuilt.
 `EntStore::compare_spans` also names each graft by its span, from the
-spanfilade (`ENT-FIDELITY-GAPS.md`, gap 4).
+spanfilade (`ENT-FIDELITY-GAPS.md`, closed gaps).
 
 ### Frames paged, cold
 

@@ -88,7 +88,8 @@ are each branch's whole state (clock, Rel enfilade, context enfilade, canopy).
 ### Extents and the spanfilade (`grmpl-ent::measure`, `spanfilade`)
 
 Fact trees are measured by `(Count, Extent)`: per column, the bounding box of
-the subtree's entity cells — Gold's wid. Three rules keep the searches it drives
+the subtree's entity cells (grmpl's own summary; Gold's content trees cache
+none). Three rules keep the searches it drives
 exact:
 
 * **An extent displaces exactly as its keys do.** It is stored in the node's

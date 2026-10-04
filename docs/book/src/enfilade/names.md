@@ -9,7 +9,8 @@ differently:
   *spanfilade*, and the *granfilade* beneath them.
 - **Udanax Gold** — the later, more abstract design, and the one whose Smalltalk
   source was released. Its vocabulary is the `Ent`, the `Orgl`, the `DagWood`,
-  the `Loaf`/`Crum` families, `Dsp`s and wids.
+  the `Loaf` and `Crum` families, and `Dsp`s. (*Wid* and *granfilade* are
+  Green's words.)
 
 grmpl follows **Gold** — that is where the `Ent` lives, and `grmpl-ent` is named
 for it. But Green's names are the ones that survive in general circulation, and
@@ -66,40 +67,54 @@ one.
 ## Gold: the vocabulary this book uses
 
 Gold generalizes the above. Rather than three special-purpose enfilades it has
-one enfilade *family* with specialized node types, and a versioning backbone over
-them.
+one content-tree *family* (the O-tree), history and canopy trees hung off its
+nodes, and a versioning backbone over them.
 
-- **`Ent`** — the versioned-content backbone: `oroots` (content) plus
-  `fulltrace` (history). The whole of the next chapter.
-- **`Orgl` / `OrglRoot`** — one content structure rooted in an enfilade. Roughly
+- **`Ent`** — the versioned-content backbone. It declares `oroots` and
+  `fulltrace`, but `oroots` is vestigial (`smalltalkOnly`, `NOCOPY`, its stores
+  commented out); the live `Ent` is the `fulltrace` and its `newTrace`. The
+  whole of the next chapter.
+- **`Orgl` / `OrglRoot`** — one content structure rooted in a tree. Roughly
   "one document," or in grmpl's generalization, one *relation's* worth of facts.
-  An `OrglRoot` is the handle you hold to a particular version of one orgl.
-- **`TracePosition`** — a point in history. `oroots` maps a `TracePosition` to
-  the `OrglRoot` current *at* that point. In grmpl a version point is the pair
-  `(branch, edition)`, which is precisely a trace position.
-- **`Crum`** — a **node** of a measured tree. The specializations are where
-  Gold's design lives:
-  - **`CanopyCrum`** — a node of the *canopy*, the tree of standing interest.
-  - **`HistoryCrum`** — carries **trace membership** as an upward measure, so
-    "is this content in edition E?" prunes instead of scanning.
-  - **`SensorCrum`** — a node carrying an active *sensor*: a standing trigger
-    that fires when a change lands under it. Where a `CanopyCrum` indexes who is
-    watching, a `SensorCrum` is the watch itself, sited in the tree. grmpl's
-    `Endorsement`-gated interests in `canopy.rs` occupy this role.
-- **`Loaf`** — a **block of crums**, and the unit the granfilade actually stores.
-  This distinction is easy to skip and worth keeping: a *crum* is a logical node;
-  a *loaf* is the physical record holding a run of them. It is the difference
-  between one disk record per item and one per *batch* of items — a constant
-  factor, but the constant factor that decides whether the structure is usable at
-  all. grmpl's tree holds a run of up to 64 entries per granfilade record for
-  exactly this reason; a grmpl node is a loaf.
-- **`Dsp`** — a displacement. Covered in
+  An `OrglRoot` is the handle you hold to a particular version of one orgl; it is
+  stamped with a trace position and owned by the editions that use it.
+- **`TracePosition`** — a point in history: `BoundedTrace(branch, position)`,
+  ordered by `isLE:`. In grmpl a version point is the pair `(branch, edition)`,
+  which is precisely a trace position.
+- **`Loaf`** — a **node** of an orgl's content tree, the *O-tree*. The tree is
+  a binary splay tree, not a B-tree: a `SplitLoaf` splits on a distinction, a
+  `DspLoaf` displaces its one child, and the leaves are `OExpandingLoaf`s.
+  Balance is not guaranteed. Loaves cache no summary of what lies below.
+  grmpl's own node is not a loaf: it is a B+ tree node holding a run of up to
+  64 entries in one granfilade record, one disk record per *batch* of items
+  rather than per item. That is a constant factor, but the one that decides
+  whether the structure is usable at all.
+- **`Crum`** — a node of the trees hung *off* the O-tree. The specializations
+  are where much of Gold's design lives:
+  - **`HistoryCrum`** — every O-tree node has one, holding its **O-parents**,
+    the nodes that contain it. The H-tree is the O-DAG inverted, and it is what
+    *backfollow* ("which editions contain this content") and identity-based
+    compare (`sharedRegion:`, `mapSharedTo:`) climb.
+  - **`CanopyCrum`** — a node of a *canopy*: a shared binary tree of
+    **permission and endorsement flags**, OR-ed upward. The **Bert canopy**
+    hangs on the H-tree and prunes backfollow.
+  - **`SensorCrum`** — a crum of the **Sensor canopy**, which hangs on the
+    O-tree. Its flags are the filters of the standing queries (recorders)
+    planted below, and it prunes the check for which of them an edit can
+    affect. grmpl's `canopy.rs` borrows the name for an interval index of
+    watchers, with OR-ed `Endorsement` flags on the watchers rather than on
+    content.
+- **`Dsp`** — a displacement, held in Gold by a `DspLoaf` node. Covered in
   [*Wids and Dsps*](./wids-dsps.md).
 - **`DagWood`** — the branch structure of the `fulltrace`. Explained where it is
   declared, in [the next chapter](./the-ent.md#the-dagwood).
-- **`GrandNode` / `GrandHashTable`** — the **granfilade**, the persistent node
-  store. This is the one name Green and Gold share, and the one grmpl kept
-  verbatim: `grmpl-ent/src/granfilade.rs`.
+- **`GrandHashTable`** — an extensible on-disk hash **collection**, used inside
+  the `BeGrandMap` (which registers range elements by id). It is not a node store,
+  and Gold never uses the word *granfilade*. Gold's storage is **Abrahams**:
+  persistent objects addressed by identity and updated in place, written in
+  *flocks* packed into fixed-size *snarfs*. grmpl took the name *granfilade*
+  from Green for its own content-addressed node store,
+  `grmpl-ent/src/granfilade.rs`.
 
 ## The map to grmpl
 
@@ -119,15 +134,14 @@ And Gold's, more directly:
 | Gold | grmpl |
 |---|---|
 | `Ent` | the whole `grmpl-ent` crate |
-| `oroots` : `TracePosition → OrglRoot` | the **Version enfilade**, `edition → Fact root` |
-| `fulltrace` | the Edition enfilade (linear, within a branch) **+** the `DagWood` (between branches) |
+| `OrglRoot` stamped with a `TracePosition` (`oroots` is vestigial) | the **Version enfilade**, `edition → Fact root` |
+| `fulltrace` | the Edition enfilade (linear, within a branch) **+** the `DagWood` (between branches; grmpl has no merges) |
 | `Orgl` | one relation's facts |
-| `Crum` | a `Tree` node |
-| `Loaf` | a node's 64-entry run — one granfilade record |
-| `CanopyCrum` / `SensorCrum` | `canopy.rs` — `InterestKey`, `Endorsement` |
-| `HistoryCrum inTrace:` | *not implemented* — version-compare prunes on shared content keys instead |
-| `Dsp` | the dsp on every `Tree` handle; `dsp.rs` — `Displace` |
+| `Loaf` (binary splay-tree node) | a `Tree` node (B+ tree, 64-entry run, one granfilade record) |
+| `HistoryCrum` (O-parents), backfollow | *not implemented* — version-compare prunes on shared content keys instead |
+| `CanopyCrum` / `SensorCrum` (flag canopies) | `canopy.rs` borrows the name: an interval index of watchers (`InterestKey`, `Endorsement`) |
+| `DspLoaf` | the dsp on every `Tree` handle; `dsp.rs` — `Displace` |
 | `DagWood` | `dag.rs` — `Dag`, `Branch`, `BranchId` |
-| `GrandNode` | `granfilade.rs` — content-addressed nodes |
+| Abrahams in flocks and snarfs | `granfilade.rs` — content-addressed nodes, grmpl's own design |
 
 With the zoo named, the rest of the book can use these words without apology.

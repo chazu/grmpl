@@ -1,17 +1,23 @@
 # The enfilade: a measured tree
 
-An enfilade is, at heart, a **persistent, balanced, measured tree**. Three
-adjectives, each load-bearing.
+An enfilade, as grmpl builds it, is a **persistent, balanced, measured tree**.
+Three adjectives, each load-bearing. Gold's own content tree differs on two of
+them, and the sections below say where.
 
 ## Balanced tree
 
 The leaves hold the actual content — characters, tuples, whatever the enfilade is
 indexing — in order. Internal nodes hold no content; they exist only to keep the
-tree shallow. Because the tree is kept balanced (Gold uses a B-tree-like family
-of `Loaf`/`Crum` nodes; grmpl uses a B+ tree with wide nodes), the path from the
-root to any leaf has length `O(log n)`. Every fundamental operation — find a
-position, split the tree at a point, join two trees — touches only nodes along
-such a path, so each is `O(log n)`.
+tree shallow. grmpl keeps its tree balanced with a B+ tree of wide nodes, so the
+path from the root to any leaf has length `O(log n)`. Every fundamental
+operation — find a position, split the tree at a point, join two trees — touches
+only nodes along such a path, so each is `O(log n)`.
+
+Gold's content tree (the *O-tree* of an orgl) is not a B-tree. It is a **binary
+splay tree** of `Loaf` nodes: a `SplitLoaf` splits on a *distinction* (inside a
+region or outside it), a `DspLoaf` displaces its one child, and the leaves are
+`OExpandingLoaf`s. Only copying splays, so balance is not guaranteed; the source
+itself notes "This should be splaying!!".
 
 ## Measured
 
@@ -43,6 +49,12 @@ in `O(log n)` by reading node summaries instead of leaves. This is the
 enfilade's superpower, and Part III shows grmpl using it to turn a linear
 precondition check and a linear join into logarithmic ones.
 
+Caching the measure in every node is grmpl's design (its `Count` and `Extent`),
+not Gold's. Gold's O-tree nodes cache **no** summary: `count` and `domain`
+recurse, and a search prunes on the splits themselves and on a `limitRegion`
+narrowed on the way down. Gold's upward summaries live in separate trees, the
+*canopies*, whose crums carry flag words OR-ed toward the root.
+
 ## Persistent (in the immutable sense)
 
 "Persistent" here is the functional-programming sense: **operations do not mutate
@@ -71,6 +83,10 @@ still points at. So:
 - The new version cost `O(log n)` new nodes, not `O(n)`.
 - A link into an unchanged span of the old version still resolves — it points at
   a shared subtree that both versions agree on.
+
+This is grmpl's tree exactly. Gold shares subtrees between editions too, but its
+splay rearranges shared nodes in place, which works only because Gold addresses
+nodes by identity rather than by content.
 
 That is the whole game: **an edit is `O(edit)`, history is free, and sharing is
 automatic.** Everything else the enfilade does is an elaboration of this

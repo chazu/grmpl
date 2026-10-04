@@ -13,27 +13,23 @@ implement?** It was rewritten after `grmpl-store` (the fjall LSM stand-in) was
 deleted and `grmpl-ent` became the only substrate; the previous version assessed
 the LSM.
 
-**The headline:** the *design* is faithful to the Ent, and so, now, is the
-core data structure. `grmpl-ent` realizes never-overwrite, path-copied
-structural sharing, versions as roots, version compare that costs the size of
-the change, content-addressed persistence, interest routing — and, since the
-tree gained displacements, Gold's **dsps on pointers**, with persistent
-split/join and an `O(log n)` **virtual copy** that the store uses for template
-instancing. And the whole world is now *in* the Ent: one root record links to
-the branch DAG and to the per-branch state, every directory and the canopy are
-trees beneath it, and nodes page in on demand, so opening a world reads two
-frames whatever its size. Fact trees carry Gold's **wid** — each subtree's
-bounding box in entity space — so a search prunes on any entity column, and a
-**spanfilade** records every graft from both ends, so a template knows its
-instances and an instance its template. Context is inherited down nested
-entity blocks and travels with a graft, and a materialized view keeps its
-derived state in the Ent, so maintaining it costs the change. A version
-compare recognizes a shared subtree however the spines above it were rebuilt,
-and can name a graft by its span from the spanfilade. What remains short of
-the Ent is listed in §5 and kept current in
-[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md): sequences as enfilades, merges
-in the branch DAG, and Green's 2-D enfilades proper. Context beyond entity
-space waits on clustering, which is what would give core a scope tree.
+**The headline:** `grmpl-ent` has Gold's versioning core: never-overwrite,
+path-copied structural sharing, versions as roots, a persisted version DAG,
+`O(1)` relocation by displacement, and virtual copy by sharing subtrees. Around
+that core it makes choices of its own: an ordered B+ tree instead of Gold's
+binary splay tree, immutable content-addressed nodes instead of
+identity-addressed objects updated in place, facts identified by value, and
+cached `Count`/`Extent` summaries that Gold's content trees do not have. It
+lacks Gold's history layer: the upward links from content to everything that
+contains it, the backfollow and identity-based compare built on them, the
+canopies that prune them, the standing queries over them, and the Agenda that
+does their unbounded work in the background. Gold's version trace also has
+merges, which grmpl's does not.
+
+This note was first written from a coarse reading of Gold. A later
+line-by-line audit, [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md), corrected it; where
+the two disagree, the audit is the source-backed one. The open gaps are kept in
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).
 
 ---
 
@@ -49,25 +45,36 @@ Abraham subclass: #Ent
     category: 'Xanadu-Be-Ents'!
 ```
 
-An `Ent` is the **versioned-content backbone**: a map from `TracePosition` →
-`OrglRoot` (each *orgl* is a content structure rooted in an **enfilade**) plus a
-`fulltrace` **DAG** of the whole version history. Around it, the same file carries
-the classic enfilade machinery:
+The `oroots` table is vestigial: it is built `smalltalkOnly` and its stores are
+commented out. **The live Ent is `fulltrace`**, a `DagWood` that hands out
+`TracePosition`s and orders them. Around it, the same file carries the rest of
+the backend (details and line citations in
+[`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §1):
 
-* **`Loaf`/`Crum`** families — the nodes of a *measured tree* (a B-tree-like
-  structure). `CanopyCrum`, `HistoryCrum`, `SensorCrum` are specializations.
-* **`Dsp`** (displacement) family — a subtree's key is its parent's key *plus a
-  displacement*, so relocating or virtually-copying a subtree is a cheap key
-  change, and context flows **down** the tree.
-* **wids** (widths) — every node advertises *the range of addresses its subtree
-  covers*, so a sparse, effectively transfinite space is searchable in
-  `O(depth)`; summaries flow **up** the tree.
-* **`GrandNode`/`GrandHashTable`** — the *granfilade*, the persistent storage.
+* **The trace.** A partial order of versions. Branching is implicit, and
+  `newSuccessorAfter:` makes a position with **two parents**, a merge. Every
+  derived edition (copy, transform, combine) gets a new trace position.
+* **The O-tree** (`Loaf` family) holds an orgl's content. It is a **binary
+  splay tree**: a `SplitLoaf` splits on one dimension's distinction, a
+  `DspLoaf` displaces its one child, and leaves cover regions, some of them
+  lazy or placeholders. Its nodes cache **no** summary of what lies below.
+* **`Dsp`** (displacement) family — a `DspLoaf`'s child is displaced by its
+  dsp, so relocating or virtually copying a subtree is `O(1)` and shares it.
+* **The H-tree** (`HistoryCrum`) inverts the O-tree: every node records the
+  nodes that contain it. Walking it upward answers "which editions hold this
+  content" (backfollow) and "what do these two editions share" (compare).
+* **Canopies** (`CanopyCrum`) are shared trees of permission and endorsement
+  flags OR-ed upward, hung over the history and content trees, which prune
+  backfollow and standing queries.
+* **Recorders and the Agenda**: standing backfollow queries, and persistent
+  background steps for unbounded work.
+* **Persistence**: identity-addressed objects (`Abraham`s) updated in place,
+  written in flocks and snarfs under a fixed root (the `Turtle`). Gold never
+  uses the word "granfilade"; `GrandHashTable` is a collection, not the store.
 
 Two moves make the `Ent` powerful: **structural sharing** (a new version shares
-every unchanged subtree, allocating new crums only along the edited path → an edit
-or virtual copy is `O(edit)`), and **dual measures** (dsps carry context down,
-wids summarize content up).
+every unchanged subtree, so an edit or a virtual copy is `O(edit)`), and
+**history** (shared content knows everything that contains it).
 
 ---
 
@@ -104,10 +111,10 @@ relational/differential world substrate. The mapping is remarkably direct:
 |------------------------------------|----------------------------------------------------------------|
 | orgl content trees (`OrglRoot`)    | **Fact enfilades** — relations + their indexes                 |
 | `fulltrace` DAG + versioned roots  | **Edition enfilades** — historical roots, patches, branches, ancestry |
-| `Dsp` inherited displacement       | **Context enfilades** — DSPative authority/namespace/schema down scopes |
-| `CanopyCrum` / upward interest     | **Canopy enfilades** — standing queries, subscriptions, sensors |
+| `Dsp` displacement                 | **Context enfilades** — DSPative authority/namespace/schema down scopes (an extrapolation) |
+| sensor canopy + recorders          | **Canopy enfilades** — standing queries, subscriptions, sensors |
 | (no equivalent)                    | **Derived enfilades** — differential materialized views (grmpl's addition) |
-| wids (width summaries up)          | **WIDative measurements** — fact kinds, key ranges, entity counts, spatial bounds, dirty regions, subscription interests (`idea.md` §10) |
+| canopy flags OR-ed up; regions at leaves and roots | **WIDative measurements** — fact kinds, key ranges, entity counts, spatial bounds, dirty regions, subscription interests (`idea.md` §10) |
 
 grmpl even keeps Xanadu's key discipline as an explicit law: **editions/snapshots
 are opaque** (`idea.md` §10 — "A single-node implementation may use a
@@ -133,7 +140,8 @@ persists all of them through one node store, the `granfilade`.
   `Arc`-held, and an insert path-copies only the root-to-leaf spine. A new
   version costs `O(log n)` new nodes and shares everything else. **This is
   genuine Ent-style structural sharing.**
-* **Every pointer carries a dsp**, as on Gold's `DspLoaf`: a `Tree` handle is a
+* **Every pointer carries a dsp.** Gold puts a dsp in a separate `DspLoaf`
+  node; grmpl folds it into the handle, which is equivalent: a `Tree` handle is a
   shared node plus its displacement relative to its parent, and a node stores its
   keys in its own local frame. A descent accumulates dsps; reads move stored keys
   *up* to the query (`Displace::cmp_displaced`) rather than the query down, and
@@ -141,16 +149,17 @@ persists all of them through one node store, the `granfilade`.
 * What a dsp displaces is grmpl's own coordinate: a tuple key moves by shifting
   every entity cell together (`dsp::Displace`). Separators and range pruning are
   still by key order, so this is an enfilade over ordered tuple coordinates rather
-  than Udanax's tumbler widths — the wid is a cached measure, not a width.
+  than Gold's coordinate-space regions; the summary is a cached measure.
 * Persistent **split** and **join** cost `O(log n)` new nodes, and **graft** — the
   virtual copy — splits a span out, relocates it, and joins it back in elsewhere,
   sharing every interior node with the original.
 * Each node caches a monoid **measure** of its subtree (`measure::Measure`).
   `Count` answers "how many rows in this span" and "did anything change in this
   edition range" in `O(log n)`. Fact trees also carry an **`Extent`**: per
-  column, the least and greatest entity id under the subtree. That is Gold's wid
-  in grmpl's coordinates — the subtree's box in the space a dsp moves — and like
-  a wid it is stored in the node's local frame and displaced on the way down.
+  column, the least and greatest entity id under the subtree: the subtree's box
+  in the space a dsp moves, stored in the node's local frame and displaced on the
+  way down. Gold's content trees cache no such summary; the extent is grmpl's
+  own, in the spirit of `idea.md`'s "WIDative summaries".
   `Tree::search` walks any measure this way, skipping (and never paging in) a
   subtree whose summary rules it out, so a query on a column the tree is not
   ordered by still prunes.
@@ -163,7 +172,7 @@ Every structure is a tree, and every tree hangs from one root record:
 
 ```
 root record ──► branch DAG         Tree<BranchId, Branch>          (Gold's fulltrace DagWood)
-            └─► branch enfilade    Tree<BranchId, BranchState>     (Gold's oroots)
+            └─► branch enfilade    Tree<BranchId, BranchState>
                   BranchState = clock, watermark,
                     ├─► Rel enfilade       Tree<RelId, RelRoots>
                     │     RelRoots ─► Version enfilade  Tree<edition, Fact tree>
@@ -184,7 +193,7 @@ root record ──► branch DAG         Tree<BranchId, Branch>          (Gold's
 | Canopy | interest intervals with a `max-hi` measure and an endorsement lattice, so a change routes only to watchers whose interval it stabs; persisted with the commits routed to it |
 | Spanfilade | every graft, keyed by source span and again by target span, measured by the hull of its spans |
 | Branch DAG | branches with at most one parent (a tree; no merges), and common-ancestor lookup |
-| Granfilade | `SHA-256(frame) → frame` in fjall's `nodes` keyspace, one root record in `meta`, mark-and-sweep GC |
+| Granfilade | `SHA-256(frame) → frame` in fjall's `nodes` keyspace, one root record in `meta`, mark-and-sweep GC. The name is Udanax Green's; Gold stores identity-addressed objects updated in place |
 
 A tree holds another tree as a **link**: the linked root's content key rides in
 the frame's reference run beside an internal node's children, so GC follows a
@@ -280,26 +289,33 @@ recomputes both ends of every interval.
 
 ## 4. Scorecard
 
-| Ent / enfilade property | In the design (`idea.md`) | In `grmpl-ent` |
-|---|---|---|
-| Never overwrite; historical editions retained | ✅ core law | ✅ versions are roots; as-of reads |
-| Opaque edition identity | ✅ explicit law | ✅ `Edition` is opaque to the language |
-| Patch = guarded, atomic next edition | ✅ semantic center | ✅ `commit_if`, group-committed |
-| Structural sharing / path copy | ✅ | ✅ `O(log n)` new nodes per commit |
-| Version compare costs the edit | ✅ | ✅ `Tree::diff` prunes shared subtrees at any depth; `compare_spans` names grafts by span |
-| Content-addressed persistent node store | ✅ granfilade | ✅ SHA-256 keyed, GC'd, paged on demand |
-| One root; every structure a tree beneath it | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
-| Measured tree with upward summaries | ✅ "WIDative summaries" | ✅ `Count`, and an `Extent` per entity column that `search` prunes on |
-| **DSP displacements composing down the tree** | ✅ | ✅ a dsp on every pointer, accumulated by descent |
-| **Cheap split / join** | ✅ "cheap split/join" | ✅ persistent, `O(log n)` new nodes |
-| **Virtual copy / relocation** | ✅ | ✅ relocate `O(1)`; graft `O(log n)`, used for instancing |
-| DSP-inherited context down scopes | ✅ Context enfilades | ✅ over nested entity blocks (`context`, `inherit`), carried by grafts; ⏸ other scopes wait on clustering, the nesting core lacks |
-| Edition ancestry DAG (`fulltrace`) | ✅ Edition enfilades | ⚠️ a persisted enfilade, but a tree of branches: no merges |
-| Canopy indexing interest | ✅ Canopy enfilades | ✅ interval routing, persisted with the commits routed to it |
-| Reverse index over virtual copies (Green's spanfilade) | — | ✅ by source and by target; origin follows chains of copies |
-| Derived state in the Ent | ✅ Derived enfilades | ✅ `materialized view`: linear form with derivation counts, maintained per commit, read and watched from the copy |
-| Sequences as measured enfilades (§6 parsing) | ✅ | ❌ |
-| Udanax Green 2D enfilades (poom/span) | — | ⚠️ both directions answered, by two 1-D interval trees rather than one 2-D enfilade |
+The Gold column is from the source ([`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md));
+the design column is `idea.md`.
+
+| Property | In Gold | In the design (`idea.md`) | In `grmpl-ent` |
+|---|---|---|---|
+| Never overwrite; historical editions retained | ✅ | ✅ core law | ✅ versions are roots; as-of reads |
+| Opaque edition identity | ✅ trace positions | ✅ explicit law | ✅ `Edition` is opaque to the language |
+| Patch = guarded, atomic next edition | ⚠️ pseudo-transactions, no rollback | ✅ semantic center | ✅ `commit_if`, group-committed |
+| Structural sharing / path copy | ✅ | ✅ | ✅ `O(log n)` new nodes per commit |
+| Content tree shape | binary splay, split per dimension | — | B+ tree ordered by whole key (divergent) |
+| Cached upward summaries in content nodes | ❌ (canopy crums instead) | ✅ "WIDative summaries" | ✅ `Count` and per-column `Extent` (grmpl's own) |
+| Displacements composing down the tree | ✅ `DspLoaf` nodes | ✅ | ✅ a dsp on every handle |
+| Relocation / virtual copy | ✅ `O(1)` / splay and share | ✅ | ✅ relocate `O(1)`; graft `O(log n)` |
+| Version compare | by shared content identity (`sharedRegion`) | ✅ | by position and value (`Tree::diff`); grafts by span (`compare_spans`) |
+| History: content knows its containers (H-tree) | ✅ | — | ❌ |
+| Backfollow: which editions hold this | ✅ transitive, filtered | — | ⚠️ grafts only, one hop, per branch (spanfilade) |
+| Version DAG with merges | ✅ `DagBranch` | ✅ Edition enfilades | ⚠️ a tree of branches: no merges |
+| Canopies (permission/endorsement flags) | ✅ bert + sensor | — | ❌ (grmpl's canopy is an interval index of watchers) |
+| Standing queries | ✅ recorders, into a trail | ✅ Canopy enfilades | ✅ watches over relational views (divergent) |
+| Persistent background work | ✅ the Agenda | — | ❌ all work at commit |
+| Storage | identity-addressed, in place | ✅ granfilade | content-addressed SHA-256, immutable (deliberate) |
+| One root; every structure beneath it | ✅ the Turtle | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
+| Content identity | range elements | — | tuple values (deliberate) |
+| DSP-inherited context down scopes | — | ✅ Context enfilades | ✅ over nested entity blocks; ⏸ other scopes wait on clustering |
+| Derived state in the Ent | — | ✅ Derived enfilades | ✅ `materialized view` |
+| Reverse index over copies (Green's spanfilade) | — | — | ✅ by source and by target |
+| Sequences as measured enfilades (§6 parsing) | — | ✅ | ❌ |
 
 ---
 
@@ -310,20 +326,28 @@ implementation now has the Ent's core: its **versioning** (immutable versions,
 path copying, cheap history, comparison that costs the change,
 content-addressed persistence), its **coordinate system** (dsps on pointers,
 `O(1)` relocation, `O(log n)` virtual copy by graft), and its **shape on disk**
-(one root, `oroots` and `fulltrace` beneath it, every structure a tree, nodes
-paged in on demand). It differs from Udanax in what the coordinates are:
-ordered tuples whose entity cells move, rather than tumbler widths.
+(one root, the version DAG beneath it, every structure a tree, nodes paged in
+on demand). It differs from Gold in what the coordinates are (ordered tuples
+whose entity cells move, rather than regions of coordinate spaces), in how
+nodes are stored (content-addressed and immutable), and in what identifies
+content (values, not range elements).
 
-Since v7 it also has the Ent's **summaries**: Fact trees carry each subtree's
-box in entity space, the way Gold's wids carry extents, and a search prunes on
-any entity column. And it has Green's **reverse index**: the spanfilade knows,
+Since v7 it also has **summaries** Gold's content trees lack: Fact trees carry
+each subtree's box in entity space, and a search prunes on any entity column.
+And it has Green's **reverse index**: the spanfilade knows,
 for every virtual copy, where it came from and where it went. Since step 3 it
 has the last two members of `idea.md`'s family in working form: **context
 enfilades**, scopes inherited down nested entity blocks and carried by grafts,
 and **derived enfilades**, materialized views whose maintenance state lives in
 the Ent.
 
-What is still short of the Ent:
+What is still short of Gold, from the source (full list in
+[`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §4): the history layer (upward links,
+backfollow, identity-based compare), merges in the version trace, the
+canopies, recorders, the Agenda, splits on any dimension, lazy and run-length
+leaves, per-dimension dsps, and unloading clean nodes.
+
+What is short of `idea.md`'s extrapolations:
 
 1. **Scopes are entity blocks only.** Context is inherited down nested spans
    of entity ids, which is where the dsps act. Namespace, authority or schema
@@ -337,9 +361,7 @@ What is still short of the Ent:
    summarized, so a search on them reads and filters, or uses an Arrangement.
    That keeps a frame's measures fixed-size; summarizing text would put
    arbitrary strings in every internal frame.
-4. **The branch DAG has no merges.** It is a tree of branches, each with one
-   parent.
-5. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
+4. **Green's 2-D enfilades.** The spanfilade answers both of Green's directions,
    but as two 1-D interval trees each measured by a hull, not as one enfilade
    with 2-D wids. The Fact trees' extents are n-dimensional boxes, but they ride
    a tree ordered by its whole key, so they prune only as well as each column
@@ -357,7 +379,7 @@ entity's answer.
 The extents and the spanfilade have costs of their own (measured in
 `docs/PERFORMANCE-ENT.md` §7). A search on a scattered column prunes nothing: it
 visits every leaf, and on a cold store pages every leaf in, where an
-Arrangement would read `O(log n)` frames — the wid is only as good as the
+Arrangement would read `O(log n)` frames — the extent is only as good as the
 locality of what it bounds. Every Fact frame carries the boxes, so a commit
 writes about a quarter more bytes. And the spanfilade writes every graft twice,
 and a fork into the past rebuilds it in `O(grafts)`, because it is keyed by
@@ -386,9 +408,8 @@ structure, are in [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md) and
 ### Sources & method
 
 * Xanadu Gold read directly: [`dotmpe/udanax-mpe`](https://github.com/dotmpe/udanax-mpe)
-  `gold/udanax-top.st` — the `Ent` class (line 6092), and the `Loaf`/`Crum`/`Dsp`/
-  `Orgl`/`CanopyCrum`/`GrandNode` families; `gold/udanax-spaces.st` — the
-  `Arrangement`/`Dsp` coordinate spaces. Background:
+  `gold/udanax-top.st` and `gold/udanax-spaces.st`, read line by line for
+  [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Background:
   [Enfilade (Xanadu)](https://en.wikipedia.org/wiki/Enfilade_(Xanadu)),
   [xanadu.com/tech](https://xanadu.com/tech/).
 * grmpl read directly: [`idea.md`](../idea.md) and `crates/grmpl-ent/src/`

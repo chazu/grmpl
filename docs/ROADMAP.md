@@ -485,13 +485,16 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   current. Join maintenance reads the unchanged side by key
   (`TraceStore::lookup`). Laws: `grmpl-ent/tests/{join_maintenance,scopes}.rs`,
   `grmpl-session/tests/{materialized,scopes}.rs`.
-* **Landed:** version compare across a graft (Ent-fidelity gap 4). `Tree::diff`
+* **Landed:** version compare across a graft (an Ent-fidelity gap, closed). `Tree::diff`
   walks both versions as frontiers of whole subtrees, so a shared subtree is
   skipped however the spines above it were rebuilt; `EntStore::compare_spans`
   names each graft by its span from the spanfilade. Law and cost:
   `grmpl-ent/tests/graft_compare.rs`.
-* **Open, in order:** a transactional graft effect in a patch (phase 3A of the
-  world-package plan); sequences as measured enfilades; merges in the branch
-  DAG. Context inherited down scopes other than entity space waits on
-  clustering. The full list of fidelity gaps is
+* **Audited:** Gold's source read line by line against `grmpl-ent`
+  ([`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md)). The fidelity gaps are now the
+  Gold mechanisms it found missing ([`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)).
+* **Open, in order:** Gold's history layer (upward links, backfollow,
+  identity-based compare); merges in the version trace; the canopies,
+  recorders and Agenda; splits on any dimension. Also a transactional graft
+  effect in a patch (phase 3A of the world-package plan). The full list of fidelity gaps is
   [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).
