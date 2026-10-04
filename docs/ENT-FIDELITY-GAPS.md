@@ -5,12 +5,14 @@ Gold's Ent, as the source shows it. Each Gold gap is backed by the line-by-line
 audit [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Gaps against `idea.md`'s
 extrapolations of the Ent are kept separately below, since they are not Gold.
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-03, after step 4 (the history layer).
+**Last updated:** 2026-10-04, after step 6 (k-d splits).
 
 The step reports say what each step built and what it cost:
 [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md),
-[`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md) and
-[`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md).
+[`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md),
+[`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md),
+[`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md) and
+[`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md).
 
 ---
 
@@ -41,18 +43,61 @@ measurements before it counts as closed, as in steps 2–3.
 | G1 | **History (the H-tree):** every node knows the nodes that contain it, and the versions at the top | ✅ step 4: an index beside the immutable nodes |
 | G2 | **Backfollow:** which versions and editions hold this content, transitively, across the whole Ent | ✅ step 4: `backfollow`, from leaves, across branches |
 | G3 | **Identity-based compare** (`sharedRegion`, `mapSharedTo`): what two versions share, wherever it sits | ✅ step 4: `shared_region` (Gold's upward method) and `shared_region_by_descent`, which measures faster |
-| G4 | **Merges in the trace**, and a trace per derived operation (copy, transform, combine) | ❌ |
-| G5 | **Canopies:** the bert canopy pruning backfollow, the sensor canopy pruning standing-query checks | ❌ (grmpl's "canopy" is an interval index of watchers) |
-| G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ❌ (watches are relational, a different thing) |
-| G7 | **The Agenda:** persistent, crash-resumable background work | ⚠️ one job: history indexing runs deferred, in bounded durable steps |
-| G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ❌ (why extents prune only along the sort order) |
+| G4 | **Merges in the trace**, and a trace per derived operation (copy, transform, combine) | ✅ step 5: a merge is a two-parent branch, built by replaying patches. A trace position per derived operation is a representation difference: grmpl's copies and transforms are commits, and already get editions |
+| G5 | **Canopies:** the bert canopy pruning backfollow, the sensor canopy pruning standing-query checks | ⛔ declined as a faithful build ([below](#declined-canopies-and-recorders-g5-g6)); grmpl's "canopy" is an interval index of watchers |
+| G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ⛔ declined as a faithful build ([below](#declined-canopies-and-recorders-g5-g6)); watches are relational, a different thing |
+| G7 | **The Agenda:** persistent, crash-resumable background work | ⏸ only as needed: one job (history indexing) runs deferred, in bounded durable steps. Gold's other big users of the Agenda were canopy propagation and recorder triggers, now declined |
+| G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ✅ step 6: a per-relation k-d layout of binary splits, beside the B+ one. Every column prunes, at about √n for a read on any one column |
 | G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ❌ |
 | G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
 | G11 | **Unloading clean nodes** back to stubs | ❌ (a paged node never unloads) |
 
 Already faithful: versions as roots, the persisted version DAG (tree case),
 `isLE`-style ancestry, `O(1)` relocation, copy by sharing subtrees, paged stubs,
-one root with everything beneath it, and since step 4 the history layer.
+one root with everything beneath it, since step 4 the history layer, and since
+step 5 merges in the version DAG, and since step 6 splits on any column.
+
+### Found in step 6: identity compare stops at the highest shared node
+
+`shared_region` reports each node of one version that the other holds, at
+every position the other holds it, without looking inside. A copy of content
+held inside a larger node that the other version also keeps in place is not
+reported at the copy's shift. Step 4's test never saw this, because its
+template sat at the end of the key space, where B+ joins rebuild the nodes
+above it. A template mid-tree is hidden in either layout. `backfollow` starts
+from the leaves and finds every copy. Open question: whether the identity
+compare should look inside shared nodes, at the cost of reading them.
+
+### Declined: canopies and recorders (G5, G6)
+
+Examined 2026-10-04 and declined as faithful builds. A Gold canopy is a tree of
+OR-ed flag words, shared by pointer among the content and history nodes it
+summarizes. It pays under three conditions grmpl deliberately lacks:
+
+* **Nodes updated in place.** Gold sets flags on shared crums and propagates
+  them on the Agenda. grmpl's nodes are content-addressed, so a canopy would be
+  an index beside them, kept current by deferred work.
+* **Content identity apart from value.** The sensor canopy hangs on content
+  identity. grmpl's facts are identified by value, so for relational watches
+  there is no identity to hang it on.
+* **A small, fixed set of classes to filter on.** An OR-ed word saturates once
+  it stands for open-ended things: with one hashed bit per standing query, a
+  node with 64 queries below it has about 63% of 64 bits set, and near the
+  root it prunes nothing. Bits also cannot express a key range or a predicate.
+  The bert canopy prunes backfollow by permission and endorsement, and grmpl's
+  editions carry neither, so it would prune nothing.
+
+For routing relational watches, grmpl's interval canopy (a `max-hi` measure,
+stabbed once per commit into the `fired` log) prunes more exactly than a flag
+word can. The watch path's real cost is evaluation fan-out, which shared
+arrangements address and no canopy does.
+
+**What transfers:** a side tree holding *mutable, summarizable properties over
+immutable content*, keyed by content and summarized upward, as the history
+index already is. Reach for it if per-content properties appear (who may read
+a block, who watches for its copies). A standing "who copies this" query, if
+one is ever wanted, has a cheap form: an interval interest on source spans,
+stabbed by `apply_grafts` beside the target-span stab it already does.
 
 ## Gaps against `idea.md`'s extrapolations
 

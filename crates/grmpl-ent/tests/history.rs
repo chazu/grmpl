@@ -15,7 +15,7 @@
 //!    at its shift.
 
 use grmpl_core::{Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::{EntStore, Version};
+use grmpl_ent::{EntStore, Layout, Version};
 
 const R: RelId = RelId(1);
 
@@ -30,8 +30,10 @@ fn row(e: u64) -> Tuple {
 const N: u64 = 20_000;
 const BLOCK: (u64, u64) = (1_000_000, 1_001_000);
 
-/// `N` rows plus a 1,000-row template block.
+/// `N` rows plus a 1,000-row template block, in the B+ layout: the costs and
+/// shares pinned here are its, and `kd_layout.rs` has the k-d layout's.
 fn world(s: &EntStore) -> Edition {
+    s.set_default_layout(Layout::Ordered).unwrap();
     let ids: Vec<u64> = (0..N).chain(BLOCK.0..BLOCK.1).collect();
     for c in ids.chunks(5_000) {
         s.commit(&c.iter().map(|&e| (R, row(e), 1)).collect::<Vec<_>>()).unwrap();

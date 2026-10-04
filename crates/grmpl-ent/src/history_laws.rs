@@ -14,8 +14,6 @@ use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, 
 
 use super::{content_key, pieces, ContentKey, EntStore, FactTree, Holding, Version};
 
-use crate::tree::NodeRef;
-
 const R1: RelId = RelId(1);
 const R2: RelId = RelId(2);
 
@@ -71,7 +69,7 @@ fn nodes_of(t: &FactTree) -> Vec<Placed> {
     while let Some((n, parent_off)) = stack.pop() {
         let off = parent_off.wrapping_add(n.dsp());
         out.push((*n.ck_cell().unwrap().get().unwrap(), off, n.len()));
-        if let Some(NodeRef::Internal(_, children)) = n.node() {
+        if let Some(children) = n.node().map(|n| n.children()) {
             stack.extend(children.iter().map(|c| (c.clone(), off)));
         }
     }
@@ -124,7 +122,7 @@ fn model_shared(store: &EntStore, a: Version, b: Version) -> Vec<(i64, usize)> {
             }
             continue;
         }
-        if let Some(NodeRef::Internal(_, children)) = n.node() {
+        if let Some(children) = n.node().map(|n| n.children()) {
             stack.extend(children.iter().map(|c| (c.clone(), off)));
         }
     }

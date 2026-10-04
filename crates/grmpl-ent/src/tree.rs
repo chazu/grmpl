@@ -52,6 +52,12 @@ use grmpl_core::hash::Sha256Digest as ContentKey;
 use crate::dsp::Displace;
 use crate::measure::Measure;
 
+mod kd;
+#[cfg(test)]
+mod kd_laws;
+
+pub use kd::Layout;
+
 /// One entry difference between two tree versions: `(key, left_value,
 /// right_value)`, where a `None` side means the key is absent there.
 pub type EntryDiff<K, V> = (K, Option<V>, Option<V>);
@@ -78,6 +84,38 @@ const MIN: usize = B / 2;
 enum Kind<K, V, M> {
     Leaf(Vec<(K, V)>),
     Internal { keys: Vec<K>, children: Vec<Tree<K, V, M>> },
+    /// **A k-d split** (Gold's `SplitLoaf`): a binary node dividing its
+    /// entries on one column. `children[0]` holds every key whose column
+    /// `col` lies below `pivot`'s lone coordinate (a key without the column
+    /// counts as below), `children[1]` the rest. Only the k-d layout
+    /// ([`kd`]) builds these, and a tree is all one layout: B+ internal
+    /// nodes and splits never mix.
+    ///
+    /// A split on column `0` divides keys exactly as the separator `pivot`
+    /// would in an internal node, so every key-range walk treats it as one.
+    /// A split on any other column leaves the two children's keys
+    /// interleaved, and a walk in key order must visit both.
+    Split { col: usize, pivot: K, children: [Tree<K, V, M>; 2] },
+}
+
+/// How a read walk sees a node: a run of entries, children divided by
+/// separators (a B+ internal node, or a k-d split on column `0`), or children
+/// whose keys interleave (a k-d split on any other column).
+enum View<'a, K, V, M> {
+    Leaf(&'a [(K, V)]),
+    Sep(&'a [K], &'a [Tree<K, V, M>]),
+    Mixed(&'a [Tree<K, V, M>]),
+}
+
+impl<K, V, M> Kind<K, V, M> {
+    fn view(&self) -> View<'_, K, V, M> {
+        match self {
+            Kind::Leaf(entries) => View::Leaf(entries),
+            Kind::Internal { keys, children } => View::Sep(keys, children),
+            Kind::Split { col: 0, pivot, children } => View::Sep(std::slice::from_ref(pivot), children),
+            Kind::Split { children, .. } => View::Mixed(children),
+        }
+    }
 }
 
 struct Node<K, V, M> {
@@ -163,6 +201,19 @@ pub enum NodeRef<'a, K, V, M> {
     Leaf(&'a [(K, V)]),
     /// Separator keys and the children they divide (`keys.len() + 1` children).
     Internal(&'a [K], &'a [Tree<K, V, M>]),
+    /// A k-d split: its column, its pivot (a one-column key, in the node's
+    /// local frame) and its two children, below the pivot and at or above it.
+    Split(usize, &'a K, &'a [Tree<K, V, M>]),
+}
+
+impl<'a, K, V, M> NodeRef<'a, K, V, M> {
+    /// The node's children: none for a leaf.
+    pub fn children(&self) -> &'a [Tree<K, V, M>] {
+        match self {
+            NodeRef::Leaf(_) => &[],
+            NodeRef::Internal(_, children) | NodeRef::Split(_, _, children) => children,
+        }
+    }
 }
 
 // Manual `Clone`: cloning a tree is a single `Arc` refcount bump (a version
@@ -191,6 +242,7 @@ enum Ins<K, V, M> {
 enum Open<K, V, M> {
     Leaf(Vec<(K, V)>),
     Internal(Vec<K>, Vec<Tree<K, V, M>>),
+    Split(usize, K, [Tree<K, V, M>; 2]),
 }
 
 /// `k` moved by `by`, borrowing when there is nothing to move.
@@ -255,6 +307,7 @@ where
         match Self::open(self) {
             Open::Leaf(entries) => Self::leaf(entries),
             Open::Internal(keys, children) => Self::internal(keys, children),
+            Open::Split(col, pivot, [lo, hi]) => Self::split_node(col, pivot, lo, hi),
         }
     }
 
@@ -274,6 +327,9 @@ where
                         .map(|i| &entries[i].1)
                 }
                 Kind::Internal { keys, children } => cur = &children[child_index(keys, off, key)],
+                Kind::Split { col, pivot, children } => {
+                    cur = &children[usize::from(key.cmp_column(*col, pivot, off) != Ordering::Less)]
+                }
             }
         }
     }
@@ -281,6 +337,7 @@ where
     /// A new tree with `key → val` inserted or replaced. Persistent: the prior
     /// tree is unchanged and shares every untouched subtree.
     pub fn insert(&self, key: K, val: V) -> Self {
+        debug_assert!(!self.is_kd(), "a B+ insert into a k-d tree");
         if self.root.is_none() {
             return Self::leaf(vec![(key, val)]);
         }
@@ -293,6 +350,7 @@ where
     /// A new tree with `key` removed. Absent keys are a true no-op — the same
     /// shared version is returned, not a rebuilt copy.
     pub fn remove(&self, key: &K) -> Self {
+        debug_assert!(!self.is_kd(), "a B+ remove from a k-d tree");
         match Self::rem(self, key, 0) {
             None => self.clone(),
             Some(t) => Self::shrink_root(t),
@@ -325,6 +383,7 @@ where
     pub fn search(&self, admit: impl Fn(&M) -> bool, keep: impl Fn(&K, &V) -> bool) -> Vec<(K, V)> {
         let mut out = Vec::new();
         Self::search_into(self, 0, &admit, &keep, &mut out);
+        in_key_order(&mut out);
         out
     }
 
@@ -343,8 +402,8 @@ where
         if !admitted {
             return;
         }
-        match n.kind() {
-            Kind::Leaf(entries) => {
+        match n.kind().view() {
+            View::Leaf(entries) => {
                 for (k, v) in entries {
                     let k = moved(k, off);
                     if keep(&k, v) {
@@ -352,7 +411,7 @@ where
                     }
                 }
             }
-            Kind::Internal { children, .. } => {
+            View::Sep(_, children) | View::Mixed(children) => {
                 for c in children {
                     Self::search_into(c, off, admit, keep, out);
                 }
@@ -377,6 +436,7 @@ where
         let mut out = Vec::new();
         if lo < hi {
             Self::range_into(self, lo, hi, 0, &mut out);
+            in_key_order(&mut out);
         }
         out
     }
@@ -432,7 +492,12 @@ where
         V: PartialEq,
     {
         let mut out = Vec::new();
-        Self::diff_into(self, other, &mut out);
+        if self.is_kd() || other.is_kd() {
+            Self::kd_diff_into(self, 0, other, 0, &mut out);
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+        } else {
+            Self::diff_into(self, other, &mut out);
+        }
         out
     }
 
@@ -440,9 +505,15 @@ where
     /// independent of tree shape. This is the identity view. Keys come out in
     /// the absolute frame, owned (a clone, or a displaced copy under a dsp).
     pub fn iter(&self) -> Iter<'_, K, V, M> {
-        let mut it = Iter { stack: Vec::new(), leaf: None };
+        let mut it = Iter { stack: Vec::new(), leaf: None, sorted: None };
         it.descend(self, 0);
         it
+    }
+
+    /// Whether this tree is in the k-d layout: its root is a split. A lone
+    /// leaf is valid in either layout and reads the same in both.
+    pub fn is_kd(&self) -> bool {
+        matches!(self.root.as_deref().map(|n| n.kind()), Some(Kind::Split { .. }))
     }
 
     // --- split, join, graft -------------------------------------------------
@@ -452,6 +523,7 @@ where
     ///
     /// A cut outside the tree's span shares the whole tree and writes nothing.
     pub fn split(&self, key: &K) -> (Self, Self) {
+        debug_assert!(!self.is_kd(), "a B+ split of a k-d tree");
         if self.is_empty() {
             return (Tree::new(), Tree::new());
         }
@@ -468,6 +540,7 @@ where
     /// `left` must be below every key of `right`. Persistent: `O(log n)` new
     /// nodes along the seam, everything else shared.
     pub fn join(left: &Self, right: &Self) -> Self {
+        debug_assert!(!left.is_kd() && !right.is_kd(), "a B+ join of k-d trees");
         if left.is_empty() {
             return right.clone();
         }
@@ -540,6 +613,7 @@ where
         match self.root.as_deref()?.kind() {
             Kind::Leaf(entries) => Some(NodeRef::Leaf(entries)),
             Kind::Internal { keys, children } => Some(NodeRef::Internal(keys, children)),
+            Kind::Split { col, pivot, children } => Some(NodeRef::Split(*col, pivot, children)),
         }
     }
 
@@ -592,6 +666,12 @@ where
         Self::internal(keys, children)
     }
 
+    /// Rebuild a k-d split from its exact persisted column, pivot and two
+    /// children (each already at its persisted dsp).
+    pub fn split_of(col: usize, pivot: K, lo: Self, hi: Self) -> Self {
+        Self::split_node(col, pivot, lo, hi)
+    }
+
     // --- construction -------------------------------------------------------
 
     fn leaf(entries: Vec<(K, V)>) -> Self {
@@ -626,6 +706,27 @@ where
                 size,
                 measure,
                 kind: OnceLock::from(Kind::Internal { keys, children }),
+                pager: None,
+                ck: OnceLock::new(),
+            })),
+            dsp: 0,
+        }
+    }
+
+    /// A k-d split node over two non-empty children, both in its frame.
+    fn split_node(col: usize, pivot: K, lo: Self, hi: Self) -> Self {
+        let mut measure = M::empty();
+        for c in [&lo, &hi] {
+            match (c.dsp, c.local_measure()) {
+                (0, Some(m)) => measure.absorb(m),
+                _ => measure.absorb(&c.measure()),
+            }
+        }
+        Tree {
+            root: Some(Arc::new(Node {
+                size: lo.len() + hi.len(),
+                measure,
+                kind: OnceLock::from(Kind::Split { col, pivot, children: [lo, hi] }),
                 pager: None,
                 ck: OnceLock::new(),
             })),
@@ -673,6 +774,9 @@ where
                 if d == 0 { keys.clone() } else { keys.iter().map(|k| k.displace(d)).collect() },
                 children.iter().map(|c| c.relocate(d)).collect(),
             ),
+            Kind::Split { col, pivot, children: [lo, hi] } => {
+                Open::Split(*col, moved(pivot, d).into_owned(), [lo.relocate(d), hi.relocate(d)])
+            }
         }
     }
 
@@ -683,36 +787,40 @@ where
         let mut cur = self;
         while let Some(n) = cur.root.as_deref() {
             h += 1;
-            match n.kind() {
-                Kind::Leaf(_) => break,
-                Kind::Internal { children, .. } => cur = &children[0],
+            match n.kind().view() {
+                View::Leaf(_) => break,
+                View::Sep(_, children) | View::Mixed(children) => cur = &children[0],
             }
         }
         h
     }
 
     /// The least key, in this handle's frame. The tree must be non-empty.
+    /// Down a separator spine that is one path; under a split on another
+    /// column both children are asked.
     fn min_key(&self) -> K {
-        let mut cur = self;
-        let mut off = 0i64;
-        loop {
-            off = off.wrapping_add(cur.dsp);
-            match cur.root.as_deref().expect("min_key of an empty tree").kind() {
-                Kind::Leaf(entries) => return entries[0].0.displace(off),
-                Kind::Internal { children, .. } => cur = &children[0],
-            }
-        }
+        Self::extreme_key(self, 0, false)
     }
 
     /// The greatest key, in this handle's frame. The tree must be non-empty.
     fn max_key(&self) -> K {
-        let mut cur = self;
-        let mut off = 0i64;
-        loop {
-            off = off.wrapping_add(cur.dsp);
-            match cur.root.as_deref().expect("max_key of an empty tree").kind() {
-                Kind::Leaf(entries) => return entries[entries.len() - 1].0.displace(off),
-                Kind::Internal { children, .. } => cur = &children[children.len() - 1],
+        Self::extreme_key(self, 0, true)
+    }
+
+    fn extreme_key(t: &Self, off: i64, greatest: bool) -> K {
+        let off = off.wrapping_add(t.dsp);
+        match t.root.as_deref().expect("an extreme key of an empty tree").kind().view() {
+            View::Leaf(entries) => {
+                let (k, _) = if greatest { &entries[entries.len() - 1] } else { &entries[0] };
+                k.displace(off)
+            }
+            View::Sep(_, children) => {
+                let c = if greatest { &children[children.len() - 1] } else { &children[0] };
+                Self::extreme_key(c, off, greatest)
+            }
+            View::Mixed(children) => {
+                let keys = children.iter().map(|c| Self::extreme_key(c, off, greatest));
+                if greatest { keys.max() } else { keys.min() }.expect("a split has children")
             }
         }
     }
@@ -754,6 +862,7 @@ where
                     }
                 }
             }
+            Open::Split(..) => unreachable!("a B+ insert met a k-d split"),
         }
     }
 
@@ -781,6 +890,7 @@ where
                 Self::fix(&mut ks, &mut ch, i);
                 Some(Self::internal(ks, ch))
             }
+            Kind::Split { .. } => unreachable!("a B+ remove met a k-d split"),
         }
     }
 
@@ -854,6 +964,7 @@ where
         match self.root.as_deref().map(|n| n.kind()) {
             Some(Kind::Leaf(e)) => e.len() < MIN,
             Some(Kind::Internal { children, .. }) => children.len() < MIN,
+            Some(Kind::Split { .. }) => unreachable!("B+ occupancy of a k-d split"),
             None => true,
         }
     }
@@ -888,6 +999,7 @@ where
                 let right = Self::from_parts(right_ks, right_ch);
                 (Self::join(&left, &ml), Self::join(&mr, &right))
             }
+            Open::Split(..) => unreachable!("a B+ split met a k-d split"),
         }
     }
 
@@ -985,8 +1097,8 @@ where
             }
             return acc;
         }
-        match n.kind() {
-            Kind::Leaf(entries) => {
+        match n.kind().view() {
+            View::Leaf(entries) => {
                 for (k, v) in entries {
                     if in_span(k, off, lo, hi) {
                         acc.absorb_entry(&moved(k, off), v);
@@ -994,11 +1106,17 @@ where
                 }
                 acc
             }
-            Kind::Internal { keys, children } => {
+            View::Sep(keys, children) => {
                 for (idx, c) in span(keys, children, off, lo, hi) {
                     let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
                     let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
                     acc = Self::fold_range(c, lo, hi, clo, chi, off, acc);
+                }
+                acc
+            }
+            View::Mixed(children) => {
+                for c in children {
+                    acc = Self::fold_range(c, lo, hi, nlo, nhi, off, acc);
                 }
                 acc
             }
@@ -1016,15 +1134,16 @@ where
             return n.size;
         }
         let off = off.wrapping_add(t.dsp);
-        match n.kind() {
-            Kind::Leaf(entries) => entries.iter().filter(|(k, _)| in_span(k, off, lo, hi)).count(),
-            Kind::Internal { keys, children } => span(keys, children, off, lo, hi)
+        match n.kind().view() {
+            View::Leaf(entries) => entries.iter().filter(|(k, _)| in_span(k, off, lo, hi)).count(),
+            View::Sep(keys, children) => span(keys, children, off, lo, hi)
                 .map(|(idx, c)| {
                     let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
                     let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
                     Self::count_into(c, lo, hi, clo, chi, off)
                 })
                 .sum(),
+            View::Mixed(children) => children.iter().map(|c| Self::count_into(c, lo, hi, nlo, nhi, off)).sum(),
         }
     }
 
@@ -1034,16 +1153,21 @@ where
             Some(n) => n,
         };
         let off = off.wrapping_add(t.dsp);
-        match n.kind() {
-            Kind::Leaf(entries) => {
+        match n.kind().view() {
+            View::Leaf(entries) => {
                 for (k, v) in entries {
                     if in_span(k, off, lo, hi) {
                         out.push((moved(k, off).into_owned(), v.clone()));
                     }
                 }
             }
-            Kind::Internal { keys, children } => {
+            View::Sep(keys, children) => {
                 for (_, c) in span(keys, children, off, lo, hi) {
+                    Self::range_into(c, lo, hi, off, out);
+                }
+            }
+            View::Mixed(children) => {
+                for c in children {
                     Self::range_into(c, lo, hi, off, out);
                 }
             }
@@ -1062,34 +1186,39 @@ where
             return n.size > 0;
         }
         let off = off.wrapping_add(t.dsp);
-        match n.kind() {
-            Kind::Leaf(entries) => entries.iter().any(|(k, _)| in_span(k, off, lo, hi)),
-            Kind::Internal { keys, children } => span(keys, children, off, lo, hi).any(|(idx, c)| {
+        match n.kind().view() {
+            View::Leaf(entries) => entries.iter().any(|(k, _)| in_span(k, off, lo, hi)),
+            View::Sep(keys, children) => span(keys, children, off, lo, hi).any(|(idx, c)| {
                 let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
                 let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
                 Self::any_into(c, lo, hi, clo, chi, off)
             }),
+            View::Mixed(children) => children.iter().any(|c| Self::any_into(c, lo, hi, nlo, nhi, off)),
         }
     }
 
     fn last_le_in<'a>(t: &'a Self, key: &K, off: i64) -> Option<(K, &'a V)> {
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
-        match n.kind() {
-            Kind::Leaf(entries) => {
+        match n.kind().view() {
+            View::Leaf(entries) => {
                 let i = entries.partition_point(|(k, _)| k.cmp_displaced(off, key) != Ordering::Greater);
                 (i > 0).then(|| {
                     let (k, v) = &entries[i - 1];
                     (moved(k, off).into_owned(), v)
                 })
             }
-            Kind::Internal { keys, children } => {
+            View::Sep(keys, children) => {
                 // Descend the child whose span holds `key`; if that subtree has
                 // nothing at or below it, the answer is the greatest entry of a
                 // preceding sibling.
                 let i = child_index(keys, off, key);
                 (0..=i).rev().find_map(|j| Self::last_le_in(&children[j], key, off))
             }
+            View::Mixed(children) => children
+                .iter()
+                .filter_map(|c| Self::last_le_in(c, key, off))
+                .max_by(|a, b| a.0.cmp(&b.0)),
         }
     }
 
@@ -1172,7 +1301,7 @@ where
         match head {
             Head::Entry(k, off, v) => push(moved(k, off).into_owned(), v),
             Head::Node(t, off, _) => {
-                let mut it = Iter { stack: Vec::new(), leaf: None };
+                let mut it = Iter { stack: Vec::new(), leaf: None, sorted: None };
                 it.descend(t, off);
                 for (k, v) in it {
                     push(k, v);
@@ -1197,6 +1326,7 @@ where
                     stack.push(Head::Node(c, off, lo));
                 }
             }
+            Kind::Split { .. } => unreachable!("a k-d tree is compared by `kd_diff_into`"),
         }
     }
 }
@@ -1260,6 +1390,9 @@ where
     /// order and inside their separators' spans, uniform leaf depth, occupancy
     /// within `[MIN, B]` below the root, and cached sizes that match.
     pub(crate) fn check(&self) {
+        if self.is_kd() {
+            return self.kd_check();
+        }
         if self.root.is_some() {
             Self::check_node(self, None, None, 0, true);
         }
@@ -1311,6 +1444,7 @@ where
                 assert_eq!(n.size, size, "cached size disagrees with the children");
                 depth.unwrap() + 1
             }
+            Kind::Split { .. } => panic!("a k-d split inside a B+ tree"),
         }
     }
 }
@@ -1366,14 +1500,20 @@ type Frame<'a, K, V, M> = (&'a [Tree<K, V, M>], usize, i64);
 type LeafCursor<'a, K, V> = (&'a [(K, V)], usize, i64);
 
 /// In-order iterator over `(key, value)`, keys in the absolute frame.
+///
+/// A k-d split on a column other than `0` interleaves its children's keys, so
+/// the iterator reads such a subtree whole and sorts it: key order costs a
+/// sort wherever the tree is not divided in key order.
 pub struct Iter<'a, K, V, M> {
     /// Internal nodes on the descent, each with the next child to visit.
     stack: Vec<Frame<'a, K, V, M>>,
     /// The leaf being drained, how far into it we are, and its offset.
     leaf: Option<LeafCursor<'a, K, V>>,
+    /// A sorted subtree being drained.
+    sorted: Option<std::vec::IntoIter<(K, &'a V)>>,
 }
 
-impl<'a, K, V, M> Iter<'a, K, V, M> {
+impl<'a, K: Displace, V, M> Iter<'a, K, V, M> {
     /// Walk to the leftmost leaf of `t`, recording the internal nodes passed.
     /// `off` is the offset of `t`'s parent frame.
     fn descend(&mut self, t: &'a Tree<K, V, M>, off: i64) {
@@ -1381,17 +1521,49 @@ impl<'a, K, V, M> Iter<'a, K, V, M> {
         let mut off = off;
         while let Some(n) = cur.root.as_deref() {
             off = off.wrapping_add(cur.dsp);
-            match n.kind() {
-                Kind::Leaf(entries) => {
+            match n.kind().view() {
+                View::Leaf(entries) => {
                     self.leaf = Some((entries, 0, off));
                     return;
                 }
-                Kind::Internal { children, .. } => {
+                View::Sep(_, children) => {
                     self.stack.push((children, 1, off));
                     cur = &children[0];
                 }
+                View::Mixed(children) => {
+                    let mut all = Vec::with_capacity(n.size);
+                    for c in children {
+                        collect_all(c, off, &mut all);
+                    }
+                    all.sort_by(|a, b| a.0.cmp(&b.0));
+                    self.sorted = Some(all.into_iter());
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Every entry under `t`, keys moved to the frame `off` carries `t`'s parent
+/// to, in no particular order.
+fn collect_all<'a, K: Displace, V, M>(t: &'a Tree<K, V, M>, off: i64, out: &mut Vec<(K, &'a V)>) {
+    let Some(n) = t.root.as_deref() else { return };
+    let off = off.wrapping_add(t.dsp);
+    match n.kind().view() {
+        View::Leaf(entries) => out.extend(entries.iter().map(|(k, v)| (moved(k, off).into_owned(), v))),
+        View::Sep(_, children) | View::Mixed(children) => {
+            for c in children {
+                collect_all(c, off, out);
+            }
+        }
+    }
+}
+
+/// Sort `out` by key unless it already is: a walk over separators emits key
+/// order, and only a k-d split on another column interleaves.
+fn in_key_order<K: Ord, X>(out: &mut [(K, X)]) {
+    if !out.windows(2).all(|w| w[0].0 <= w[1].0) {
+        out.sort_by(|a, b| a.0.cmp(&b.0));
     }
 }
 
@@ -1406,6 +1578,12 @@ impl<'a, K: Displace, V, M> Iterator for Iter<'a, K, V, M> {
                     return Some((moved(k, *off).into_owned(), v));
                 }
                 self.leaf = None;
+            }
+            if let Some(sorted) = &mut self.sorted {
+                if let Some(item) = sorted.next() {
+                    return Some(item);
+                }
+                self.sorted = None;
             }
             // The leaf is drained: take the next unvisited child of the nearest
             // ancestor that still has one, and descend its left spine.

@@ -20,7 +20,7 @@ use grmpl_core::{
     Diff, Edition, EditionStore, Entity, RelId, Result, TraceStore, Tuple, Update, Value,
 };
 use grmpl_diff::{eval_delta, eval_snapshot, multiset, Query};
-use grmpl_ent::EntStore;
+use grmpl_ent::{EntStore, Layout};
 
 const THINGS: RelId = RelId(1);
 const SCOPES: RelId = RelId(2);
@@ -232,6 +232,8 @@ fn stabbing_a_large_scope_relation_reads_a_few_frames() {
     let dir = tempfile::tempdir().unwrap();
     {
         let store = EntStore::open(dir.path()).unwrap();
+        // The bound is the B+ layout's depth.
+        store.set_default_layout(Layout::Ordered).unwrap();
         let rows: Vec<(RelId, Tuple, Diff)> = (0..20_000u64)
             .map(|i| (SCOPES, scope(i * 10, i * 10 + 9, "mood", "room"), 1))
             .chain((0..20u64).map(|r| (SCOPES, scope(r * 10_000, r * 10_000 + 9_999, "mood", "region"), 1)))

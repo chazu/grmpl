@@ -14,3 +14,9 @@ tempfile = "3"
 grmpl-diff = { path = "../grmpl-diff" }
 grmpl-proc = { path = "../grmpl-proc" }
 grmpl = { path = "../grmpl-session" }
+
+[features]
+# Lay every relation out as a k-d tree unless told otherwise, so a whole test
+# run checks the laws against the k-d layout (`cargo test --features
+# grmpl-ent/kd-default`).
+kd-default = []

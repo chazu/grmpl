@@ -15,7 +15,7 @@
 //!    entity outside its block is refused, proved from the block's extent.
 
 use grmpl_core::{Diff, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::EntStore;
+use grmpl_ent::{EntStore, Layout};
 
 const EXITS: RelId = RelId(1);
 
@@ -89,6 +89,8 @@ fn an_entity_column_search_is_exact_at_every_edition() {
 fn reopened(dir: &std::path::Path, rooms: u64, to: impl Fn(u64, u64) -> u64) -> EntStore {
     {
         let store = EntStore::open(dir).unwrap();
+        // This measures the B+ layout's extents, so it pins that layout.
+        store.set_default_layout(Layout::Ordered).unwrap();
         for chunk in (0..rooms).collect::<Vec<_>>().chunks(1_000) {
             let ups: Vec<_> = chunk
                 .iter()

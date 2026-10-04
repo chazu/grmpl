@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::{Count, EntStore, Tree};
+use grmpl_ent::{Count, EntStore, Layout, Tree};
 
 const R: RelId = RelId(1);
 
@@ -260,6 +260,9 @@ fn frames(n: u64, copy: u64) -> (u64, u64) {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = {
         let store = EntStore::open(dir.path()).unwrap();
+        // These bounds are the B+ layout's, so they pin it; `kd_layout.rs`
+        // has the k-d layout's.
+        store.set_default_layout(Layout::Ordered).unwrap();
         let ids: Vec<u64> = (0..n).chain(1_000_000..1_000_000 + copy).collect();
         for chunk in ids.chunks(5_000) {
             store.commit(&chunk.iter().map(|&e| (R, row(e, 0), 1)).collect::<Vec<_>>()).unwrap();
@@ -307,6 +310,7 @@ fn a_compare_reads_the_edit_however_the_spines_were_rebuilt() {
     let dir = tempfile::tempdir().unwrap();
     let eds = {
         let store = EntStore::open(dir.path()).unwrap();
+        store.set_default_layout(Layout::Ordered).unwrap();
         let ids: Vec<u64> = (0..N).map(|i| i * 3).collect();
         for chunk in ids.chunks(5_000) {
             store.commit(&chunk.iter().map(|&e| (R, row(e, 0), 1)).collect::<Vec<_>>()).unwrap();

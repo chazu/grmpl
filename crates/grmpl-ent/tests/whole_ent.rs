@@ -17,7 +17,7 @@
 //!    precisely instead of widening to the whole relation.
 
 use grmpl_core::{Diff, Edition, EditionStore, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::EntStore;
+use grmpl_ent::{EntStore, Layout};
 
 fn t(n: i64) -> Tuple {
     Tuple::from([Value::Int(n)])
@@ -45,6 +45,8 @@ fn opening_a_world_reads_a_few_frames_whatever_its_size() {
         let dir = tempfile::tempdir().unwrap();
         let cur = {
             let store = EntStore::open(dir.path()).unwrap();
+            // The bound is the B+ layout's depth.
+            store.set_default_layout(Layout::Ordered).unwrap();
             build(&store, 4, rows, 100);
             store.current()
         };

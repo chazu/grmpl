@@ -19,12 +19,14 @@ path-copied structural sharing, versions as roots, a persisted version DAG,
 step 4 Gold's history layer: every node's containers indexed, so backfollow
 finds every version holding some content. Around
 that core it makes choices of its own: an ordered B+ tree instead of Gold's
-binary splay tree, immutable content-addressed nodes instead of
+binary splay tree (since step 6, binary splits on any column are a
+per-relation alternative), immutable content-addressed nodes instead of
 identity-addressed objects updated in place, facts identified by value, and
-cached `Count`/`Extent` summaries that Gold's content trees do not have. It
-still lacks the canopies that prune backfollow, the standing queries over it,
-and a general Agenda, and Gold's version trace has merges, which grmpl's does
-not.
+cached `Count`/`Extent` summaries that Gold's content trees do not have. Since
+step 5 its version DAG has merges, built by replaying patches. It does not
+have Gold's canopies or recorders, and will not: they were examined and
+declined, because they pay under conditions grmpl deliberately lacks (see
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md#declined-canopies-and-recorders-g5-g6)).
 
 This note was first written from a coarse reading of Gold. A later
 line-by-line audit, [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md), corrected it; where
@@ -298,17 +300,17 @@ the design column is `idea.md`.
 | Opaque edition identity | ✅ trace positions | ✅ explicit law | ✅ `Edition` is opaque to the language |
 | Patch = guarded, atomic next edition | ⚠️ pseudo-transactions, no rollback | ✅ semantic center | ✅ `commit_if`, group-committed |
 | Structural sharing / path copy | ✅ | ✅ | ✅ `O(log n)` new nodes per commit |
-| Content tree shape | binary splay, split per dimension | — | B+ tree ordered by whole key (divergent) |
+| Content tree shape | binary splay, split per dimension | — | B+ tree ordered by whole key (divergent), or per relation binary splits on any column, balanced by scapegoat rebuild and same-column rotation (step 6) |
 | Cached upward summaries in content nodes | ❌ (canopy crums instead) | ✅ "WIDative summaries" | ✅ `Count` and per-column `Extent` (grmpl's own) |
 | Displacements composing down the tree | ✅ `DspLoaf` nodes | ✅ | ✅ a dsp on every handle |
 | Relocation / virtual copy | ✅ `O(1)` / splay and share | ✅ | ✅ relocate `O(1)`; graft `O(log n)` |
 | Version compare | by shared content identity (`sharedRegion`) | ✅ | by position and value (`Tree::diff`); by identity (`shared_region`) |
 | History: content knows its containers (H-tree) | ✅ | — | ✅ an index beside the nodes, built deferred |
 | Backfollow: which editions hold this | ✅ transitive, filtered | — | ✅ `backfollow`, across branches; ❌ not filtered by permission |
-| Version DAG with merges | ✅ `DagBranch` | ✅ Edition enfilades | ⚠️ a tree of branches: no merges |
-| Canopies (permission/endorsement flags) | ✅ bert + sensor | — | ❌ (grmpl's canopy is an interval index of watchers) |
-| Standing queries | ✅ recorders, into a trail | ✅ Canopy enfilades | ✅ watches over relational views (divergent) |
-| Persistent background work | ✅ the Agenda | — | ⚠️ history indexing only |
+| Version DAG with merges | ✅ `DagBranch` | ✅ Edition enfilades | ✅ two-parent branches, merged by replaying patches (step 5) |
+| Canopies (permission/endorsement flags) | ✅ bert + sensor | — | ⛔ declined (grmpl's canopy is an interval index of watchers) |
+| Standing queries | ✅ recorders, into a trail | ✅ Canopy enfilades | ✅ watches over relational views (divergent); recorders declined |
+| Persistent background work | ✅ the Agenda | — | ⏸ history indexing only; more as needed |
 | Storage | identity-addressed, in place | ✅ granfilade | content-addressed SHA-256, immutable (deliberate) |
 | One root; every structure beneath it | ✅ the Turtle | ✅ the `Ent` object | ✅ root record → DAG + branch enfilade → everything |
 | Content identity | range elements | — | tuple values (deliberate) |
@@ -343,11 +345,13 @@ the Ent.
 
 What is still short of Gold, from the source (full list in
 [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §4, status in
-[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): merges in the version trace,
-the canopies, recorders, a general Agenda, splits on any dimension, lazy and
-run-length leaves, per-dimension dsps, and unloading clean nodes. The history
-layer landed in step 4
-([`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md)).
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): lazy and run-length leaves,
+per-dimension dsps, and unloading clean nodes. The
+history layer landed in step 4
+([`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md)) and merges in step 5
+([`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md)), and splits on any
+column in step 6 ([`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md)).
+Canopies, recorders and a general Agenda were declined.
 
 What is short of `idea.md`'s extrapolations:
 

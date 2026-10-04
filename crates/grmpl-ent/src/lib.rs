@@ -38,7 +38,7 @@ pub use granfilade::{Granfilade, Persist};
 pub use measure::{Count, Extent, Measure};
 pub use spanfilade::{GraftSpan, Spanfilade};
 pub use store::{EntStore, Holding, MergeConflict, MergeOutcome, SpanCompare, Version};
-pub use tree::Tree;
+pub use tree::{Layout, Tree};
 
 #[cfg(test)]
 mod tests {

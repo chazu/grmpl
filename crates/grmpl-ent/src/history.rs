@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use crate::dag::{BranchId, Dag};
 use crate::granfilade::{content_key, ContentKey, PersistKey, PersistMeasure, PersistVal};
 use crate::measure::Count;
-use crate::tree::{NodeRef, Tree};
+use crate::tree::Tree;
 
 type Ck = ContentKey;
 
@@ -124,7 +124,7 @@ impl History {
         }
         self.born = self.born.insert((ck, b), e);
         let mut visited = 1;
-        if let Some(NodeRef::Internal(_, children)) = t.node() {
+        if let Some(children) = t.node().map(|n| n.children()) {
             for c in children {
                 let cck = *c.ck_cell().and_then(|cell| cell.get()).expect("a keyed node's children are keyed");
                 // Edges are a set: a node built again on another branch adds

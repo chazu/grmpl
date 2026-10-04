@@ -286,6 +286,7 @@ impl Canopy {
                     Self::overlap(child, rel, lo, hi, out);
                 }
             }
+            NodeRef::Split(..) => unreachable!("the canopy is a B+ tree"),
         }
     }
 
@@ -341,6 +342,7 @@ impl Canopy {
                     self.stab(child, rel, point, required, out);
                 }
             }
+            NodeRef::Split(..) => unreachable!("the canopy is a B+ tree"),
         }
     }
 }

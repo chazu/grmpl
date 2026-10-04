@@ -66,9 +66,10 @@ const CK_LEN: usize = 32;
 /// leaves to other trees, each internal child's size and measure, and the
 /// single root record. v7 added the [`Extent`] to every Fact tree's measure
 /// and the spanfilade to each branch's state. v8 added each branch's patch log
-/// and a second parent to merged branches. Like every cutover before it, v8 is
-/// fresh-store-only: a v8 binary rejects every older persisted node before
-/// interpreting its payload.
+/// and a second parent to merged branches. v9 added the k-d split frame and
+/// each branch's layout default and layout directory. Like every cutover before
+/// it, v9 is fresh-store-only: a v9 binary rejects every older persisted node
+/// before interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// The meta key of the root record — the granfilade's one mutable slot.
@@ -334,22 +335,27 @@ impl Persist for Count {
     }
 }
 
-/// An extent persists as its column count, then each column's bounds behind a
-/// presence flag.
+/// An extent persists as its row count and column count, then each column's
+/// bounds behind a presence flag and its count of entity cells.
 impl Persist for Extent {
     fn encode(&self, e: &mut Enc<'_, '_>) {
-        (self.0.len() as u32).encode(e);
-        for col in &self.0 {
+        let (bounds, ents, rows) = self.parts();
+        rows.encode(e);
+        (bounds.len() as u32).encode(e);
+        for (col, n) in bounds.iter().zip(ents) {
             col.encode(e);
+            n.encode(e);
         }
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let rows = u64::decode(d)?;
         let n = u32::decode(d)? as usize;
-        let mut cols = Vec::with_capacity(n.min(256));
+        let (mut bounds, mut ents) = (Vec::with_capacity(n.min(256)), Vec::with_capacity(n.min(256)));
         for _ in 0..n {
-            cols.push(Option::<(u64, u64)>::decode(d)?);
+            bounds.push(Option::<(u64, u64)>::decode(d)?);
+            ents.push(u64::decode(d)?);
         }
-        Ok(Extent(cols))
+        Ok(Extent::from_parts(bounds, ents, rows))
     }
 }
 
@@ -611,6 +617,21 @@ impl Granfilade {
                 }
                 Ok(Tree::internal_of(keys, children))
             }
+            TAG_SPLIT => {
+                let pivot = K::decode(&mut d)?;
+                let [lo, hi] = refs[..] else {
+                    return Err(Error::Codec("granfilade: malformed split node".into()));
+                };
+                let pager = self.pager::<K, V, M>();
+                let mut child = |ck: ContentKey| -> Result<Tree<K, V, M>> {
+                    let dsp = i64::decode(&mut d)?;
+                    let size = u64::decode(&mut d)? as usize;
+                    let measure = M::decode(&mut d)?;
+                    Ok(self.stub(ck, size, measure, &pager).relocate(dsp))
+                };
+                let (lo, hi) = (child(lo)?, child(hi)?);
+                Ok(Tree::split_of(count, pivot, lo, hi))
+            }
             _ => Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
         }
     }
@@ -753,6 +774,10 @@ const TAG_LEAF: u8 = 0;
 /// An internal frame: separators in the node's local frame, then for each child
 /// its dsp, size and measure; its references are the children.
 const TAG_INTERNAL: u8 = 1;
+/// A k-d split frame: the column (in the count field), the pivot in the
+/// node's local frame, then for each of the two children its dsp, size and
+/// measure; its references are the two children, below the pivot first.
+const TAG_SPLIT: u8 = 2;
 
 /// The reference run of a node frame, read **without decoding the payload** —
 /// the frame puts it first precisely so GC can walk references without knowing
@@ -876,6 +901,20 @@ where
                 c.local_measure().expect("a child is never empty").encode(&mut e);
             }
             TAG_INTERNAL
+        }
+        NodeRef::Split(col, pivot, children) => {
+            for c in children {
+                let ck = collect_nodes(c, e.sink).expect("a child is never empty");
+                e.refs.push(ck);
+            }
+            (col as u32).encode(&mut e);
+            pivot.encode(&mut e);
+            for c in children {
+                c.dsp().encode(&mut e);
+                (c.len() as u64).encode(&mut e);
+                c.local_measure().expect("a child is never empty").encode(&mut e);
+            }
+            TAG_SPLIT
         }
     };
     let Enc { buf, refs, sink } = e;

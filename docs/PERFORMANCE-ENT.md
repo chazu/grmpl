@@ -609,3 +609,32 @@ Each replayed patch becomes its own edition of the merged branch, with its own
 version roots, so a merge writes about seven frames per patch, all in one
 batch with one `fsync`. A refused merge stops at the conflict and writes
 nothing.
+
+## 12. Layouts: B+ against k-d (Ent-fidelity step 6)
+
+`entbench`'s last section: exits `(from, way, to)` with scattered
+destinations, four per room, loaded in 1,000-row commits, then reopened so
+every read starts cold. Release build, one run each. Frames are node frames
+paged in (cold reads) or written (writes).
+
+| at 100k rows | B+ | k-d |
+|---|---|---|
+| box on the scattered column, cold | 6.4 ms, 3,221 frames | 0.14 ms, 65 frames |
+| box on the scattered column, warm | 141 µs | 2.4 µs |
+| range on `to` below the present, cold | 6.1 ms, 3,192 frames | 0.17 ms, 77 frames |
+| range on `to` at the present, warm | 3.9 µs (first call builds an Arrangement: 252 ms) | 35 µs, nothing built |
+| one room's exits (lead column), cold | 31 µs, 7 frames | 0.59 ms, 450 frames |
+| one room's exits, warm | 253 ns | 12.8 µs |
+| `read_at` the whole relation | 0.89 ms | 8.7 ms |
+| single-row commit | 4.8 ms, 28 frames | 4.4 ms, 22 frames |
+| graft 1,000 rows | 10.9 ms, 18 frames | 5.0 ms, 24 frames |
+| compare across that graft, cold | 42 frames | 52 frames |
+| load, per row | 11 µs | 14 µs |
+
+The k-d tree wins by fifty-fold wherever the question is about the scattered
+column, and loses by the same order wherever it is about the lead column: a
+read on `from` enters both sides of every split on `to`, about the square root
+of the leaves. Sorted output costs a sort (ten-fold on `read_at`). Commits and
+grafts cost the same, since a commit is bound by its `fsync`. At 10k rows the
+shape is the same at a smaller scale (box: 319 frames against 23; lead read: 5
+against 94).

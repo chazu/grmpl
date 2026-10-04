@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::{EntStore, Granfilade};
+use grmpl_ent::{EntStore, Granfilade, Layout};
 
 const REL: RelId = RelId(1);
 const OTHER: RelId = RelId(2);
@@ -439,5 +439,131 @@ fn main() {
         );
     }
 
+    kd_layout();
     println!();
+}
+
+/// `exits_world` laid out as `layout`, reopened cold.
+fn exits_world_in(dir: &std::path::Path, layout: Layout, rows: u64, to: impl Fn(u64, u64) -> u64) -> (EntStore, f64) {
+    let start = Instant::now();
+    {
+        let store = EntStore::open(dir).expect("open");
+        store.set_default_layout(layout).unwrap();
+        let all: Vec<(RelId, Tuple, Diff)> =
+            (0..rows).map(|i| (REL, exit(i / 4, (i % 4) as i64, to(i / 4, i % 4)), 1)).collect();
+        for chunk in all.chunks(1_000) {
+            store.commit(chunk).unwrap();
+        }
+    }
+    let load = start.elapsed().as_nanos() as f64 / rows as f64;
+    (EntStore::open(dir).unwrap(), load)
+}
+
+/// Frames a cold read pages in, and its wall-clock time.
+fn cold<T>(store: &EntStore, read: impl FnOnce(&EntStore) -> T) -> (T, u64, f64) {
+    let before = store.frames_paged();
+    let start = Instant::now();
+    let out = read(store);
+    let ns = start.elapsed().as_nanos() as f64;
+    (out, store.frames_paged() - before, ns)
+}
+
+/// Mean wall-clock time of `r` warm runs.
+fn warm(r: u32, mut f: impl FnMut()) -> f64 {
+    let start = Instant::now();
+    for _ in 0..r {
+        f();
+    }
+    start.elapsed().as_nanos() as f64 / r as f64
+}
+
+/// **G8: the k-d layout against the B+ layout**, on one exits world with
+/// scattered destinations, every read on a cold store first.
+fn kd_layout() {
+    header(
+        "Layouts — B+ (ordered) against k-d (splits on any column)",
+        "Exits with scattered destinations; each read first cold (frames paged), then warm.",
+    );
+    for n in [10_000u64, 100_000] {
+        let rooms = n / 4;
+        let far = move |r: u64, w: u64| (r * 7_919 + w * 104_729) % rooms;
+        let span = (rooms / 2, rooms / 2 + 10);
+        for layout in [Layout::Ordered, Layout::Kd] {
+            let tag = match layout {
+                Layout::Ordered => "B+",
+                Layout::Kd => "k-d",
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let (store, load) = exits_world_in(dir.path(), layout, n, far);
+            let at = store.current();
+            let size = n as i64;
+            row(&format!("{tag}: load, per row"), size, load, "1 000-row commits");
+
+            let (lo, hi) = (Tuple::from([Value::Ent(Entity(rooms / 3))]), Tuple::from([Value::Ent(Entity(rooms / 3 + 1))]));
+            let (got, frames, ns) = cold(&store, |s| s.range_at(REL, at, &lo, &hi).unwrap());
+            row(&format!("{tag}: one room's exits (cold)"), size, ns, &format!("{} rows, {frames} frames", got.len()));
+            let ns = warm(1_000, || {
+                std::hint::black_box(store.range_at(REL, at, &lo, &hi).unwrap());
+            });
+            row(&format!("{tag}: one room's exits (warm)"), size, ns, "");
+
+            let (got, frames, ns) = cold(&store, |s| s.search_at(REL, at, &[(2, span.0, span.1)]).unwrap());
+            row(&format!("{tag}: box on scattered column (cold)"), size, ns, &format!("{} rows, {frames} frames", got.len()));
+            let ns = warm(50, || {
+                std::hint::black_box(store.search_at(REL, at, &[(2, span.0, span.1)]).unwrap());
+            });
+            row(&format!("{tag}: box on scattered column (warm)"), size, ns, "");
+
+            let (vlo, vhi) = (Value::Ent(Entity(span.0)), Value::Ent(Entity(span.1)));
+            let (_, frames, ns) = cold(&store, |s| s.read_range_on(REL, Edition(at.0 - 1), 2, &vlo, &vhi).unwrap());
+            row(&format!("{tag}: column range, past (cold)"), size, ns, &format!("{frames} frames"));
+            let (_, _, first) = cold(&store, |s| s.read_range_on(REL, at, 2, &vlo, &vhi).unwrap());
+            let ns = warm(50, || {
+                std::hint::black_box(store.read_range_on(REL, at, 2, &vlo, &vhi).unwrap());
+            });
+            row(&format!("{tag}: column range, present (warm)"), size, ns, &format!("first call {:.1} ms", first / 1e6));
+
+            let ns = warm(3, || {
+                std::hint::black_box(store.read_at(REL, at).unwrap());
+            });
+            row(&format!("{tag}: read_at, whole relation"), size, ns, "sorted output");
+
+            let mut k = 0u64;
+            let before = store.frames_encoded();
+            let ns = warm(200, || {
+                store.commit(&[(REL, exit(k % rooms, 9, (k * 31) % rooms), 1)]).unwrap();
+                k += 1;
+            });
+            let frames = (store.frames_encoded() - before) / 200;
+            row(&format!("{tag}: single-row commit"), size, ns, &format!("{frames} frames/commit"));
+
+            // A 1 000-row block instanced above the world, then compared.
+            let (block_lo, block_hi) = (rooms / 4, rooms / 4 + 250);
+            let local = move |r: u64, w: u64| block_lo + (r + w) % 250;
+            let ups: Vec<(RelId, Tuple, Diff)> =
+                (block_lo..block_hi).flat_map(|r| (0..4).map(move |w| (REL, exit(r, 20 + w as i64, local(r, w)), 1))).collect();
+            store.commit(&ups).unwrap();
+            let template = store.current();
+            // Only the template rows are inside the block's span with ways ≥ 20,
+            // but a graft moves every fact of the block; drop the scattered ones.
+            let stray: Vec<(RelId, Tuple, Diff)> = store
+                .range_at(REL, template, &Tuple::from([Value::Ent(Entity(block_lo))]), &Tuple::from([Value::Ent(Entity(block_hi))]))
+                .unwrap()
+                .into_iter()
+                .filter(|(t, _)| !matches!(t.as_slice()[1], Value::Int(w) if w >= 20))
+                .map(|(t, d)| (REL, t, -d))
+                .collect();
+            store.commit(&stray).unwrap();
+            let template = store.current();
+            let before = store.frames_encoded();
+            let start = Instant::now();
+            let grafted = store.instance_template(&[REL], block_lo, block_hi, 10_000_000).unwrap();
+            let ns = start.elapsed().as_nanos() as f64;
+            row(&format!("{tag}: graft 1 000 rows"), size, ns, &format!("{} frames", store.frames_encoded() - before));
+            drop(store);
+            let store = EntStore::open(dir.path()).unwrap();
+            let (rows, frames, ns) = cold(&store, |s| s.compare(REL, template, grafted).unwrap());
+            row(&format!("{tag}: compare across graft (cold)"), size, ns, &format!("{} rows, {frames} frames", rows.len()));
+        }
+    }
 }

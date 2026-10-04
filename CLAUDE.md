@@ -42,7 +42,10 @@ Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
                 || count(u32, BE) || payload` — an internal node's refs are its
   children and its payload is its separators, then each child's dsp (`i64`),
   size (`u64`) and measure; a leaf's payload is its entries and its refs are the
-  **links** its values hold (a value may be a whole tree), in order
+  **links** its values hold (a value may be a whole tree), in order; a k-d
+  split's refs are its two children (below the pivot first), its count field
+  is its column and its payload is its pivot, then each child's dsp, size and
+  measure
 * `root record = version(1) || n(u8) || [present(1) || content_key?]*n`
 
 Node content keys are **SHA-256** (`grmpl_core::hash`), vendored and pinned
@@ -84,6 +87,35 @@ are each branch's whole state (clock, Rel enfilade, context enfilade, canopy).
   roots are the root record *and* every paged node still unread in memory; a
   sweep removes swept keys from the granfilade's `present` set, so a resident
   node that loses its frame is written again if a later root reaches it.
+
+### Layouts: B+ and k-d (`grmpl-ent::tree`, `tree::kd`)
+
+A relation's Fact trees are either B+ trees ordered by the whole key (the
+default) or **k-d trees** of binary splits on any column (Gold's `SplitLoaf`;
+`Layout::Kd`, per relation via `set_layout`, or per branch via
+`set_default_layout`, held in the branch's layout directory).
+
+* **A tree is one layout.** B+ internal nodes and k-d splits never mix. Reads
+  need no layout: a split on column `0` is a separator (its pivot is a
+  one-column key), and a walk in key order visits both children of any other
+  split, sorting what interleaves. Writes dispatch on the relation's layout,
+  since a lone leaf is valid in both.
+* **The layout is fixed once written.** `set_layout` and `set_default_layout`
+  are refused for a relation with any version; forks carry the directory and
+  merges unite it.
+* **Splits choose the column of widest numeric spread at the median**, with
+  integer arithmetic for the scapegoat bound, so the shape is deterministic on
+  every platform.
+* **Rotate only past splits on the same column.** Joins and cuts on column `0`
+  (grafts, span compares) rebalance by weight-balanced rotation and share every
+  subtree off the cut; a split on another column is cut on both sides. An
+  insert too deep for its subtree's size rebuilds that subtree (the scapegoat),
+  giving up the sharing beneath it.
+* **A k-d diff partitions, it does not pair.** Pieces that are the same node at
+  the same absolute position cancel; otherwise the largest split divides both
+  sides, and a piece whose ancestors' pivots already place it on one side goes
+  there unread. Without those bounds a compare across a graft reads the
+  relation.
 
 ### Extents and the spanfilade (`grmpl-ent::measure`, `spanfilade`)
 

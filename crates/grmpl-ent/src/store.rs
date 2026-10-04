@@ -34,9 +34,9 @@ use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
 use crate::granfilade::{content_key, ContentKey, Dec, Enc, Granfilade, Persist, StagedWrite};
 use crate::history::{History, Holder};
-use crate::measure::{Count, Extent};
+use crate::measure::{Count, Extent, Measure};
 use crate::spanfilade::{GraftSpan, Spanfilade};
-use crate::tree::Tree;
+use crate::tree::{Layout, Tree};
 
 /// The Fact enfilade: `tuple → net Σdiff` (nonzero only), measured by the entry
 /// [`Count`], so "how many rows" over any key span is an `O(log n)` fold of
@@ -243,6 +243,24 @@ type OrderTree = Tree<u32, FactTree, Count>;
 /// Keyed interest-first so "did interest *i* fire anywhere in `(from, to]`" is a
 /// single WID range measure — `O(log n)`, no scan of the interval.
 type FiredTree = Tree<(u64, u64), (), Count>;
+
+/// The **layout directory**: `relation → the shape of its Fact trees`, for
+/// every relation laid out other than by the branch's default. A directory
+/// beside the Rel enfilade rather than a field of each relation's roots, so a
+/// relation can be laid out before its first fact, and a fork or a merge
+/// carries the choice whether or not the relation has rows yet.
+type LayoutTree = Tree<u32, Layout, Count>;
+
+/// A layout persists as its one-byte tag.
+impl Persist for Layout {
+    fn encode(&self, e: &mut Enc<'_, '_>) {
+        e.put(&[self.tag()]);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let tag = d.take(1)?[0];
+        Layout::from_tag(tag).ok_or_else(|| Error::Codec(format!("ent: unknown layout tag {tag}")))
+    }
+}
 
 /// One relation's roots: its versioned Fact enfilade, its Edition log, and any
 /// **Arrangements** — alternate orderings of the same facts (G-9).
@@ -583,6 +601,10 @@ struct Inner {
     /// **The patch log**: what every edition of this branch's own was, with
     /// its preconditions, so a merge can replay it on another branch.
     patches: PatchTree,
+    /// The layout a relation's Fact trees take unless `layouts` names one.
+    layout: Layout,
+    /// **The layout directory**: relations laid out otherwise.
+    layouts: LayoutTree,
 }
 
 /// A branch's state persists as its clock and links to its trees. The canopy
@@ -600,6 +622,8 @@ impl Persist for Inner {
         e.link(&self.registered);
         self.grafts.encode(e);
         e.link(&self.patches);
+        self.layout.encode(e);
+        e.link(&self.layouts);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         Ok(Inner {
@@ -613,6 +637,8 @@ impl Persist for Inner {
             registered: d.link()?,
             grafts: Spanfilade::decode(d)?,
             patches: d.link()?,
+            layout: Layout::decode(d)?,
+            layouts: d.link()?,
         })
     }
 }
@@ -630,6 +656,11 @@ impl Inner {
 
     fn log_of(&self, rel: RelId) -> Option<&LogTree> {
         self.roots(rel).map(|r| &r.log)
+    }
+
+    /// The layout `rel`'s Fact trees take.
+    fn layout_of(&self, rel: RelId) -> Layout {
+        self.layouts.get(&rel.0).copied().unwrap_or(self.layout)
     }
 
     /// Replace `rel`'s roots, creating the entry if it is new.
@@ -744,6 +775,53 @@ impl EntStore {
         Ok(facts.map(|t| search_box(&t, bounds)).unwrap_or_default())
     }
 
+    /// **The layout of `rel`'s Fact trees** ([`Layout`]): the B+ tree ordered
+    /// by the whole key, or binary splits on any column (Gold's `SplitLoaf`,
+    /// fidelity gap G8).
+    pub fn layout(&self, rel: RelId) -> Layout {
+        self.inner.lock().unwrap().layout_of(rel)
+    }
+
+    /// **Lay `rel` out** as `layout`. A relation's layout is fixed once it has
+    /// a version, since its trees are built in it, so this is refused for a
+    /// relation that has ever been written. Durable when it returns, and
+    /// carried by forks and merges.
+    pub fn set_layout(&self, rel: RelId, layout: Layout) -> Result<()> {
+        let seq = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.roots(rel).is_some_and(|r| !r.versions.is_empty() || !r.log.is_empty()) {
+                if inner.layout_of(rel) == layout {
+                    return Ok(());
+                }
+                return Err(Error::Store(format!("set_layout: relation {} already has versions", rel.0)));
+            }
+            inner.layouts = inner.layouts.insert(rel.0, layout);
+            self.stage(&inner)?
+        };
+        self.await_durable(seq)
+    }
+
+    /// **The layout of every relation not laid out by
+    /// [`set_layout`](Self::set_layout)**, including relations already written:
+    /// so this too is refused once any relation that would change has a
+    /// version. Durable when it returns.
+    pub fn set_default_layout(&self, layout: Layout) -> Result<()> {
+        let seq = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.layout == layout {
+                return Ok(());
+            }
+            for (rel, roots) in inner.rels.iter() {
+                if inner.layouts.get(&rel).is_none() && (!roots.versions.is_empty() || !roots.log.is_empty()) {
+                    return Err(Error::Store(format!("set_default_layout: relation {rel} already has versions")));
+                }
+            }
+            inner.layout = layout;
+            self.stage(&inner)?
+        };
+        self.await_durable(seq)
+    }
+
     /// **Where a block was copied to** (the spanfilade direction): every graft
     /// made at or before `at` whose source overlaps entity ids `[lo, hi)`.
     pub fn copies_of(&self, lo: u64, hi: u64, at: Edition) -> Vec<GraftSpan> {
@@ -845,9 +923,18 @@ impl EntStore {
                     .ok_or_else(|| Error::Store(format!("graft at edition {g} is not in the spanfilade")))?;
                 let (slo, shi) =
                     (Tuple::from([Value::Ent(Entity(copy.source.0))]), Tuple::from([Value::Ent(Entity(copy.source.1))]));
-                let block = root_at(g - 1).split(&slo).1.split(&shi).0.relocate(copy.shift());
-                let (below, rest) = base.split(&tlo);
-                base = FactTree::join(&FactTree::join(&below, &block), &rest.split(&thi).1);
+                base = match inner.layout_of(rel) {
+                    Layout::Ordered => {
+                        let block = root_at(g - 1).split(&slo).1.split(&shi).0.relocate(copy.shift());
+                        let (below, rest) = base.split(&tlo);
+                        FactTree::join(&FactTree::join(&below, &block), &rest.split(&thi).1)
+                    }
+                    Layout::Kd => {
+                        let block = root_at(g - 1).kd_split(&slo).1.kd_split(&shi).0.relocate(copy.shift());
+                        let (below, rest) = base.kd_split(&tlo);
+                        FactTree::kd_join_at(&FactTree::kd_join_at(&below, &tlo, &block), &thi, &rest.kd_split(&thi).1)
+                    }
+                };
                 copies.push(copy);
             }
         }
@@ -938,7 +1025,7 @@ impl EntStore {
                     continue;
                 }
             }
-            if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+            if let Some(children) = t.node().map(|n| n.children()) {
                 stack.extend(children.iter().map(|c| (c, off)));
             }
         }
@@ -970,14 +1057,17 @@ impl EntStore {
         }
         let key = |t: &FactTree| *t.ck_cell().and_then(|c| c.get()).expect("keyed above");
         let mut in_b: HashMap<ContentKey, Vec<i64>> = HashMap::new();
-        let mut stack = vec![(&tb, height(&tb), 0i64)];
+        // A k-d tree's leaves sit at different depths, so its nodes are all
+        // read; a B+ tree's leaves are named by their parents.
+        let top = if tb.is_kd() { usize::MAX } else { height(&tb) };
+        let mut stack = vec![(&tb, top, 0i64)];
         while let Some((t, h, parent_off)) = stack.pop() {
             let off = parent_off.wrapping_add(t.dsp());
             in_b.entry(key(t)).or_default().push(off);
             // Reading an interior node names its children, so a leaf (height
             // 1) is recorded from its parent's frame and never read.
             if h > 1 {
-                if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+                if let Some(children) = t.node().map(|n| n.children()) {
                     for c in children {
                         if h == 2 {
                             in_b.entry(key(c)).or_default().push(off.wrapping_add(c.dsp()));
@@ -1000,7 +1090,7 @@ impl EntStore {
                 }
                 continue;
             }
-            if let Some(crate::tree::NodeRef::Internal(_, children)) = t.node() {
+            if let Some(children) = t.node().map(|n| n.children()) {
                 stack.extend(children.iter().map(|c| (c, off)));
             }
         }
@@ -1117,6 +1207,18 @@ impl EntStore {
                 }
                 Some(_) => {}
                 None => merged.ctx = merged.ctx.insert(k, v.clone()),
+            }
+        }
+        // Layouts: united too, so a relation the other side laid out keeps its
+        // shape here.
+        for (rel, l) in theirs.layouts.iter() {
+            match merged.layouts.get(&rel) {
+                Some(ml) if *ml != *l => {
+                    return conflict(other.branch, theirs.current, format!("relation {rel} is laid out differently"));
+                }
+                Some(_) => {}
+                None if merged.layout_of(RelId(rel)) != *l => merged.layouts = merged.layouts.insert(rel, *l),
+                None => {}
             }
         }
         for (br, e, patch, state) in todo {
@@ -1317,6 +1419,8 @@ impl EntStore {
             // The child's patch log starts empty: what it inherited is its
             // parent's, reached through the DAG.
             patches: PatchTree::new(),
+            layout: inner.layout,
+            layouts: inner.layouts.clone(),
         };
         // Graft a new branch onto this one at the fork edition in the shared
         // DagWood and stage its state, under one root lock so no root record
@@ -1580,6 +1684,8 @@ impl Inner {
             registered: Tree::new(),
             grafts: Spanfilade::new(),
             patches: PatchTree::new(),
+            layout: Layout::default(),
+            layouts: LayoutTree::new(),
         }
     }
 
@@ -1590,7 +1696,12 @@ impl Inner {
         let base = roots.versions.last_le(&e).map(|(_, t)| t.clone()).unwrap_or_default();
         let cur = base.get(tuple).copied().unwrap_or(0);
         let net = cur + diff;
-        let root = if net == 0 { base.remove(tuple) } else { base.insert(tuple.clone(), net) };
+        let root = match (self.layout_of(rel), net) {
+            (Layout::Ordered, 0) => base.remove(tuple),
+            (Layout::Ordered, _) => base.insert(tuple.clone(), net),
+            (Layout::Kd, 0) => base.kd_remove(tuple),
+            (Layout::Kd, _) => base.kd_insert(tuple.clone(), net),
+        };
         roots.versions = roots.versions.insert(e, root);
         // Keep every existing Arrangement in step with the primary order.
         let cols: Vec<u32> = roots.orders.iter().map(|(c, _)| c).collect();
@@ -1683,7 +1794,11 @@ impl Inner {
                     rel.0
                 )));
             }
-            let grafted = facts.graft(&src_lo, &src_hi, shift).ok_or_else(|| {
+            let grafted = match self.layout_of(*rel) {
+                Layout::Ordered => facts.graft(&src_lo, &src_hi, shift),
+                Layout::Kd => facts.kd_graft(&src_lo, &src_hi, shift),
+            };
+            let grafted = grafted.ok_or_else(|| {
                 Error::Store(format!(
                     "instance_template: relation {} already has facts in the target block \
                      [{block_lo}+{shift}, {block_hi}+{shift}), or the shift wraps the id space",
@@ -1963,6 +2078,13 @@ impl TraceStore for EntStore {
             let (klo, khi) = (Tuple::from([lo.clone()]), Tuple::from([hi.clone()]));
             return Ok(inner.fact_at(rel, at.0).map(|t| t.range_collect(&klo, &khi)).unwrap_or_default());
         }
+        // A k-d tree splits on every column, so it is its own index for any of
+        // them, at any edition: no Arrangement is built.
+        if inner.layout_of(rel) == Layout::Kd {
+            let facts = inner.fact_at(rel, at.0).cloned();
+            drop(inner);
+            return Ok(facts.map(|t| t.kd_range_on(col, lo, hi)).unwrap_or_default());
+        }
         // Arrangements track the *current* order. Below it, an entity span is a
         // search on the extents; anything else reads the primary order and
         // filters, which is always exact.
@@ -2019,6 +2141,18 @@ impl TraceStore for EntStore {
         if let Some(spans) = &spans {
             if col == 0 {
                 return Ok(inner.fact_at(rel, at.0).map(|t| probe(t, spans)).unwrap_or_default());
+            }
+            // A k-d tree probes any column through its own splits.
+            if inner.layout_of(rel) == Layout::Kd {
+                let facts = inner.fact_at(rel, at.0).cloned();
+                drop(inner);
+                let Some(facts) = facts else { return Ok(Vec::new()) };
+                let mut out: Vec<(Tuple, Diff)> = spans
+                    .iter()
+                    .flat_map(|(lo, hi)| facts.kd_range_on(col, &lo.as_slice()[0], &hi.as_slice()[0]))
+                    .collect();
+                out.sort();
+                return Ok(out);
             }
             if at.0 == inner.current {
                 Self::ensure_order(&mut inner, rel, col);
@@ -2430,9 +2564,59 @@ fn pieces(t: &FactTree, lo: &Tuple, hi: &Tuple) -> Vec<(ContentKey, i64, usize)>
             }
         }
     }
+    /// A k-d tree's leaves sit at different depths, so every node on the way
+    /// is read. A split on column `0` bounds its children as a separator does.
+    fn walk_kd(
+        t: &FactTree,
+        parent_off: i64,
+        span: (&Tuple, &Tuple),
+        out: &mut Vec<(ContentKey, i64, usize)>,
+    ) {
+        let off = parent_off.wrapping_add(t.dsp());
+        let ck = *t.ck_cell().and_then(|c| c.get()).expect("keyed by content_key");
+        let (lo, hi) = span;
+        // A subtree whose extent puts it outside a one-column span is skipped
+        // unread.
+        let m = <FactMeasure as Measure<Tuple, Diff>>::displace(&t.measure(), parent_off);
+        let outside = |k: &Tuple, below: bool| {
+            k.as_slice().len() == 1 && <FactMeasure as Measure<Tuple, Diff>>::side_of(&m, 0, k) == Some(below)
+        };
+        if outside(lo, true) || outside(hi, false) {
+            return;
+        }
+        match t.node() {
+            Some(crate::tree::NodeRef::Leaf(entries)) => {
+                let n = entries
+                    .iter()
+                    .filter(|(k, _)| {
+                        let k = k.displace(off);
+                        &k >= lo && &k < hi
+                    })
+                    .count();
+                if n > 0 {
+                    out.push((ck, off, n));
+                }
+            }
+            Some(crate::tree::NodeRef::Split(col, pivot, children)) => {
+                let p = pivot.displace(off);
+                // Below a column-0 pivot every key is under it; above, at or over it.
+                if col != 0 || *lo < p {
+                    walk_kd(&children[0], off, span, out);
+                }
+                if col != 0 || *hi > p {
+                    walk_kd(&children[1], off, span, out);
+                }
+            }
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     if content_key(t).is_some() {
-        walk(t, height(t), 0, (None, None), (lo, hi), &mut out);
+        if t.is_kd() {
+            walk_kd(t, 0, (lo, hi), &mut out);
+        } else {
+            walk(t, height(t), 0, (None, None), (lo, hi), &mut out);
+        }
     }
     out
 }

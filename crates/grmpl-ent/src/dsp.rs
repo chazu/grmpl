@@ -50,6 +50,19 @@ pub trait Displace: Ord + Clone {
             self.displace(by).cmp(other)
         }
     }
+
+    /// How this key's column `col` compares with the lone coordinate of a
+    /// stored **pivot** moved up by `by`: the test a k-d split node makes
+    /// (`tree.rs`, `Kind::Split`). A key that has no column `col` sorts below
+    /// every pivot. As with [`cmp_displaced`](Self::cmp_displaced), the stored
+    /// pivot moves up to the key, never the key down.
+    ///
+    /// A key type with one column (every scalar key) has only column `0`, and
+    /// its pivot is a whole key.
+    fn cmp_column(&self, col: usize, pivot: &Self, by: i64) -> Ordering {
+        assert_eq!(col, 0, "a scalar key has one column");
+        pivot.cmp_displaced(by, self).reverse()
+    }
 }
 
 /// A tuple moves by shifting **every** entity cell together; other cells (names,
@@ -93,6 +106,18 @@ impl Displace for Tuple {
             }
         }
         a.len().cmp(&b.len())
+    }
+
+    /// A pivot is a one-column tuple; a tuple too short to have `col` sorts
+    /// below it.
+    fn cmp_column(&self, col: usize, pivot: &Self, by: i64) -> Ordering {
+        let (Some(x), Some(p)) = (self.as_slice().get(col), pivot.as_slice().first()) else {
+            return Ordering::Less;
+        };
+        match (x, p) {
+            (Value::Ent(x), Value::Ent(p)) => x.0.cmp(&p.0.wrapping_add(by as u64)),
+            _ => x.cmp(p),
+        }
     }
 }
 

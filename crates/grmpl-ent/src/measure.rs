@@ -38,6 +38,14 @@ pub trait Measure<K, V>: Clone {
     /// The measure of the same subtree with every **key** displaced by `by`
     /// (values never move). A measure that ignores keys returns itself.
     fn displace(&self, by: i64) -> Self;
+    /// Which side of a k-d split on column `col` at `pivot` (a one-column key,
+    /// in this measure's frame) every key it summarizes lies on, if it can
+    /// tell: `Some(true)` all below, `Some(false)` all at or above. A `Some`
+    /// is a proof; `None` claims nothing. This is what lets a cut or a compare
+    /// in the k-d layout place a subtree without reading it.
+    fn side_of(&self, _col: usize, _pivot: &K) -> Option<bool> {
+        None
+    }
 }
 
 /// Tuple measures compose: a tree may carry several upward summaries at once
@@ -63,6 +71,9 @@ impl<K, V, A: Measure<K, V>, B: Measure<K, V>> Measure<K, V> for (A, B) {
     fn displace(&self, by: i64) -> Self {
         (self.0.displace(by), self.1.displace(by))
     }
+    fn side_of(&self, col: usize, pivot: &K) -> Option<bool> {
+        self.0.side_of(col, pivot).or_else(|| self.1.side_of(col, pivot))
+    }
 }
 
 /// The trivial measure — just the entry count. Useful on its own (size), and as
@@ -85,6 +96,9 @@ impl<K, V> Measure<K, V> for Count {
     }
 }
 
+/// Per column, the least and greatest entity id in it, if any.
+pub type Bounds = Vec<Option<(u64, u64)>>;
+
 /// **The extent of a subtree in entity space.** grmpl's own summary: Gold's
 /// content trees cache none (`docs/ENT-GOLD-AUDIT.md` §1.2).
 ///
@@ -104,13 +118,38 @@ impl<K, V> Measure<K, V> for Count {
 /// Only entity cells are summarized. They are the coordinates the dsp acts on,
 /// and they are fixed-size, so a frame's measures stay small; text and number
 /// columns are left to Arrangements.
+///
+/// Beside each column's bounds the extent counts the rows holding an entity
+/// there, and the rows it summarizes. Where the two agree, every cell of the
+/// column is an entity inside the bounds, so the extent can place the whole
+/// subtree on one side of a k-d pivot ([`Measure::side_of`]). Where they do
+/// not, a cell of another kind could sort anywhere, and it claims nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Extent(pub Vec<Option<(u64, u64)>>);
+pub struct Extent {
+    /// Per column, the least and greatest entity id, or `None` if no entity
+    /// lies in it.
+    bounds: Bounds,
+    /// Per column, the rows holding an entity there.
+    ents: Vec<u64>,
+    /// The rows summarized.
+    rows: u64,
+}
 
 impl Extent {
+    /// An extent from its persisted parts.
+    pub fn from_parts(bounds: Bounds, ents: Vec<u64>, rows: u64) -> Extent {
+        Extent { bounds, ents, rows }
+    }
+
+    /// Its persisted parts: the bounds, the per-column entity counts and the
+    /// rows.
+    pub fn parts(&self) -> (&Bounds, &[u64], u64) {
+        (&self.bounds, &self.ents, self.rows)
+    }
+
     /// The bounds of column `col`, or `None` if no entity lies in it.
     pub fn column(&self, col: usize) -> Option<(u64, u64)> {
-        self.0.get(col).copied().flatten()
+        self.bounds.get(col).copied().flatten()
     }
 
     /// Whether column `col` may hold an entity in `[lo, hi)`. A `false` is a
@@ -121,24 +160,24 @@ impl Extent {
 
     /// Whether every entity cell, in every column, lies in `[lo, hi)`.
     pub fn within(&self, lo: u64, hi: u64) -> bool {
-        self.0.iter().flatten().all(|&(min, max)| lo <= min && max < hi)
+        self.bounds.iter().flatten().all(|&(min, max)| lo <= min && max < hi)
+    }
+
+    /// The bounds of column `col` if every row summarized holds an entity
+    /// there.
+    fn full(&self, col: usize) -> Option<(u64, u64)> {
+        (self.rows > 0 && self.ents.get(col) == Some(&self.rows)).then(|| self.column(col)).flatten()
     }
 }
 
 impl<V> Measure<Tuple, V> for Extent {
     fn empty() -> Self {
-        Extent(Vec::new())
+        Extent::default()
     }
-    fn entry(key: &Tuple, _v: &V) -> Self {
-        Extent(
-            key.as_slice()
-                .iter()
-                .map(|cell| match cell {
-                    Value::Ent(e) => Some((e.0, e.0)),
-                    _ => None,
-                })
-                .collect(),
-        )
+    fn entry(key: &Tuple, val: &V) -> Self {
+        let mut x = Extent::default();
+        Measure::<Tuple, V>::absorb_entry(&mut x, key, val);
+        x
     }
     fn combine(&self, right: &Self) -> Self {
         let mut out = self.clone();
@@ -146,30 +185,38 @@ impl<V> Measure<Tuple, V> for Extent {
         out
     }
     fn absorb(&mut self, right: &Self) {
-        if self.0.len() < right.0.len() {
-            self.0.resize(right.0.len(), None);
+        if self.bounds.len() < right.bounds.len() {
+            self.bounds.resize(right.bounds.len(), None);
+            self.ents.resize(right.bounds.len(), 0);
         }
-        for (mine, theirs) in self.0.iter_mut().zip(&right.0) {
+        for (mine, theirs) in self.bounds.iter_mut().zip(&right.bounds) {
             *mine = match (*mine, *theirs) {
                 (None, b) => b,
                 (a, None) => a,
                 (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
             };
         }
+        for (mine, theirs) in self.ents.iter_mut().zip(&right.ents) {
+            *mine += theirs;
+        }
+        self.rows += right.rows;
     }
     fn absorb_entry(&mut self, key: &Tuple, _val: &V) {
         let cells = key.as_slice();
-        if self.0.len() < cells.len() {
-            self.0.resize(cells.len(), None);
+        if self.bounds.len() < cells.len() {
+            self.bounds.resize(cells.len(), None);
+            self.ents.resize(cells.len(), 0);
         }
-        for (mine, cell) in self.0.iter_mut().zip(cells) {
+        for ((mine, n), cell) in self.bounds.iter_mut().zip(self.ents.iter_mut()).zip(cells) {
             if let Value::Ent(e) = cell {
                 *mine = Some(match *mine {
                     None => (e.0, e.0),
                     Some((lo, hi)) => (lo.min(e.0), hi.max(e.0)),
                 });
+                *n += 1;
             }
         }
+        self.rows += 1;
     }
     /// Every bound moves with the entity cells it summarizes. The tree only
     /// displaces subtrees whose keys do not wrap, so the order of each pair
@@ -179,12 +226,23 @@ impl<V> Measure<Tuple, V> for Extent {
             return self.clone();
         }
         let by = by as u64;
-        Extent(
-            self.0
-                .iter()
-                .map(|b| b.map(|(lo, hi)| (lo.wrapping_add(by), hi.wrapping_add(by))))
-                .collect(),
-        )
+        Extent {
+            bounds: self.bounds.iter().map(|b| b.map(|(lo, hi)| (lo.wrapping_add(by), hi.wrapping_add(by)))).collect(),
+            ents: self.ents.clone(),
+            rows: self.rows,
+        }
+    }
+    /// Only a column every row holds an entity in, against an entity pivot.
+    fn side_of(&self, col: usize, pivot: &Tuple) -> Option<bool> {
+        let Some(Value::Ent(p)) = pivot.as_slice().first() else { return None };
+        let (min, max) = self.full(col)?;
+        if max < p.0 {
+            Some(true)
+        } else if min >= p.0 {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -234,5 +292,26 @@ mod tests {
         let a_bc = Measure::<Tuple, ()>::combine(&a, &Measure::<Tuple, ()>::combine(&b, &c));
         assert_eq!(ab_c, a_bc);
         assert_eq!(Measure::<Tuple, ()>::combine(&Extent::default(), &a), a);
+    }
+
+    #[test]
+    fn an_extent_places_a_subtree_only_when_every_cell_is_an_entity() {
+        let side = |rows: &[Tuple], col: usize, p: u64| Measure::<Tuple, ()>::side_of(&of(rows), col, &Tuple::from([ent(p)]));
+        let rooms = [Tuple::from([ent(10), ent(3)]), Tuple::from([ent(12), ent(7)])];
+        assert_eq!(side(&rooms, 0, 13), Some(true));
+        assert_eq!(side(&rooms, 0, 10), Some(false));
+        assert_eq!(side(&rooms, 0, 11), None, "the pivot falls inside the bounds");
+        assert_eq!(side(&rooms, 1, 8), Some(true));
+        // A number in the column could sort anywhere against an entity pivot,
+        // and so could a missing cell: neither column claims a side.
+        let mixed = [Tuple::from([ent(10), ent(3)]), Tuple::from([ent(12), Value::Int(1)])];
+        assert_eq!(side(&mixed, 1, 100), None);
+        let short = [Tuple::from([ent(10), ent(3)]), Tuple::from([ent(12)])];
+        assert_eq!(side(&short, 1, 100), None);
+        assert_eq!(side(&short, 0, 100), Some(true));
+        // A displaced extent places as its keys do.
+        let moved = Measure::<Tuple, ()>::displace(&of(&rooms), 1_000);
+        assert_eq!(Measure::<Tuple, ()>::side_of(&moved, 0, &Tuple::from([ent(1_011)])), None);
+        assert_eq!(Measure::<Tuple, ()>::side_of(&moved, 0, &Tuple::from([ent(1_013)])), Some(true));
     }
 }
