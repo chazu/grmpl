@@ -104,6 +104,9 @@ fn model_shared(store: &EntStore, a: Version, b: Version) -> Vec<(i64, usize)> {
     for (ck, off, _) in nodes_of(&tree_of(store, b)) {
         in_b.entry(ck).or_default().push(off);
     }
+    // Every leaf of `a`, at every position `b` holds that leaf: content held
+    // at several shifts is counted at each, as Gold's `mapSharedTo` maps each
+    // key to all its appearances.
     let ta = tree_of(store, a);
     let mut out: BTreeMap<i64, usize> = BTreeMap::new();
     if content_key(&ta).is_none() {
@@ -112,18 +115,18 @@ fn model_shared(store: &EntStore, a: Version, b: Version) -> Vec<(i64, usize)> {
     let mut stack = vec![(ta, 0i64)];
     while let Some((n, parent_off)) = stack.pop() {
         let off = parent_off.wrapping_add(n.dsp());
-        let ck = *n.ck_cell().unwrap().get().unwrap();
-        if let Some(offs) = in_b.get(&ck) {
-            let mut offs = offs.clone();
-            offs.sort_unstable();
-            offs.dedup();
-            for o in offs {
-                *out.entry(o - off).or_insert(0) += n.len();
+        match n.node() {
+            Some(node) if node.children().is_empty() => {
+                let ck = *n.ck_cell().unwrap().get().unwrap();
+                let mut offs = in_b.get(&ck).cloned().unwrap_or_default();
+                offs.sort_unstable();
+                offs.dedup();
+                for o in offs {
+                    *out.entry(o - off).or_insert(0) += n.len();
+                }
             }
-            continue;
-        }
-        if let Some(children) = n.node().map(|n| n.children()) {
-            stack.extend(children.iter().map(|c| (c.clone(), off)));
+            Some(node) => stack.extend(node.children().iter().map(|c| (c.clone(), off))),
+            None => {}
         }
     }
     out.into_iter().collect()

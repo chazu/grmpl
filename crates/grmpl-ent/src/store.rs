@@ -991,10 +991,18 @@ impl EntStore {
     /// `a`'s rows appear there. Sharing means the same nodes, as for
     /// [`backfollow`](Self::backfollow).
     ///
-    /// Walks `a` from its root. A node is looked for in `b` by climbing the
-    /// history index towards `b`'s root, admitting only nodes born on `b`'s
-    /// lineage by `b`'s edition (Gold's `isLE:` pruning), and memoized across
-    /// the walk. A node found is reported whole; one not found is opened.
+    /// **Complete, as Gold's `mapSharedTo` is**: content `b` holds at several
+    /// shifts is reported at every one of them. So the walk goes to every leaf
+    /// of `a`, as Gold's `compare:` does (`udanax-top.st` 8116–8119), and
+    /// climbs the history index from each towards `b`'s root through every
+    /// parent, as `mappingTo:` does (27547–27553), admitting only nodes born on
+    /// `b`'s lineage by `b`'s edition (Gold's `isLE:` pruning). The climbs are
+    /// memoized, so leaves share the climb above their common ancestors.
+    ///
+    /// Stopping at the first node `b` also holds would be cheaper, and is
+    /// exact for *whether* content is shared, but not for *where*: a copy of
+    /// a template held inside a larger node that `b` keeps in place would go
+    /// unreported at the copy's shift.
     pub fn shared_region(&self, a: Version, b: Version) -> Result<Vec<(i64, usize)>> {
         let (history, dag, branches) = self.caught_up();
         let tree_at = |v: Version| -> Result<FactTree> {
@@ -1012,21 +1020,12 @@ impl EntStore {
         let lineage = dag.lineage(b.branch, b.edition.0);
         let admit = |ck: &ContentKey| history.visible(ck, &lineage);
         let mut memo = HashMap::new();
-        let mut stack = vec![(&ta, 0i64)];
-        while let Some((t, parent_off)) = stack.pop() {
-            let off = parent_off.wrapping_add(t.dsp());
-            let ck = *t.ck_cell().and_then(|c| c.get()).expect("keyed above");
-            if admit(&ck) {
-                let at = history.offsets_in(ck, &target, &admit, &mut memo);
-                if !at.is_empty() {
-                    for o in at {
-                        *out.entry(o.wrapping_sub(off)).or_insert(0) += t.len();
-                    }
-                    continue;
-                }
+        for (ck, off, rows) in leaves(&ta) {
+            if !admit(&ck) {
+                continue;
             }
-            if let Some(children) = t.node().map(|n| n.children()) {
-                stack.extend(children.iter().map(|c| (c, off)));
+            for o in history.offsets_in(ck, &target, &admit, &mut memo) {
+                *out.entry(o.wrapping_sub(off)).or_insert(0) += rows;
             }
         }
         Ok(out.into_iter().collect())
@@ -1034,11 +1033,11 @@ impl EntStore {
 
     /// **The same answer as [`shared_region`](Self::shared_region), without
     /// the history index.** Collects every node key of `b` from its interior
-    /// frames (a leaf's key is in its parent's frame, so leaves are not read),
-    /// then walks `a` from its root, reporting each node found whole. It costs
-    /// the two versions' interior nodes however long the history is, where the
-    /// upward search costs every later version of a node it climbs from. Kept
-    /// beside Gold's method to measure the two.
+    /// frames (a B+ leaf's key is in its parent's frame, so its leaves are not
+    /// read), then looks up every leaf of `a` among them, at every position
+    /// `b` holds it. It costs the two versions' nodes however long the history
+    /// is, where the upward search costs every later version of a node it
+    /// climbs from. Kept beside Gold's method to measure the two.
     pub fn shared_region_by_descent(&self, a: Version, b: Version) -> Result<Vec<(i64, usize)>> {
         let branches = self.family.root.lock().unwrap().branches.clone();
         let tree_at = |v: Version| -> Result<FactTree> {
@@ -1078,20 +1077,13 @@ impl EntStore {
                 }
             }
         }
-        let mut stack = vec![(&ta, 0i64)];
-        while let Some((t, parent_off)) = stack.pop() {
-            let off = parent_off.wrapping_add(t.dsp());
-            if let Some(offs) = in_b.get(&key(t)) {
-                let mut offs = offs.clone();
-                offs.sort_unstable();
-                offs.dedup();
-                for o in offs {
-                    *out.entry(o.wrapping_sub(off)).or_insert(0) += t.len();
-                }
-                continue;
-            }
-            if let Some(children) = t.node().map(|n| n.children()) {
-                stack.extend(children.iter().map(|c| (c, off)));
+        for (ck, off, rows) in leaves(&ta) {
+            let Some(offs) = in_b.get(&ck) else { continue };
+            let mut offs = offs.clone();
+            offs.sort_unstable();
+            offs.dedup();
+            for o in offs {
+                *out.entry(o.wrapping_sub(off)).or_insert(0) += rows;
             }
         }
         Ok(out.into_iter().collect())
@@ -2616,6 +2608,33 @@ fn pieces(t: &FactTree, lo: &Tuple, hi: &Tuple) -> Vec<(ContentKey, i64, usize)>
             walk_kd(t, 0, (lo, hi), &mut out);
         } else {
             walk(t, height(t), 0, (None, None), (lo, hi), &mut out);
+        }
+    }
+    out
+}
+
+/// **Every leaf of a Fact tree**, as `(content key, offset of its frame,
+/// rows)`. A B+ tree's leaves sit at one depth, so they are named by their
+/// parents and not read; a k-d tree's are found by reading each split. The
+/// tree must be keyed (`content_key`).
+fn leaves(t: &FactTree) -> Vec<(ContentKey, i64, usize)> {
+    let mut out = Vec::new();
+    if t.is_empty() {
+        return out;
+    }
+    let key = |t: &FactTree| *t.ck_cell().and_then(|c| c.get()).expect("keyed by content_key");
+    let top = if t.is_kd() { usize::MAX } else { height(t) };
+    let mut stack = vec![(t, top, 0i64)];
+    while let Some((n, h, parent_off)) = stack.pop() {
+        let off = parent_off.wrapping_add(n.dsp());
+        if h == 1 {
+            out.push((key(n), off, n.len()));
+            continue;
+        }
+        match n.node() {
+            Some(crate::tree::NodeRef::Leaf(_)) => out.push((key(n), off, n.len())),
+            Some(node) => stack.extend(node.children().iter().map(|c| (c, h.saturating_sub(1), off))),
+            None => {}
         }
     }
     out

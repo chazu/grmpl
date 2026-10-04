@@ -161,8 +161,10 @@ slots 2–5 (`parents`, `holders`, `born`, `cursor`).
   skips versions consolidation retired, including ones it folded into the
   watermark checkpoint (several holders can stand for that one version).
 * **Sharing is identity**: backfollow and `shared_region` find shared nodes,
-  not equal values. Backfollow starts from the leaves of the span, as Gold
-  does.
+  not equal values. Both start from leaves, as Gold does, and `shared_region`
+  is **complete**: it reports content at every position the other version
+  holds it. Stopping at the first shared node would hide a copy of content
+  held inside a node kept in place.
 
 ### Context and derived enfilades (`context`/`inherit`, `materialized view`)
 

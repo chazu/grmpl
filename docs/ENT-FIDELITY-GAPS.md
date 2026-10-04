@@ -57,16 +57,20 @@ Already faithful: versions as roots, the persisted version DAG (tree case),
 one root with everything beneath it, since step 4 the history layer, and since
 step 5 merges in the version DAG, and since step 6 splits on any column.
 
-### Found in step 6: identity compare stops at the highest shared node
+### Identity compare is complete ✅ (fixed 2026-10-04, after step 6)
 
-`shared_region` reports each node of one version that the other holds, at
-every position the other holds it, without looking inside. A copy of content
-held inside a larger node that the other version also keeps in place is not
-reported at the copy's shift. Step 4's test never saw this, because its
-template sat at the end of the key space, where B+ joins rebuild the nodes
-above it. A template mid-tree is hidden in either layout. `backfollow` starts
-from the leaves and finds every copy. Open question: whether the identity
-compare should look inside shared nodes, at the cost of reading them.
+* **Was:** `shared_region` stopped at the first node both versions held and
+  reported it at the positions the other held it, without looking inside. A
+  copy of content held inside a larger node that the other version kept in
+  place went unreported at the copy's shift. Step 4's test never saw it,
+  because its template sat at the end of the key space, where B+ joins
+  rebuild the nodes above it; a template mid-tree was hidden in either layout.
+* **Now:** both methods go to every leaf of the first version and report
+  each at every position the other holds it, as Gold's `mapSharedTo` maps each
+  key to all its appearances (`compare:` walks every leaf, `mappingTo:` climbs
+  every parent). The brute-force model in the history laws had the same
+  early stop, so it now states completeness at leaf granularity. Costs about
+  100 more frames on step 4's world (`PERFORMANCE-ENT.md` §10).
 
 ### Declined: canopies and recorders (G5, G6)
 

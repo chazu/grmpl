@@ -138,3 +138,30 @@ fn identity_compare_finds_the_template_and_its_instances() {
         assert!((900..=1_000).contains(&rows), "instance {k} shares {rows} rows with the template");
     }
 }
+
+#[test]
+fn identity_compare_finds_a_copy_of_content_held_inside_a_larger_shared_node() {
+    // A template in the middle of the key space: after instancing it above
+    // the world, the later version still holds the node around the template
+    // in place, and holds the template's own nodes again at the copy's shift.
+    // Both must be reported, in either layout, by both methods.
+    for layout in [Layout::Ordered, Layout::Kd] {
+        let s = EntStore::new();
+        s.set_default_layout(layout).unwrap();
+        for c in (0..N).collect::<Vec<_>>().chunks(5_000) {
+            s.commit(&c.iter().map(|&e| (R, row(e), 1)).collect::<Vec<_>>()).unwrap();
+        }
+        let template_at = s.current();
+        s.instance_template(&[R], 5_000, 6_000, 4_000_000).unwrap();
+        let v = |e: Edition| Version { branch: s.branch_id(), rel: R, edition: e };
+        for shared in [
+            s.shared_region(v(template_at), v(s.current())).unwrap(),
+            s.shared_region_by_descent(v(template_at), v(s.current())).unwrap(),
+        ] {
+            let at = |d: i64| shared.iter().find(|(s, _)| *s == d).map_or(0, |(_, r)| *r);
+            assert_eq!(at(0), N as usize, "{layout:?}: the relation is shared in place");
+            // Less the seam leaves the cut rebuilt.
+            assert!((800..=1_000).contains(&at(4_000_000)), "{layout:?}: the copy shares {} rows", at(4_000_000));
+        }
+    }
+}

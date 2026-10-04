@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use grmpl_core::{Diff, Edition, EditionStore, Entity, RelId, TraceStore, Tuple, Value};
-use grmpl_ent::{EntStore, Granfilade, Layout};
+use grmpl_ent::{EntStore, Granfilade, Layout, Version};
 
 const REL: RelId = RelId(1);
 const OTHER: RelId = RelId(2);
@@ -58,6 +58,12 @@ fn header(title: &str, what: &str) {
 }
 
 fn main() {
+    // `entbench <section>` runs one section: `layouts` or `identity`.
+    match std::env::args().nth(1).as_deref() {
+        Some("layouts") => return kd_layout(),
+        Some("identity") => return identity_compare(),
+        _ => {}
+    }
     let sizes: [i64; 3] = [1_000, 10_000, 100_000];
 
     // ---------------------------------------------------------------- fork ---
@@ -440,7 +446,55 @@ fn main() {
     }
 
     kd_layout();
+    identity_compare();
     println!();
+}
+
+/// **Identity compare** (step 4's world, now reproducible): a 100k-row
+/// relation with a 1 000-row template block, ten instances of it, then one-row
+/// commits; `shared_region` between the template's edition and the latest,
+/// both ways, each on a freshly reopened store.
+fn identity_compare() {
+    header(
+        "Identity compare — Gold's upward climb against a downward walk",
+        "100k rows, a 1 000-row template, ten instances, then N one-row commits; cold.",
+    );
+    let fact = |e: u64| Tuple::from([Value::Ent(Entity(e)), Value::Int(0)]);
+    for commits in [200u64, 2_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let (branch, template_at, latest) = {
+            let store = EntStore::open(dir.path()).unwrap();
+            let ids: Vec<u64> = (0..100_000).chain(1_000_000..1_001_000).collect();
+            for chunk in ids.chunks(5_000) {
+                store.commit(&chunk.iter().map(|&e| (REL, fact(e), 1)).collect::<Vec<_>>()).unwrap();
+            }
+            let template_at = store.current();
+            for k in 1..=10u64 {
+                store.instance_template(&[REL], 1_000_000, 1_001_000, (k * 1_000_000) as i64).unwrap();
+            }
+            for k in 0..commits {
+                store.commit(&[(REL, fact(200_000 + k), 1)]).unwrap();
+            }
+            store.step_history(usize::MAX).unwrap();
+            (store.branch_id(), template_at, store.current())
+        };
+        let v = |e: Edition| Version { branch, rel: REL, edition: e };
+        for (label, a, b) in [("early → late", template_at, latest), ("late → early", latest, template_at)] {
+            for (method, descent) in [("upward", false), ("descent", true)] {
+                let store = EntStore::open(dir.path()).unwrap();
+                let before = store.frames_paged();
+                let start = Instant::now();
+                let shared = if descent {
+                    store.shared_region_by_descent(v(a), v(b)).unwrap()
+                } else {
+                    store.shared_region(v(a), v(b)).unwrap()
+                };
+                let ns = start.elapsed().as_nanos() as f64;
+                let frames = store.frames_paged() - before;
+                row(&format!("{method}, {label}"), commits as i64, ns, &format!("{frames} frames, {} shifts", shared.len()));
+            }
+        }
+    }
 }
 
 /// `exits_world` laid out as `layout`, reopened cold.

@@ -149,7 +149,9 @@ cold:
   template rows 5,000–6,000 of 21,000 give `shared_region` nothing at the
   shift). Step 4's test only passed because its template sat at the end of the
   key space, where B+ joins rebuild the nodes above it. `backfollow`, which
-  starts from the leaves as Gold does, finds the copy in every case.
+  starts from the leaves as Gold does, finds the copy in every case. Fixed
+  after this step: both methods now walk every leaf, as Gold's `compare:`
+  does (see `ENT-FIDELITY-GAPS.md`).
 
 ## 7. Laws and mutants
 
@@ -186,6 +188,3 @@ cold:
   should stay B+; nothing chooses the layout for it.
 * **Per-dimension dsps (G10)** would let a graft move one column and not
   another; the k-d tree's pivots would then displace per column.
-* **`shared_region`'s highest-node answer** (§6) is a property of the
-  identity compare, not of this step. A complete answer would look inside each
-  shared node for other positions, at the cost of reading it.

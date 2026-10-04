@@ -586,7 +586,19 @@ edges are about its new spine times the fan-out.
 | upward through the history index (`shared_region`) | 532–630 frames, ~2 ms | 3,195–4,373 frames, ~23 ms |
 | downward walk (`shared_region_by_descent`) | 119–124 frames, ~0.9 ms | 120–167 frames, ~1.2 ms |
 
-The upward climb from an old node passes through every later version that
+*Revised in step 6:* both methods now answer completely, as Gold's
+`mapSharedTo` does, reporting content at every shift the other version holds
+it rather than stopping at the first shared node (`entbench identity`, which
+reproduces this world):
+
+| complete (step 6) | 200 commits | 2,000 commits |
+|---|---|---|
+| upward | 733–750 frames, ~4.5 ms | 3,684–4,086 frames, ~17–19 ms |
+| downward | 219 frames, ~1.5 ms | 221 frames, ~1.5 ms |
+
+Completeness costs a visit to every leaf of the first version instead of
+stopping high: about 100 more frames either way here. The upward climb from an
+old node passes through every later version that
 shares it, so its cost grows with history. Born-pruning (Gold's `isLE:`)
 trims about a quarter in the late-against-early direction and costs a little
 in the other. The downward walk reads only interior nodes, because interior
