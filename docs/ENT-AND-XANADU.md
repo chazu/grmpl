@@ -304,6 +304,7 @@ the design column is `idea.md`.
 | Leaf kinds | region (one element over a region), virtual (a primitive array), partial (placeholders) | — | items: rows, runs (run-length and lazy at once), holes (step 7); runs coarsen identity, which in grmpl is node sharing |
 | Cached upward summaries in content nodes | ❌ (canopy crums instead) | ✅ "WIDative summaries" | ✅ `Count` and per-column `Extent` (grmpl's own) |
 | Displacements composing down the tree | ✅ `DspLoaf` nodes | ✅ | ✅ a dsp on every handle |
+| Per-dimension displacements | ✅ `GenericCrossDsp` | — | ⛔ declined: one shift moves every entity cell, so an id means one entity in every column |
 | Relocation / virtual copy | ✅ `O(1)` / splay and share | ✅ | ✅ relocate `O(1)`; graft `O(log n)` |
 | Version compare | by shared content identity (`sharedRegion`) | ✅ | by position and value (`Tree::diff`); by identity (`shared_region`) |
 | History: content knows its containers (H-tree) | ✅ | — | ✅ an index beside the nodes, built deferred |
@@ -346,15 +347,14 @@ the Ent.
 
 What is still short of Gold, from the source (full list in
 [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §4, status in
-[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): per-dimension dsps and
-unloading clean nodes. The
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): unloading clean nodes. The
 history layer landed in step 4
 ([`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md)) and merges in step 5
 ([`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md)), and splits on any
 column in step 6 ([`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md)), and
 run, lazy and partial leaves in step 7
 ([`ENT-FIDELITY-STEP-7.md`](ENT-FIDELITY-STEP-7.md)).
-Canopies, recorders and a general Agenda were declined.
+Canopies, recorders, a general Agenda and per-dimension dsps were declined.
 
 What is short of `idea.md`'s extrapolations:
 

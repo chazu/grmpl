@@ -5,7 +5,7 @@ Gold's Ent, as the source shows it. Each Gold gap is backed by the line-by-line
 audit [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Gaps against `idea.md`'s
 extrapolations of the Ent are kept separately below, since they are not Gold.
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-04, after step 7 (run leaves).
+**Last updated:** 2026-10-05, declining per-dimension dsps (G10).
 
 The step reports say what each step built and what it cost:
 [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md),
@@ -50,7 +50,7 @@ measurements before it counts as closed, as in steps 2–3.
 | G7 | **The Agenda:** persistent, crash-resumable background work | ⏸ only as needed: one job (history indexing) runs deferred, in bounded durable steps. Gold's other big users of the Agenda were canopy propagation and recorder triggers, now declined |
 | G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ✅ step 6: a per-relation k-d layout of binary splits, beside the B+ one. Every column prunes, at about √n for a read on any one column |
 | G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ✅ step 7: leaves of items. A run (rows stepped by a per-column stride, one value) is run-length and lazy at once; a hole is a minimal partial loaf. Runs are opt-in per relation, off by default, because they coarsen identity, which in grmpl is node sharing |
-| G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
+| G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ⛔ declined ([below](#declined-per-dimension-dsps-g10)); one shift for every entity cell, deliberately |
 | G11 | **Unloading clean nodes** back to stubs | ❌ (a paged node never unloads) |
 
 Already faithful: versions as roots, the persisted version DAG (tree case),
@@ -58,6 +58,29 @@ Already faithful: versions as roots, the persisted version DAG (tree case),
 one root with everything beneath it, since step 4 the history layer, and since
 step 5 merges in the version DAG, since step 6 splits on any column, and
 since step 7 run-length, lazy and partial leaves.
+
+### Declined: per-dimension dsps (G10)
+
+Examined 2026-10-05 and declined. Gold's `GenericCrossDsp` shifts each
+dimension of a cross space by its own amount. grmpl's displacement shifts
+every entity cell of a tuple by one amount, and that is deliberate:
+
+* **An entity id means one entity in every column.** A shift moves a block of
+  entity space, so `1042` in a fact's first column and `1042` in its third
+  are still the same entity after the move, and a copied template stays
+  connected to itself. A per-column shift would let one copy hold one entity
+  under two ids.
+* **What it would enable is world policy.** Its use is a template whose
+  facts point outside its block (an exit to a shared hub), which a graft
+  refuses today. Whether templates may reference shared entities, and how,
+  is a decision for a world's layout of ids, not a mechanism of the Ent.
+* **It would reach everywhere.** The dsp would become a vector, which every
+  key displacement, extent, k-d pivot, graft check, node frame and dsp law
+  would carry, for no new question the plex could answer.
+
+Gold's dimensions are independent coordinate spaces; grmpl's entity columns
+share one. That divergence is recorded in
+[`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §2 as "extrapolated (narrower)".
 
 ### Identity compare is complete ✅ (fixed 2026-10-04, after step 6)
 

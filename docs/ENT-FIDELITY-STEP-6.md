@@ -187,4 +187,5 @@ cold:
 * **Lead-column reads are not rescued.** A relation read mostly by its key
   should stay B+; nothing chooses the layout for it.
 * **Per-dimension dsps (G10)** would let a graft move one column and not
-  another; the k-d tree's pivots would then displace per column.
+  another; the k-d tree's pivots would then displace per column. Declined
+  since (see `ENT-FIDELITY-GAPS.md`).
