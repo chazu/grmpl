@@ -67,6 +67,8 @@ struct Leg {
     rels: Vec<u32>,
 }
 
+crate::run_values_by_eq!(Leg);
+
 impl Persist for Leg {
     fn encode(&self, e: &mut Enc<'_, '_>) {
         self.width.encode(e);

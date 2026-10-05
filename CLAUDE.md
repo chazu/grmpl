@@ -41,8 +41,10 @@ Every serialized artifact begins with a single `wire::FORMAT_VERSION` byte:
 * `node frame = version(1) || tag(1) || n_refs(u32, BE) || [content_key]*n
                 || count(u32, BE) || payload` — an internal node's refs are its
   children and its payload is its separators, then each child's dsp (`i64`),
-  size (`u64`) and measure; a leaf's payload is its entries and its refs are the
-  **links** its values hold (a value may be a whole tree), in order; a k-d
+  size (`u64`), reserved keys (`u64`) and measure; a leaf's payload is its
+  **items** (a tag, then a row's key and value, a run's count, first key,
+  stride and value, or a hole's count, first key and stride) and its refs are
+  the **links** its values hold (a value may be a whole tree), in order; a k-d
   split's refs are its two children (below the pivot first), its count field
   is its column and its payload is its pivot, then each child's dsp, size and
   measure
@@ -116,6 +118,31 @@ default) or **k-d trees** of binary splits on any column (Gold's `SplitLoaf`;
   sides, and a piece whose ancestors' pivots already place it on one side goes
   there unread. Without those bounds a compare across a graft reads the
   relation.
+
+### Runs and holes (`grmpl-ent::tree::leaf`)
+
+A leaf is a run of **items** (Gold's loaves): a row, a **run** (`n` rows,
+row `i` being the first key stepped `i` times by a per-column stride, one
+value), or a **hole** (keys reserved, holding no rows; Gold's
+`OPartialLoaf`).
+
+* **A run is a representation, never a change.** It holds exactly the rows it
+  computes; every read answers as if they were rows. Runs form by themselves:
+  a row that continues a run joins it, three rows in a step become one, a leaf
+  folds its runs before it splits, and a write inside a run splits it.
+* **Items in a leaf never interleave.** In the k-d layout a run's key range
+  can enclose keys of another leaf, so a rebuild cuts runs apart
+  (`leaf::disjoint`) before it makes a leaf.
+* **Arity counts items; size counts rows.** A node caches its rows and its
+  reserved keys separately. A remove inside a run can split a full leaf, and
+  joining runs can underflow one: both write paths repair either.
+* **Holes occupy.** `any_in` (and so a graft's target check) sees them;
+  `get`, iteration and counts do not. `reserve` refuses keys already held;
+  writing a row at a hole's key fills it.
+* **Runs coarsen identity.** A run makes one leaf hold many rows, so sharing,
+  which is by node, is found at that coarser grain: `backfollow` and
+  `shared_region` find less of a copy whose rows folded. Laws about sharing use
+  rows that cannot fold.
 
 ### Extents and the spanfilade (`grmpl-ent::measure`, `spanfilade`)
 

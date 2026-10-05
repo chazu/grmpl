@@ -62,6 +62,7 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("layouts") => return kd_layout(),
         Some("identity") => return identity_compare(),
+        Some("runs") => return runs(),
         _ => {}
     }
     let sizes: [i64; 3] = [1_000, 10_000, 100_000];
@@ -447,7 +448,71 @@ fn main() {
 
     kd_layout();
     identity_compare();
+    runs();
     println!();
+}
+
+/// **G9: run leaves.** One relation of 100k rows, loaded in 1 000-row commits,
+/// two ways: regular (`(room, 0)`, which folds into runs) and irregular (a tag
+/// no step repeats). Then reads, an edit inside the block, a compare across
+/// it, and what backfollow finds of a template after a graft.
+fn runs() {
+    header(
+        "Runs — rows that fold against rows that cannot",
+        "100k rows, B+ layout; cold reads on a reopened store.",
+    );
+    let n = 100_000u64;
+    for (label, regular) in [("regular", true), ("irregular", false)] {
+        let fact = move |e: u64| {
+            let tag = if regular { 0 } else { (e * e % 97) as i64 };
+            Tuple::from([Value::Ent(Entity(e)), Value::Int(tag)])
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (load, nodes, bytes) = {
+            let store = EntStore::open(dir.path()).unwrap();
+            let start = Instant::now();
+            let all: Vec<u64> = (0..n).collect();
+            for chunk in all.chunks(1_000) {
+                store.commit(&chunk.iter().map(|&e| (REL, fact(e), 1)).collect::<Vec<_>>()).unwrap();
+            }
+            let load = start.elapsed().as_nanos() as f64 / n as f64;
+            store.consolidate(store.current()).unwrap();
+            store.gc().unwrap();
+            (load, store.stored_nodes().unwrap(), store.bytes_encoded())
+        };
+        row(&format!("{label}: load, per row"), n as i64, load, &format!("{nodes} nodes stored after consolidation, {bytes} bytes encoded"));
+
+        let store = EntStore::open(dir.path()).unwrap();
+        let at = store.current();
+        let (lo, hi) = (Tuple::from([Value::Ent(Entity(40_000))]), Tuple::from([Value::Ent(Entity(41_000))]));
+        let (got, frames, ns) = cold(&store, |s| s.range_at(REL, at, &lo, &hi).unwrap());
+        row(&format!("{label}: 1 000-row range (cold)"), n as i64, ns, &format!("{} rows, {frames} frames", got.len()));
+        let ns = warm(5, || {
+            std::hint::black_box(store.read_at(REL, at).unwrap());
+        });
+        row(&format!("{label}: read_at whole relation"), n as i64, ns, "");
+
+        // An edit inside the block, then the compare across it, cold.
+        let before = store.frames_encoded();
+        let start = Instant::now();
+        let edited = store.commit(&[(REL, fact(50_000), -1), (REL, fact(50_000), 1), (REL, fact(60_000), 1)]).unwrap();
+        let ns = start.elapsed().as_nanos() as f64;
+        row(&format!("{label}: commit inside the block"), n as i64, ns, &format!("{} frames written", store.frames_encoded() - before));
+        drop(store);
+        let store = EntStore::open(dir.path()).unwrap();
+        let (diff, frames, ns) = cold(&store, |s| s.compare(REL, at, edited).unwrap());
+        row(&format!("{label}: compare across it (cold)"), n as i64, ns, &format!("{} rows, {frames} frames", diff.len()));
+
+        // Instance a 1 000-row template above the world; what does
+        // backfollow find of it, by shared nodes?
+        let template = store.current();
+        store.instance_template(&[REL], 10_000, 11_000, 10_000_000).unwrap();
+        let found = store
+            .backfollow(REL, template, &Tuple::from([Value::Ent(Entity(10_000))]), &Tuple::from([Value::Ent(Entity(11_000))]))
+            .unwrap();
+        let copy: usize = found.iter().filter(|h| h.shift == 10_000_000).map(|h| h.rows).max().unwrap_or(0);
+        row(&format!("{label}: backfollow finds of the copy"), n as i64, 0.0, &format!("{copy} of 1 000 rows by shared nodes"));
+    }
 }
 
 /// **Identity compare** (step 4's world, now reproducible): a 100k-row

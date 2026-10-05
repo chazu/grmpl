@@ -46,6 +46,8 @@ pub struct InterestId(pub u64);
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Endorsement(pub u64);
 
+crate::run_values_by_eq!(Endorsement, InterestId);
+
 impl Endorsement {
     /// The lattice top: every flag set. A plain interest carries this, so it
     /// passes any endorsement requirement.
@@ -266,7 +268,8 @@ impl Canopy {
         }
         match node {
             NodeRef::Leaf(entries) => {
-                for ((r, ilo, id), (ihi, _)) in entries {
+                // The canopy's keys never form runs: every item is a row.
+                for ((r, ilo, id), (ihi, _)) in entries.iter().filter_map(|it| it.as_one()) {
                     if *r == rel && ilo < hi && lo < ihi {
                         out.push(InterestId(*id));
                     }
@@ -317,7 +320,7 @@ impl Canopy {
         }
         match node {
             NodeRef::Leaf(entries) => {
-                for ((r, lo, id), (hi, endorse)) in entries {
+                for ((r, lo, id), (hi, endorse)) in entries.iter().filter_map(|it| it.as_one()) {
                     if *r == rel && lo <= point && point < hi && endorse.dominates(required) {
                         out.push(InterestId(*id));
                     }

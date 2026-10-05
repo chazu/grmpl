@@ -63,6 +63,21 @@ pub trait Displace: Ord + Clone {
         assert_eq!(col, 0, "a scalar key has one column");
         pivot.cmp_displaced(by, self).reverse()
     }
+
+    /// **Runs** (Gold's `RegionLoaf`; fidelity gap G9). The stride that takes
+    /// this key to `next` in one step, if `next` is the next row of some run
+    /// starting here: a key greater than this one, differing only in columns
+    /// a stride can step. `None` for a key type that never forms runs, which
+    /// is the default.
+    fn stride_to(&self, _next: &Self) -> Option<Self> {
+        None
+    }
+
+    /// The key `i` steps along a run from this one (`i` may be negative).
+    /// Only called with a stride [`stride_to`](Self::stride_to) produced.
+    fn step(&self, _stride: &Self, _i: i64) -> Self {
+        unreachable!("a key type without runs is never stepped")
+    }
 }
 
 /// A tuple moves by shifting **every** entity cell together; other cells (names,
@@ -106,6 +121,42 @@ impl Displace for Tuple {
             }
         }
         a.len().cmp(&b.len())
+    }
+
+    /// Entity and integer cells step, by an integer stride per column; every
+    /// other cell stays fixed. The first column that steps steps up, so a
+    /// run's rows ascend.
+    fn stride_to(&self, next: &Self) -> Option<Self> {
+        let (a, b) = (self.as_slice(), next.as_slice());
+        if a.len() != b.len() || self >= next {
+            return None;
+        }
+        let mut stride = Vec::with_capacity(a.len());
+        for (x, y) in a.iter().zip(b) {
+            let s = match (x, y) {
+                _ if x == y => 0,
+                (Value::Ent(x), Value::Ent(y)) => i64::try_from(y.0 as i128 - x.0 as i128).ok()?,
+                (Value::Int(x), Value::Int(y)) => y.checked_sub(*x)?,
+                _ => return None,
+            };
+            stride.push(Value::Int(s));
+        }
+        Some(Tuple::new(stride))
+    }
+
+    fn step(&self, stride: &Self, i: i64) -> Self {
+        Tuple::new(
+            self.as_slice()
+                .iter()
+                .zip(stride.as_slice())
+                .map(|(cell, s)| match (cell, s) {
+                    (_, Value::Int(0)) => cell.clone(),
+                    (Value::Ent(e), Value::Int(s)) => Value::Ent(Entity(e.0.wrapping_add(s.wrapping_mul(i) as u64))),
+                    (Value::Int(x), Value::Int(s)) => Value::Int(x.wrapping_add(s.wrapping_mul(i))),
+                    _ => cell.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// A pivot is a one-column tuple; a tuple too short to have `col` sorts

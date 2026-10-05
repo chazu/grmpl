@@ -344,7 +344,9 @@ fn grafts_share_the_template_in_the_kd_layout() {
     for b in 0..50u64 {
         for r in 0..20 {
             for w in 0..3 {
-                ups.push((EXITS, exit(b * BLOCK + r, w, b * BLOCK + (r + w as u64 + 1) % 20), 1));
+                // Irregular destinations: a run would fold the block into one
+                // item in a leaf it shares, and a copy would share no node.
+                ups.push((EXITS, exit(b * BLOCK + r, w, b * BLOCK + (r * r + 7 * (w * w) as u64 + 1) % 20), 1));
             }
         }
     }

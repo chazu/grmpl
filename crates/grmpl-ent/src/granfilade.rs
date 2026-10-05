@@ -55,7 +55,7 @@ use grmpl_core::{wire, Error, Result, Tuple, Value};
 
 use crate::dsp::Displace;
 use crate::measure::{Count, Extent, Measure};
-use crate::tree::{NodeRef, Pager, Resident, Tree};
+use crate::tree::{Item, NodeRef, Pager, Resident, RunValue, Span, Tree};
 
 pub use grmpl_core::hash::Sha256Digest as ContentKey;
 
@@ -66,10 +66,12 @@ const CK_LEN: usize = 32;
 /// leaves to other trees, each internal child's size and measure, and the
 /// single root record. v7 added the [`Extent`] to every Fact tree's measure
 /// and the spanfilade to each branch's state. v8 added each branch's patch log
-/// and a second parent to merged branches. v9 added the k-d split frame and
-/// each branch's layout default and layout directory. Like every cutover before
-/// it, v9 is fresh-store-only: a v9 binary rejects every older persisted node
-/// before interpreting its payload.
+/// and a second parent to merged branches. v9 added the k-d split frame, each
+/// branch's layout default and layout directory, and a count of entity cells
+/// in every extent. v10 made a leaf a run of tagged items (rows, runs, holes)
+/// and recorded every child's and link's reserved keys. Like every
+/// cutover before it, v10 is fresh-store-only: a v10 binary rejects every
+/// older persisted node before interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// The meta key of the root record — the granfilade's one mutable slot.
@@ -97,8 +99,8 @@ pub trait PersistKey: Persist + Displace + Send + Sync + 'static {}
 impl<T: Persist + Displace + Send + Sync + 'static> PersistKey for T {}
 
 /// A value the granfilade can store.
-pub trait PersistVal: Persist + Clone + Send + Sync + 'static {}
-impl<T: Persist + Clone + Send + Sync + 'static> PersistVal for T {}
+pub trait PersistVal: Persist + RunValue + Send + Sync + 'static {}
+impl<T: Persist + RunValue + Send + Sync + 'static> PersistVal for T {}
 
 /// A measure the granfilade can store. Internal frames record each child's
 /// measure, which is what lets a paged child answer a range measure without
@@ -173,6 +175,7 @@ impl Enc<'_, '_> {
                 self.refs.push(ck);
                 tree.dsp().encode(self);
                 (tree.len() as u64).encode(self);
+                tree.reserved().encode(self);
                 tree.local_measure().expect("a non-empty tree has a measure").encode(self);
             }
         }
@@ -225,9 +228,10 @@ impl<'a> Dec<'a> {
                 let ck = self.next_ref()?;
                 let dsp = i64::decode(self)?;
                 let size = u64::decode(self)? as usize;
+                let reserved = u64::decode(self)?;
                 let measure = M::decode(self)?;
                 let pager = self.gran.pager::<K, V, M>();
-                Ok(self.gran.stub(ck, size, measure, &pager).relocate(dsp))
+                Ok(self.gran.stub(ck, size, reserved, measure, &pager).relocate(dsp))
             }
             t => Err(Error::Codec(format!("granfilade: bad link flag {t}"))),
         }
@@ -588,16 +592,27 @@ impl Granfilade {
         let count = u32::decode(&mut d)? as usize;
         match tag {
             TAG_LEAF => {
-                let mut entries = Vec::with_capacity(count);
+                let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let key = K::decode(&mut d)?;
-                    let val = V::decode(&mut d)?;
-                    entries.push((key, val));
+                    items.push(match d.take(1)?[0] {
+                        ITEM_ROW => Item::One(K::decode(&mut d)?, V::decode(&mut d)?),
+                        ITEM_RUN => {
+                            let n = u64::decode(&mut d)?;
+                            let (first, stride) = (K::decode(&mut d)?, K::decode(&mut d)?);
+                            Item::Run(Span { first, stride, n }, V::decode(&mut d)?)
+                        }
+                        ITEM_HOLE => {
+                            let n = u64::decode(&mut d)?;
+                            let (first, stride) = (K::decode(&mut d)?, K::decode(&mut d)?);
+                            Item::Hole(Span { first, stride, n })
+                        }
+                        t => return Err(Error::Codec(format!("granfilade: unknown leaf item tag {t}"))),
+                    });
                 }
                 if d.next_ref != refs.len() {
                     return Err(Error::Codec("granfilade: leaf links disagree with its references".into()));
                 }
-                Ok(Tree::leaf_of(entries))
+                Ok(Tree::leaf_of(items))
             }
             TAG_INTERNAL => {
                 let mut keys = Vec::with_capacity(count);
@@ -612,8 +627,9 @@ impl Granfilade {
                 for c in &refs {
                     let dsp = i64::decode(&mut d)?;
                     let size = u64::decode(&mut d)? as usize;
+                    let reserved = u64::decode(&mut d)?;
                     let measure = M::decode(&mut d)?;
-                    children.push(self.stub(*c, size, measure, &pager).relocate(dsp));
+                    children.push(self.stub(*c, size, reserved, measure, &pager).relocate(dsp));
                 }
                 Ok(Tree::internal_of(keys, children))
             }
@@ -626,8 +642,9 @@ impl Granfilade {
                 let mut child = |ck: ContentKey| -> Result<Tree<K, V, M>> {
                     let dsp = i64::decode(&mut d)?;
                     let size = u64::decode(&mut d)? as usize;
+                    let reserved = u64::decode(&mut d)?;
                     let measure = M::decode(&mut d)?;
-                    Ok(self.stub(ck, size, measure, &pager).relocate(dsp))
+                    Ok(self.stub(ck, size, reserved, measure, &pager).relocate(dsp))
                 };
                 let (lo, hi) = (child(lo)?, child(hi)?);
                 Ok(Tree::split_of(count, pivot, lo, hi))
@@ -647,13 +664,13 @@ impl Granfilade {
 
     /// A paged node for the frame under `ck`, which is durable (a durable frame
     /// references it), and remembered so GC keeps its frame while it is unread.
-    fn stub<K, V, M>(&self, ck: ContentKey, size: usize, measure: M, pager: &Arc<dyn Pager<K, V, M>>) -> Tree<K, V, M>
+    fn stub<K, V, M>(&self, ck: ContentKey, size: usize, reserved: u64, measure: M, pager: &Arc<dyn Pager<K, V, M>>) -> Tree<K, V, M>
     where
         K: PersistKey,
         V: PersistVal,
         M: PersistMeasure<K, V>,
     {
-        let tree = Tree::paged(ck, size, measure, Arc::clone(pager));
+        let tree = Tree::paged(ck, size, reserved, measure, Arc::clone(pager));
         self.present.lock().unwrap().insert(ck);
         if let Some(weak) = tree.residency() {
             let mut rem = self.remembered.lock().unwrap();
@@ -768,11 +785,16 @@ where
     }
 }
 
-/// A leaf frame: a run of `(key, value)` entries; its references are the links
-/// its values hold, in order.
+/// A leaf frame: a run of items, each behind its tag ([`ITEM_ROW`] then key
+/// and value; [`ITEM_RUN`] then count, first key, stride and value;
+/// [`ITEM_HOLE`] then count, first key and stride); its references are the
+/// links its values hold, in order.
 const TAG_LEAF: u8 = 0;
+const ITEM_ROW: u8 = 0;
+const ITEM_RUN: u8 = 1;
+const ITEM_HOLE: u8 = 2;
 /// An internal frame: separators in the node's local frame, then for each child
-/// its dsp, size and measure; its references are the children.
+/// its dsp, size, reserved keys and measure; its references are the children.
 const TAG_INTERNAL: u8 = 1;
 /// A k-d split frame: the column (in the count field), the pivot in the
 /// node's local frame, then for each of the two children its dsp, size and
@@ -878,11 +900,29 @@ where
     }
     let mut e = Enc { buf: Vec::new(), refs: Vec::new(), sink };
     let tag = match tree.node()? {
-        NodeRef::Leaf(entries) => {
-            (entries.len() as u32).encode(&mut e);
-            for (k, v) in entries {
-                k.encode(&mut e);
-                v.encode(&mut e);
+        NodeRef::Leaf(items) => {
+            (items.len() as u32).encode(&mut e);
+            for it in items {
+                match it {
+                    Item::One(k, v) => {
+                        e.put(&[ITEM_ROW]);
+                        k.encode(&mut e);
+                        v.encode(&mut e);
+                    }
+                    Item::Run(s, v) => {
+                        e.put(&[ITEM_RUN]);
+                        s.n.encode(&mut e);
+                        s.first.encode(&mut e);
+                        s.stride.encode(&mut e);
+                        v.encode(&mut e);
+                    }
+                    Item::Hole(s) => {
+                        e.put(&[ITEM_HOLE]);
+                        s.n.encode(&mut e);
+                        s.first.encode(&mut e);
+                        s.stride.encode(&mut e);
+                    }
+                }
             }
             TAG_LEAF
         }
@@ -898,6 +938,7 @@ where
             for c in children {
                 c.dsp().encode(&mut e);
                 (c.len() as u64).encode(&mut e);
+                c.reserved().encode(&mut e);
                 c.local_measure().expect("a child is never empty").encode(&mut e);
             }
             TAG_INTERNAL
@@ -912,6 +953,7 @@ where
             for c in children {
                 c.dsp().encode(&mut e);
                 (c.len() as u64).encode(&mut e);
+                c.reserved().encode(&mut e);
                 c.local_measure().expect("a child is never empty").encode(&mut e);
             }
             TAG_SPLIT
@@ -1059,8 +1101,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gran = Granfilade::open(dir.path()).unwrap();
         let mut tree = FactTree::new();
+        // Squares: no step repeats, so no run folds the tree into one node.
         for k in 0..5_000i64 {
-            tree = tree.insert(t(k), 1);
+            tree = tree.insert(t(k * k), 1);
         }
         let (ck, nodes) = gran.collect_tree(&tree);
         gran.write_group(vec![StagedWrite { nodes, root: vec![ck] }]).unwrap();

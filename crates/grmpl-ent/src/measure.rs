@@ -17,6 +17,8 @@
 
 use grmpl_core::{Tuple, Value};
 
+use crate::dsp::Displace;
+
 /// A monoidal summary of a subtree of `(K, V)` entries.
 pub trait Measure<K, V>: Clone {
     /// The identity: the measure of the empty subtree.
@@ -46,6 +48,28 @@ pub trait Measure<K, V>: Clone {
     fn side_of(&self, _col: usize, _pivot: &K) -> Option<bool> {
         None
     }
+    /// The measure of a **run** (`tree::leaf`): `n` rows, row `i` being
+    /// `first` stepped `i` times by `stride`, each valued `val`. The default
+    /// folds the rows; a measure of a run's shape computes it in `O(1)`.
+    fn run(first: &K, stride: &K, n: u64, val: &V) -> Self
+    where
+        K: Displace,
+    {
+        let mut m = Self::empty();
+        for i in 0..n {
+            m.absorb_entry(&first.step(stride, i as i64), val);
+        }
+        m
+    }
+    /// The measure of a **hole**: keys reserved but holding no rows. Nothing,
+    /// by default; a measure of where keys lie counts them, so that what it
+    /// proves about a subtree's keys holds for its holes too.
+    fn hole(_first: &K, _stride: &K, _n: u64) -> Self
+    where
+        K: Displace,
+    {
+        Self::empty()
+    }
 }
 
 /// Tuple measures compose: a tree may carry several upward summaries at once
@@ -74,6 +98,18 @@ impl<K, V, A: Measure<K, V>, B: Measure<K, V>> Measure<K, V> for (A, B) {
     fn side_of(&self, col: usize, pivot: &K) -> Option<bool> {
         self.0.side_of(col, pivot).or_else(|| self.1.side_of(col, pivot))
     }
+    fn run(first: &K, stride: &K, n: u64, val: &V) -> Self
+    where
+        K: Displace,
+    {
+        (A::run(first, stride, n, val), B::run(first, stride, n, val))
+    }
+    fn hole(first: &K, stride: &K, n: u64) -> Self
+    where
+        K: Displace,
+    {
+        (A::hole(first, stride, n), B::hole(first, stride, n))
+    }
 }
 
 /// The trivial measure — just the entry count. Useful on its own (size), and as
@@ -93,6 +129,12 @@ impl<K, V> Measure<K, V> for Count {
     }
     fn displace(&self, _by: i64) -> Self {
         *self
+    }
+    fn run(_first: &K, _stride: &K, n: u64, _val: &V) -> Self
+    where
+        K: Displace,
+    {
+        Count(n)
     }
 }
 
@@ -163,6 +205,30 @@ impl Extent {
         self.bounds.iter().flatten().all(|&(min, max)| lo <= min && max < hi)
     }
 
+    /// Fold in `n` rows stepped from `first` by `stride`.
+    fn absorb_run(&mut self, first: &Tuple, stride: &Tuple, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let last = first.step(stride, n as i64 - 1);
+        let (a, b) = (first.as_slice(), last.as_slice());
+        if self.bounds.len() < a.len() {
+            self.bounds.resize(a.len(), None);
+            self.ents.resize(a.len(), 0);
+        }
+        for (c, (x, y)) in a.iter().zip(b).enumerate() {
+            if let (Value::Ent(x), Value::Ent(y)) = (x, y) {
+                let (lo, hi) = (x.0.min(y.0), x.0.max(y.0));
+                self.bounds[c] = Some(match self.bounds[c] {
+                    None => (lo, hi),
+                    Some((l, h)) => (l.min(lo), h.max(hi)),
+                });
+                self.ents[c] += n;
+            }
+        }
+        self.rows += n;
+    }
+
     /// The bounds of column `col` if every row summarized holds an entity
     /// there.
     fn full(&self, col: usize) -> Option<(u64, u64)> {
@@ -231,6 +297,20 @@ impl<V> Measure<Tuple, V> for Extent {
             ents: self.ents.clone(),
             rows: self.rows,
         }
+    }
+    /// A run's rows move linearly in every column, so each entity column's
+    /// bounds are its first and last rows'.
+    fn run(first: &Tuple, stride: &Tuple, n: u64, _val: &V) -> Self {
+        let mut x = Extent::default();
+        x.absorb_run(first, stride, n);
+        x
+    }
+    /// A hole's keys are bounded as rows are, so a placement the extent
+    /// proves holds for them too.
+    fn hole(first: &Tuple, stride: &Tuple, n: u64) -> Self {
+        let mut x = Extent::default();
+        x.absorb_run(first, stride, n);
+        x
     }
     /// Only a column every row holds an entity in, against an entity pivot.
     fn side_of(&self, col: usize, pivot: &Tuple) -> Option<bool> {

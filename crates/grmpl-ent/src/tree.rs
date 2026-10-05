@@ -55,8 +55,12 @@ use crate::measure::Measure;
 mod kd;
 #[cfg(test)]
 mod kd_laws;
+pub mod leaf;
+#[cfg(test)]
+mod leaf_laws;
 
 pub use kd::Layout;
+pub use leaf::{Item, RunValue, Span};
 
 /// One entry difference between two tree versions: `(key, left_value,
 /// right_value)`, where a `None` side means the key is absent there.
@@ -82,7 +86,8 @@ const MIN: usize = B / 2;
 /// removal can leave it below that child's least key, so it is a bound, not
 /// the key.
 enum Kind<K, V, M> {
-    Leaf(Vec<(K, V)>),
+    /// A run of items in key order: rows, runs and holes ([`leaf`]).
+    Leaf(Vec<Item<K, V>>),
     Internal { keys: Vec<K>, children: Vec<Tree<K, V, M>> },
     /// **A k-d split** (Gold's `SplitLoaf`): a binary node dividing its
     /// entries on one column. `children[0]` holds every key whose column
@@ -102,7 +107,7 @@ enum Kind<K, V, M> {
 /// separators (a B+ internal node, or a k-d split on column `0`), or children
 /// whose keys interleave (a k-d split on any other column).
 enum View<'a, K, V, M> {
-    Leaf(&'a [(K, V)]),
+    Leaf(&'a [Item<K, V>]),
     Sep(&'a [K], &'a [Tree<K, V, M>]),
     Mixed(&'a [Tree<K, V, M>]),
 }
@@ -126,8 +131,10 @@ struct Node<K, V, M> {
     /// Where a paged node's contents come from. `None` for a node built in
     /// memory, which is resident from birth.
     pager: Option<Arc<dyn Pager<K, V, M>>>,
-    /// Entries in the whole subtree.
+    /// Rows in the whole subtree.
     size: usize,
+    /// Keys reserved by holes in the whole subtree, which hold no rows.
+    reserved: u64,
     /// The subtree's cached [`Measure`], in the node's local frame — the upward
     /// WID summary.
     measure: M,
@@ -197,8 +204,8 @@ pub struct Tree<K, V, M> {
 /// Keys are in the node's local frame; each child carries its own
 /// [`dsp`](Tree::dsp) relative to it.
 pub enum NodeRef<'a, K, V, M> {
-    /// A run of `(key, value)` entries, ascending.
-    Leaf(&'a [(K, V)]),
+    /// A run of items (rows, runs and holes), ascending.
+    Leaf(&'a [Item<K, V>]),
     /// Separator keys and the children they divide (`keys.len() + 1` children).
     Internal(&'a [K], &'a [Tree<K, V, M>]),
     /// A k-d split: its column, its pivot (a one-column key, in the node's
@@ -240,7 +247,7 @@ enum Ins<K, V, M> {
 /// A node's contents, owned and expressed in its **parent's** frame — what an
 /// operation that rewrites the node works on.
 enum Open<K, V, M> {
-    Leaf(Vec<(K, V)>),
+    Leaf(Vec<Item<K, V>>),
     Internal(Vec<K>, Vec<Tree<K, V, M>>),
     Split(usize, K, [Tree<K, V, M>; 2]),
 }
@@ -257,7 +264,7 @@ fn moved<K: Displace>(k: &K, by: i64) -> Cow<'_, K> {
 impl<K, V, M> Tree<K, V, M>
 where
     K: Ord + Displace,
-    V: Clone,
+    V: RunValue,
     M: Measure<K, V>,
 {
     /// The empty tree.
@@ -270,8 +277,14 @@ where
         self.root.as_ref().map_or(0, |n| n.size)
     }
 
+    /// Keys reserved by holes, which hold no rows — `O(1)`.
+    pub fn reserved(&self) -> u64 {
+        self.root.as_ref().map_or(0, |n| n.reserved)
+    }
+
+    /// No rows and no holes: no node at all.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.root.is_none()
     }
 
     /// This handle's displacement relative to the frame it lives in.
@@ -320,12 +333,7 @@ where
             let n = cur.root.as_deref()?;
             off = off.wrapping_add(cur.dsp);
             match n.kind() {
-                Kind::Leaf(entries) => {
-                    return entries
-                        .binary_search_by(|(x, _)| x.cmp_displaced(off, key))
-                        .ok()
-                        .map(|i| &entries[i].1)
-                }
+                Kind::Leaf(items) => return leaf::get(items, off, key),
                 Kind::Internal { keys, children } => cur = &children[child_index(keys, off, key)],
                 Kind::Split { col, pivot, children } => {
                     cur = &children[usize::from(key.cmp_column(*col, pivot, off) != Ordering::Less)]
@@ -339,12 +347,56 @@ where
     pub fn insert(&self, key: K, val: V) -> Self {
         debug_assert!(!self.is_kd(), "a B+ insert into a k-d tree");
         if self.root.is_none() {
-            return Self::leaf(vec![(key, val)]);
+            return Self::leaf(vec![Item::One(key, val)]);
         }
         match Self::ins(self, key, val) {
             Ins::Done(t) => t,
             Ins::Split(l, sep, r) => Self::internal(vec![sep], vec![l, r]),
         }
+    }
+
+    /// Whether any key, a row or a hole's, is exactly `key`.
+    pub fn holds_key(&self, key: &K) -> bool {
+        let mut cur = self;
+        let mut off = 0i64;
+        loop {
+            let Some(n) = cur.root.as_deref() else { return false };
+            off = off.wrapping_add(cur.dsp);
+            match n.kind() {
+                Kind::Leaf(items) => return leaf::holds(items, off, key),
+                Kind::Internal { keys, children } => cur = &children[child_index(keys, off, key)],
+                Kind::Split { col, pivot, children } => {
+                    cur = &children[usize::from(key.cmp_column(*col, pivot, off) != Ordering::Less)]
+                }
+            }
+        }
+    }
+
+    /// Whether `span`'s keys are all free: no row and no hole lies anywhere
+    /// from its first key to its last.
+    fn free(&self, span: &Span<K>) -> bool {
+        let last = span.last();
+        !self.any_in(&span.first, &last) && !self.holds_key(&last)
+    }
+
+    /// **Reserve `span`'s keys as a hole** (Gold's `OPartialLoaf`), in the B+
+    /// layout: keys that exist but hold no rows yet. Reads skip them; writing
+    /// a row at one fills it. `None`, changing nothing, if a row or hole
+    /// already lies anywhere between the span's first key and its last. The
+    /// hole goes in by a cut and a join, as a graft's copy does.
+    pub fn reserve(&self, span: Span<K>) -> Option<Self> {
+        debug_assert!(!self.is_kd(), "a B+ reserve in a k-d tree");
+        if span.n == 0 {
+            return Some(self.clone());
+        }
+        if !self.free(&span) {
+            return None;
+        }
+        let last = span.last();
+        let (below, rest) = self.split(&span.first);
+        let (_, above) = rest.split(&last);
+        let hole = Self::leaf(vec![Item::Hole(span)]);
+        Some(Self::join(&Self::join(&below, &hole), &above))
     }
 
     /// A new tree with `key` removed. Absent keys are a true no-op — the same
@@ -353,7 +405,8 @@ where
         debug_assert!(!self.is_kd(), "a B+ remove from a k-d tree");
         match Self::rem(self, key, 0) {
             None => self.clone(),
-            Some(t) => Self::shrink_root(t),
+            Some(Ins::Done(t)) => Self::shrink_root(t),
+            Some(Ins::Split(l, sep, r)) => Self::internal(vec![sep], vec![l, r]),
         }
     }
 
@@ -403,11 +456,23 @@ where
             return;
         }
         match n.kind().view() {
-            View::Leaf(entries) => {
-                for (k, v) in entries {
-                    let k = moved(k, off);
-                    if keep(&k, v) {
-                        out.push((k.into_owned(), v.clone()));
+            View::Leaf(items) => {
+                for it in items {
+                    if let Item::One(k, v) = it {
+                        let k = moved(k, off);
+                        if keep(&k, v) {
+                            out.push((k.into_owned(), v.clone()));
+                        }
+                        continue;
+                    }
+                    // A run is a subtree of its own: its measure may rule it out.
+                    if it.rows() == 0 || !admit(&it.measure::<M>().displace(off)) {
+                        continue;
+                    }
+                    for (k, v) in it.each_row(off) {
+                        if keep(&k, v) {
+                            out.push((k, v.clone()));
+                        }
                     }
                 }
             }
@@ -627,12 +692,13 @@ where
     /// measure, whose contents stay on disk until a read reaches them. Length,
     /// measure, content key and version identity are all answerable without
     /// paging it in.
-    pub fn paged(ck: ContentKey, size: usize, measure: M, pager: Arc<dyn Pager<K, V, M>>) -> Self {
+    pub fn paged(ck: ContentKey, size: usize, reserved: u64, measure: M, pager: Arc<dyn Pager<K, V, M>>) -> Self {
         Tree {
             root: Some(Arc::new(Node {
                 kind: OnceLock::new(),
                 pager: Some(pager),
                 size,
+                reserved,
                 measure,
                 ck: OnceLock::from(ck),
             })),
@@ -653,10 +719,10 @@ where
         Some(weak)
     }
 
-    /// Rebuild a leaf from its exact persisted entries — no rebalancing, so a
+    /// Rebuild a leaf from its exact persisted items — no rebalancing, so a
     /// load round-trips the stored shape and content keys stay stable.
-    pub fn leaf_of(entries: Vec<(K, V)>) -> Self {
-        Self::leaf(entries)
+    pub fn leaf_of(items: Vec<Item<K, V>>) -> Self {
+        Self::leaf(items)
     }
 
     /// Rebuild an internal node from its exact persisted separators and children
@@ -674,16 +740,14 @@ where
 
     // --- construction -------------------------------------------------------
 
-    fn leaf(entries: Vec<(K, V)>) -> Self {
-        let mut measure = M::empty();
-        for (k, v) in &entries {
-            measure.absorb_entry(k, v);
-        }
+    fn leaf(items: Vec<Item<K, V>>) -> Self {
+        let (measure, size, reserved) = leaf::summary::<K, V, M>(&items);
         Tree {
             root: Some(Arc::new(Node {
-                size: entries.len(),
+                size,
+                reserved,
                 measure,
-                kind: OnceLock::from(Kind::Leaf(entries)),
+                kind: OnceLock::from(Kind::Leaf(items)),
                 pager: None,
                 ck: OnceLock::new(),
             })),
@@ -693,17 +757,19 @@ where
 
     fn internal(keys: Vec<K>, children: Vec<Self>) -> Self {
         let mut measure = M::empty();
-        let mut size = 0;
+        let (mut size, mut reserved) = (0, 0);
         for c in &children {
             match (c.dsp, c.local_measure()) {
                 (0, Some(m)) => measure.absorb(m),
                 _ => measure.absorb(&c.measure()),
             }
             size += c.len();
+            reserved += c.reserved();
         }
         Tree {
             root: Some(Arc::new(Node {
                 size,
+                reserved,
                 measure,
                 kind: OnceLock::from(Kind::Internal { keys, children }),
                 pager: None,
@@ -725,6 +791,7 @@ where
         Tree {
             root: Some(Arc::new(Node {
                 size: lo.len() + hi.len(),
+                reserved: lo.reserved() + hi.reserved(),
                 measure,
                 kind: OnceLock::from(Kind::Split { col, pivot, children: [lo, hi] }),
                 pager: None,
@@ -742,6 +809,21 @@ where
             1 => children.pop().unwrap(),
             _ => Self::internal(keys, children),
         }
+    }
+
+    /// A rewritten leaf, its runs folded and split in two if it overflowed:
+    /// a block written row by row ends as one item, not a chain of full
+    /// leaves.
+    fn finish_leaf(mut e: Vec<Item<K, V>>) -> Ins<K, V, M> {
+        if e.len() > B {
+            leaf::compress(&mut e);
+        }
+        if e.len() <= B {
+            return Ins::Done(if e.is_empty() { Tree::new() } else { Self::leaf(e) });
+        }
+        let right = e.split_off(e.len() / 2);
+        let sep = right[0].lo_key().clone();
+        Ins::Split(Self::leaf(e), sep, Self::leaf(right))
     }
 
     /// A rewritten run of children, split in two if it overflowed.
@@ -765,11 +847,7 @@ where
         let n = t.root.as_deref().expect("open on a non-empty tree");
         let d = t.dsp;
         match n.kind() {
-            Kind::Leaf(entries) => Open::Leaf(if d == 0 {
-                entries.clone()
-            } else {
-                entries.iter().map(|(k, v)| (k.displace(d), v.clone())).collect()
-            }),
+            Kind::Leaf(items) => Open::Leaf(items.iter().map(|it| it.displaced(d)).collect()),
             Kind::Internal { keys, children } => Open::Internal(
                 if d == 0 { keys.clone() } else { keys.iter().map(|k| k.displace(d)).collect() },
                 children.iter().map(|c| c.relocate(d)).collect(),
@@ -810,10 +888,7 @@ where
     fn extreme_key(t: &Self, off: i64, greatest: bool) -> K {
         let off = off.wrapping_add(t.dsp);
         match t.root.as_deref().expect("an extreme key of an empty tree").kind().view() {
-            View::Leaf(entries) => {
-                let (k, _) = if greatest { &entries[entries.len() - 1] } else { &entries[0] };
-                k.displace(off)
-            }
+            View::Leaf(items) => leaf::extreme(items, off, greatest),
             View::Sep(_, children) => {
                 let c = if greatest { &children[children.len() - 1] } else { &children[0] };
                 Self::extreme_key(c, off, greatest)
@@ -831,28 +906,18 @@ where
     /// parent frame.
     fn ins(t: &Self, key: K, val: V) -> Ins<K, V, M> {
         match Self::open(t) {
-            Open::Leaf(mut e) => match e.binary_search_by(|(k, _)| k.cmp(&key)) {
-                Ok(i) => {
-                    e[i] = (key, val);
-                    Ins::Done(Self::leaf(e))
-                }
-                Err(i) => {
-                    e.insert(i, (key, val));
-                    if e.len() <= B {
-                        Ins::Done(Self::leaf(e))
-                    } else {
-                        let right = e.split_off(e.len() / 2);
-                        let sep = right[0].0.clone();
-                        Ins::Split(Self::leaf(e), sep, Self::leaf(right))
-                    }
-                }
-            },
+            Open::Leaf(mut e) => {
+                leaf::insert(&mut e, key, val);
+                Self::finish_leaf(e)
+            }
             Open::Internal(mut ks, mut ch) => {
                 let i = child_index(&ks, 0, &key);
                 match Self::ins(&ch[i], key, val) {
                     Ins::Done(c) => {
                         ch[i] = c;
-                        Ins::Done(Self::internal(ks, ch))
+                        // Joining runs can leave a leaf fewer items than before.
+                        Self::fix(&mut ks, &mut ch, i);
+                        Ins::Done(Self::from_parts(ks, ch))
                     }
                     Ins::Split(l, sep, r) => {
                         ch[i] = l;
@@ -871,24 +936,36 @@ where
     /// Remove `key` from the subtree under `t`, or `None` if it was absent (so the
     /// caller keeps sharing the existing version). `off` carries `t`'s parent
     /// frame to `key`'s; the result is in `t`'s parent frame. It may be below the
-    /// occupancy floor; the *parent* repairs it.
-    fn rem(t: &Self, key: &K, off: i64) -> Option<Self> {
+    /// occupancy floor; the *parent* repairs it. It may also split: cutting a
+    /// row out of a run leaves two items where there was one, so a full leaf
+    /// can overflow on a remove.
+    fn rem(t: &Self, key: &K, off: i64) -> Option<Ins<K, V, M>> {
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
         match n.kind() {
-            Kind::Leaf(entries) => {
-                let i = entries.binary_search_by(|(k, _)| k.cmp_displaced(off, key)).ok()?;
+            Kind::Leaf(items) => {
+                let (i, j) = leaf::find_row(items, off, key)?;
                 let Open::Leaf(mut e) = Self::open(t) else { unreachable!() };
-                e.remove(i);
-                Some(Self::leaf(e))
+                leaf::remove_at(&mut e, i, j);
+                Some(Self::finish_leaf(e))
             }
             Kind::Internal { keys, children } => {
                 let i = child_index(keys, off, key);
                 let newc = Self::rem(&children[i], key, off)?;
                 let Open::Internal(mut ks, mut ch) = Self::open(t) else { unreachable!() };
-                ch[i] = newc.relocate(t.dsp);
-                Self::fix(&mut ks, &mut ch, i);
-                Some(Self::internal(ks, ch))
+                match newc {
+                    Ins::Done(c) => {
+                        ch[i] = c.relocate(t.dsp);
+                        Self::fix(&mut ks, &mut ch, i);
+                        Some(Ins::Done(Self::internal(ks, ch)))
+                    }
+                    Ins::Split(l, sep, r) => {
+                        ch[i] = l.relocate(t.dsp);
+                        ch.insert(i + 1, r.relocate(t.dsp));
+                        ks.insert(i, sep.displace(t.dsp));
+                        Some(Self::finish(ks, ch))
+                    }
+                }
             }
             Kind::Split { .. } => unreachable!("a B+ remove met a k-d split"),
         }
@@ -935,7 +1012,7 @@ where
                     ch[j] = Self::leaf(entries);
                 } else {
                     let r = entries.split_off(entries.len() / 2);
-                    ks.insert(j, r[0].0.clone());
+                    ks.insert(j, r[0].lo_key().clone());
                     ch[j] = Self::leaf(entries);
                     ch.insert(j + 1, Self::leaf(r));
                 }
@@ -978,11 +1055,10 @@ where
             return (Tree::new(), Tree::new());
         }
         match Self::open(t) {
-            Open::Leaf(mut e) => {
-                let i = e.partition_point(|(k, _)| k < key);
-                let r = e.split_off(i);
-                let side = |v: Vec<(K, V)>| if v.is_empty() { Tree::new() } else { Self::leaf(v) };
-                (side(e), side(r))
+            Open::Leaf(e) => {
+                let (l, r) = leaf::split_at(e, key);
+                let side = |v: Vec<Item<K, V>>| if v.is_empty() { Tree::new() } else { Self::leaf(v) };
+                (side(l), side(r))
             }
             Open::Internal(mut ks, mut ch) => {
                 // Children before `i` lie wholly below `key`, children after it
@@ -1098,12 +1174,8 @@ where
             return acc;
         }
         match n.kind().view() {
-            View::Leaf(entries) => {
-                for (k, v) in entries {
-                    if in_span(k, off, lo, hi) {
-                        acc.absorb_entry(&moved(k, off), v);
-                    }
-                }
+            View::Leaf(items) => {
+                leaf::fold_in(items, off, lo, hi, &mut acc);
                 acc
             }
             View::Sep(keys, children) => {
@@ -1135,7 +1207,7 @@ where
         }
         let off = off.wrapping_add(t.dsp);
         match n.kind().view() {
-            View::Leaf(entries) => entries.iter().filter(|(k, _)| in_span(k, off, lo, hi)).count(),
+            View::Leaf(items) => leaf::count_in(items, off, lo, hi),
             View::Sep(keys, children) => span(keys, children, off, lo, hi)
                 .map(|(idx, c)| {
                     let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
@@ -1154,13 +1226,7 @@ where
         };
         let off = off.wrapping_add(t.dsp);
         match n.kind().view() {
-            View::Leaf(entries) => {
-                for (k, v) in entries {
-                    if in_span(k, off, lo, hi) {
-                        out.push((moved(k, off).into_owned(), v.clone()));
-                    }
-                }
-            }
+            View::Leaf(items) => leaf::range_in(items, off, lo, hi, out),
             View::Sep(keys, children) => {
                 for (_, c) in span(keys, children, off, lo, hi) {
                     Self::range_into(c, lo, hi, off, out);
@@ -1183,11 +1249,11 @@ where
             return false;
         }
         if contained(nlo, nhi, lo, hi) {
-            return n.size > 0;
+            return n.size > 0 || n.reserved > 0;
         }
         let off = off.wrapping_add(t.dsp);
         match n.kind().view() {
-            View::Leaf(entries) => entries.iter().any(|(k, _)| in_span(k, off, lo, hi)),
+            View::Leaf(items) => leaf::any_in(items, off, lo, hi),
             View::Sep(keys, children) => span(keys, children, off, lo, hi).any(|(idx, c)| {
                 let clo = if idx == 0 { nlo } else { Some((&keys[idx - 1], off)) };
                 let chi = if idx == children.len() - 1 { nhi } else { Some((&keys[idx], off)) };
@@ -1201,13 +1267,7 @@ where
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
         match n.kind().view() {
-            View::Leaf(entries) => {
-                let i = entries.partition_point(|(k, _)| k.cmp_displaced(off, key) != Ordering::Greater);
-                (i > 0).then(|| {
-                    let (k, v) = &entries[i - 1];
-                    (moved(k, off).into_owned(), v)
-                })
-            }
+            View::Leaf(items) => leaf::last_le(items, off, key),
             View::Sep(keys, children) => {
                 // Descend the child whose span holds `key`; if that subtree has
                 // nothing at or below it, the answer is the greatest entry of a
@@ -1239,15 +1299,30 @@ where
                     xs.pop();
                     ys.pop();
                 }
-                Step::Left => Self::emit(xs.pop().expect("a head"), true, out),
-                Step::Right => Self::emit(ys.pop().expect("a head"), false, out),
+                Step::Left => Self::emit_one(&mut xs, true, out),
+                Step::Right => Self::emit_one(&mut ys, false, out),
                 Step::Pair => {
-                    let (Some(Head::Entry(k, off, va)), Some(Head::Entry(.., vb))) = (xs.pop(), ys.pop()) else {
-                        unreachable!("a pair is two entries")
+                    // Two runs at one key with one stride hold the same keys for
+                    // as long as both last: compare them as one step.
+                    let stretch = match (xs.last(), ys.last()) {
+                        (Some(Head::Run(a, _, _, i)), Some(Head::Run(b, _, _, j))) if a.stride == b.stride => {
+                            (a.n - i).min(b.n - j)
+                        }
+                        _ => 1,
                     };
+                    let ((k, va), (_, vb)) = (head_row(xs.last().expect("a head")), head_row(ys.last().expect("a head")));
                     if va != vb {
-                        out.push((moved(k, off).into_owned(), Some(va.clone()), Some(vb.clone())));
+                        let stride = match xs.last() {
+                            Some(Head::Run(s, ..)) => Some(&s.stride),
+                            _ => None,
+                        };
+                        for t in 0..stretch {
+                            let k = if t == 0 { k.clone() } else { k.step(stride.expect("a stretch is a run"), t as i64) };
+                            out.push((k, Some(va.clone()), Some(vb.clone())));
+                        }
                     }
+                    advance(&mut xs, stretch);
+                    advance(&mut ys, stretch);
                 }
                 Step::OpenLeft => Self::open_onto(&mut xs),
                 Step::OpenRight => Self::open_onto(&mut ys),
@@ -1277,35 +1352,40 @@ where
     /// the same nodes again. So a misstep costs one path, never a subtree.
     fn step(x: &Head<'_, K, V, M>, y: &Head<'_, K, V, M>) -> Step {
         match (x, y) {
-            (Head::Entry(ka, i, _), Head::Entry(kb, j, _)) => match moved(*ka, *i).cmp(&moved(*kb, *j)) {
+            (Head::Node(a, i, _), Head::Node(b, j, _)) if same_at(a, *i, b, *j) => Step::Skip,
+            (Head::Node(..), Head::Node(..)) => Step::OpenBoth,
+            // A node whose separator bound lies above the row holds nothing
+            // at or below it, which spares opening the leaf after an edit.
+            (_, Head::Node(.., Some((lo, o)))) if above_key(*lo, *o, &head_row(x).0) => Step::Left,
+            (Head::Node(.., Some((lo, o))), _) if above_key(*lo, *o, &head_row(y).0) => Step::Right,
+            (_, Head::Node(..)) => Step::OpenRight,
+            (Head::Node(..), _) => Step::OpenLeft,
+            _ => match head_row(x).0.cmp(&head_row(y).0) {
                 Ordering::Less => Step::Left,
                 Ordering::Greater => Step::Right,
                 Ordering::Equal => Step::Pair,
             },
-            (Head::Node(a, i, _), Head::Node(b, j, _)) if same_at(a, *i, b, *j) => Step::Skip,
-            (Head::Node(..), Head::Node(..)) => Step::OpenBoth,
-            // A node whose separator bound lies above the entry holds nothing
-            // at or below it, which spares opening the leaf after an edit.
-            (Head::Entry(k, i, _), Head::Node(.., Some((lo, o)))) if above(*lo, *o, *k, *i) => Step::Left,
-            (Head::Node(.., Some((lo, o))), Head::Entry(k, i, _)) if above(*lo, *o, *k, *i) => Step::Right,
-            (Head::Entry(..), Head::Node(..)) => Step::OpenRight,
-            (Head::Node(..), Head::Entry(..)) => Step::OpenLeft,
         }
     }
 
-    /// Report everything under `head` as present on one side only.
-    fn emit(head: Head<'_, K, V, M>, left: bool, out: &mut Vec<EntryDiff<K, V>>) {
+    /// Report the head as present on one side only: a whole node, or one row.
+    fn emit_one(stack: &mut Vec<Head<'_, K, V, M>>, left: bool, out: &mut Vec<EntryDiff<K, V>>) {
         let mut push = |k: K, v: &V| {
             out.push(if left { (k, Some(v.clone()), None) } else { (k, None, Some(v.clone())) });
         };
-        match head {
-            Head::Entry(k, off, v) => push(moved(k, off).into_owned(), v),
+        match stack.last().expect("a head") {
             Head::Node(t, off, _) => {
                 let mut it = Iter { stack: Vec::new(), leaf: None, sorted: None };
-                it.descend(t, off);
+                it.descend(t, *off);
                 for (k, v) in it {
                     push(k, v);
                 }
+                stack.pop();
+            }
+            head => {
+                let (k, v) = head_row(head);
+                push(k, v);
+                advance(stack, 1);
             }
         }
     }
@@ -1317,8 +1397,12 @@ where
         let Some(Head::Node(t, off, lo)) = stack.pop() else { unreachable!("only a node is opened") };
         let off = off.wrapping_add(t.dsp);
         match t.root.as_deref().expect("no empty node on a frontier").kind() {
-            Kind::Leaf(entries) => {
-                stack.extend(entries.iter().rev().map(|(k, v)| Head::Entry(k, off, v)));
+            Kind::Leaf(items) => {
+                stack.extend(items.iter().rev().filter_map(|it| match it {
+                    Item::One(k, v) => Some(Head::Entry(k, off, v)),
+                    Item::Run(s, v) => Some(Head::Run(s, v, off, 0)),
+                    Item::Hole(_) => None,
+                }));
             }
             Kind::Internal { keys, children } => {
                 for (i, c) in children.iter().enumerate().rev() {
@@ -1336,6 +1420,9 @@ where
 enum Head<'a, K, V, M> {
     /// An entry, with the offset carrying its key to the absolute frame.
     Entry(&'a K, i64, &'a V),
+    /// A run from its row `i` on, with the offset carrying it to the absolute
+    /// frame.
+    Run(&'a Span<K>, &'a V, i64, u64),
     /// A subtree, the offset of its parent's frame, and the separator that
     /// bounds it below (with the offset carrying it to the absolute frame).
     /// Removals leave separators stale, so the bound may lie below the
@@ -1343,9 +1430,28 @@ enum Head<'a, K, V, M> {
     Node(&'a Tree<K, V, M>, i64, Bound<'a, K>),
 }
 
-/// Separator `lo` (at offset `o`) lies above key `k` (at offset `i`).
-fn above<K: Displace>(lo: &K, o: i64, k: &K, i: i64) -> bool {
-    *moved(lo, o) > *moved(k, i)
+/// Separator `lo` (at offset `o`) lies above the absolute key `k`.
+fn above_key<K: Displace>(lo: &K, o: i64, k: &K) -> bool {
+    lo.cmp_displaced(o, k) == Ordering::Greater
+}
+
+/// The row a row head stands at, key in the absolute frame.
+fn head_row<'a, K: Displace, V, M>(h: &Head<'a, K, V, M>) -> (K, &'a V) {
+    match h {
+        Head::Entry(k, off, v) => (k.displace(*off), v),
+        Head::Run(s, v, off, i) => (s.row(*i).displace(*off), v),
+        Head::Node(..) => unreachable!("a node has no row of its own"),
+    }
+}
+
+/// Consume `by` rows from the head row of `stack`.
+fn advance<K: Displace, V, M>(stack: &mut Vec<Head<'_, K, V, M>>, by: u64) {
+    match stack.last_mut() {
+        Some(Head::Run(s, _, _, i)) if *i + by < s.n => *i += by,
+        _ => {
+            stack.pop();
+        }
+    }
 }
 
 /// `a` (under a parent frame at `i`) and `b` (at `j`) are the same node at the
@@ -1383,7 +1489,7 @@ enum Step {
 impl<K, V, M> Tree<K, V, M>
 where
     K: Ord + Displace + std::fmt::Debug,
-    V: Clone,
+    V: RunValue,
     M: Measure<K, V>,
 {
     /// Assert every structural invariant, through the displaced frames: keys in
@@ -1413,14 +1519,17 @@ where
                 && hi.is_none_or(|(h, o)| h.cmp_displaced(o, &k) == Ordering::Greater)
         };
         match n.kind() {
-            Kind::Leaf(entries) => {
-                assert!(!entries.is_empty(), "empty leaf");
-                assert!(entries.len() <= B, "leaf over arity");
-                assert!(is_root || entries.len() >= MIN, "leaf under the floor: {}", entries.len());
-                for (k, _) in entries {
-                    assert!(within(k), "leaf key {:?} outside its span", abs(k));
+            Kind::Leaf(items) => {
+                assert!(!items.is_empty(), "empty leaf");
+                assert!(items.len() <= B, "leaf over arity");
+                assert!(is_root || items.len() >= MIN, "leaf under the floor: {}", items.len());
+                leaf::check_items(items);
+                for it in items {
+                    assert!(within(it.lo_key()), "leaf key {:?} outside its span", abs(it.lo_key()));
+                    assert!(within(&it.hi_key()), "leaf key {:?} outside its span", abs(&it.hi_key()));
                 }
-                assert_eq!(n.size, entries.len());
+                let (_, size, reserved) = leaf::summary::<K, V, M>(items);
+                assert_eq!((n.size, n.reserved), (size, reserved), "cached counts disagree with the items");
                 1
             }
             Kind::Internal { keys, children } => {
@@ -1452,11 +1561,6 @@ where
 /// A known bound on a subtree's keys: a separator and the offset that carries
 /// its frame to the query's.
 type Bound<'a, K> = Option<(&'a K, i64)>;
-
-/// `k` (at offset `off`) lies in `[lo, hi)`.
-fn in_span<K: Displace>(k: &K, off: i64, lo: &K, hi: &K) -> bool {
-    k.cmp_displaced(off, lo) != Ordering::Less && k.cmp_displaced(off, hi) == Ordering::Less
-}
 
 /// A subtree bounded by `[nlo, nhi)` cannot meet `[lo, hi)`.
 fn disjoint<K: Displace>(nlo: Bound<'_, K>, nhi: Bound<'_, K>, lo: &K, hi: &K) -> bool {
@@ -1496,8 +1600,9 @@ fn span<'a, K: Displace, T>(
 /// of the next one to visit, and the node's offset to the absolute frame.
 type Frame<'a, K, V, M> = (&'a [Tree<K, V, M>], usize, i64);
 
-/// The leaf the iterator is draining, how far into it, and its offset.
-type LeafCursor<'a, K, V> = (&'a [(K, V)], usize, i64);
+/// The leaf the iterator is draining: its items, the item and row next, and
+/// its offset.
+type LeafCursor<'a, K, V> = (&'a [Item<K, V>], usize, u64, i64);
 
 /// In-order iterator over `(key, value)`, keys in the absolute frame.
 ///
@@ -1522,8 +1627,8 @@ impl<'a, K: Displace, V, M> Iter<'a, K, V, M> {
         while let Some(n) = cur.root.as_deref() {
             off = off.wrapping_add(cur.dsp);
             match n.kind().view() {
-                View::Leaf(entries) => {
-                    self.leaf = Some((entries, 0, off));
+                View::Leaf(items) => {
+                    self.leaf = Some((items, 0, 0, off));
                     return;
                 }
                 View::Sep(_, children) => {
@@ -1550,7 +1655,11 @@ fn collect_all<'a, K: Displace, V, M>(t: &'a Tree<K, V, M>, off: i64, out: &mut 
     let Some(n) = t.root.as_deref() else { return };
     let off = off.wrapping_add(t.dsp);
     match n.kind().view() {
-        View::Leaf(entries) => out.extend(entries.iter().map(|(k, v)| (moved(k, off).into_owned(), v))),
+        View::Leaf(items) => {
+            for it in items {
+                out.extend(it.each_row(off));
+            }
+        }
         View::Sep(_, children) | View::Mixed(children) => {
             for c in children {
                 collect_all(c, off, out);
@@ -1571,11 +1680,23 @@ impl<'a, K: Displace, V, M> Iterator for Iter<'a, K, V, M> {
     type Item = (K, &'a V);
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some((entries, i, off)) = &mut self.leaf {
-                if *i < entries.len() {
-                    let (k, v) = &entries[*i];
-                    *i += 1;
-                    return Some((moved(k, *off).into_owned(), v));
+            if let Some((items, i, j, off)) = &mut self.leaf {
+                let items: &'a [Item<K, V>] = items;
+                while *i < items.len() {
+                    match &items[*i] {
+                        Item::One(k, v) => {
+                            *i += 1;
+                            return Some((moved(k, *off).into_owned(), v));
+                        }
+                        Item::Run(s, v) if *j < s.n => {
+                            *j += 1;
+                            return Some((s.row(*j - 1).displace(*off), v));
+                        }
+                        _ => {
+                            *i += 1;
+                            *j = 0;
+                        }
+                    }
                 }
                 self.leaf = None;
             }

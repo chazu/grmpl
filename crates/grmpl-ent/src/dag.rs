@@ -44,6 +44,8 @@ pub struct Branch {
     pub merged: Option<(BranchId, u64, u64)>,
 }
 
+crate::run_values_by_eq!(Branch);
+
 /// A branch record persists as its id, fork point and merged parent. The DagWood is the
 /// fulltrace's branch structure, so it is durable like every other part of the
 /// world — a reopened store that forgot its forks would have forgotten its

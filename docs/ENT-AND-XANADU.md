@@ -301,6 +301,7 @@ the design column is `idea.md`.
 | Patch = guarded, atomic next edition | ⚠️ pseudo-transactions, no rollback | ✅ semantic center | ✅ `commit_if`, group-committed |
 | Structural sharing / path copy | ✅ | ✅ | ✅ `O(log n)` new nodes per commit |
 | Content tree shape | binary splay, split per dimension | — | B+ tree ordered by whole key (divergent), or per relation binary splits on any column, balanced by scapegoat rebuild and same-column rotation (step 6) |
+| Leaf kinds | region (one element over a region), virtual (a primitive array), partial (placeholders) | — | items: rows, runs (run-length and lazy at once), holes (step 7); runs coarsen identity, which in grmpl is node sharing |
 | Cached upward summaries in content nodes | ❌ (canopy crums instead) | ✅ "WIDative summaries" | ✅ `Count` and per-column `Extent` (grmpl's own) |
 | Displacements composing down the tree | ✅ `DspLoaf` nodes | ✅ | ✅ a dsp on every handle |
 | Relocation / virtual copy | ✅ `O(1)` / splay and share | ✅ | ✅ relocate `O(1)`; graft `O(log n)` |
@@ -345,12 +346,14 @@ the Ent.
 
 What is still short of Gold, from the source (full list in
 [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md) §4, status in
-[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): lazy and run-length leaves,
-per-dimension dsps, and unloading clean nodes. The
+[`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)): per-dimension dsps and
+unloading clean nodes. The
 history layer landed in step 4
 ([`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md)) and merges in step 5
 ([`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md)), and splits on any
-column in step 6 ([`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md)).
+column in step 6 ([`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md)), and
+run, lazy and partial leaves in step 7
+([`ENT-FIDELITY-STEP-7.md`](ENT-FIDELITY-STEP-7.md)).
 Canopies, recorders and a general Agenda were declined.
 
 What is short of `idea.md`'s extrapolations:

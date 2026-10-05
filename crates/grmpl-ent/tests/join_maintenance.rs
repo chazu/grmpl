@@ -185,11 +185,16 @@ fn maintaining_a_large_join_after_a_small_commit_reads_a_few_frames() {
     let dir = tempfile::tempdir().unwrap();
     {
         let store = EntStore::open(dir.path()).unwrap();
+        // The bound is the B+ layout's: a k-d tree over a scattered column
+        // pays about the square root of its leaves for a lead-column read.
+        store.set_default_layout(grmpl_ent::Layout::Ordered).unwrap();
         for chunk in (0..N).collect::<Vec<_>>().chunks(1_000) {
             let mut ups = Vec::new();
+            // Irregular cells, so no run folds a relation into a few items:
+            // the comparison is with reading them row by row.
             for &i in chunk {
-                ups.push((R, Tuple::from([ent(i), ent(i % 50), Value::Int(0)]), 1));
-                ups.push((S, Tuple::from([ent(i), ent(i + 1)]), 1));
+                ups.push((R, Tuple::from([ent(i), ent(i * i % 50), Value::Int(0)]), 1));
+                ups.push((S, Tuple::from([ent(i), ent(i * i % 9_973)]), 1));
             }
             store.commit(&ups).unwrap();
         }
@@ -199,7 +204,7 @@ fn maintaining_a_large_join_after_a_small_commit_reads_a_few_frames() {
     // One thing moves: a retraction and an assertion in r.
     store
         .commit(&[
-            (R, Tuple::from([ent(4_321), ent(4_321 % 50), Value::Int(0)]), -1),
+            (R, Tuple::from([ent(4_321), ent(4_321 * 4_321 % 50), Value::Int(0)]), -1),
             (R, Tuple::from([ent(4_321), ent(7), Value::Int(0)]), 1),
         ])
         .unwrap();

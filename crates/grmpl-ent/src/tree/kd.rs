@@ -50,6 +50,8 @@ pub enum Layout {
     Kd,
 }
 
+crate::run_values_by_eq!(Layout);
+
 /// [`Layout::Ordered`], unless the `kd-default` feature makes every law run
 /// against the k-d layout.
 impl Default for Layout {
@@ -118,44 +120,65 @@ fn like(a: usize, b: usize) -> bool {
 
 impl<V, M> Tree<Tuple, V, M>
 where
-    V: Clone,
+    V: RunValue,
     M: Measure<Tuple, V>,
 {
     // --- building -----------------------------------------------------------
 
     /// **A balanced k-d tree** over `entries`, which must have distinct keys:
     /// each node splits on the column of widest spread at its median, down to
-    /// leaves of at most [`B`] entries.
-    pub fn kd_build(entries: Vec<(Tuple, V)>) -> Self {
-        Self::build(entries)
+    /// leaves of at most [`B`] items. Rows that form runs are folded first.
+    pub fn kd_build(mut entries: Vec<(Tuple, V)>) -> Self {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut items: Vec<Item<Tuple, V>> = entries.into_iter().map(|(k, v)| Item::One(k, v)).collect();
+        leaf::compress(&mut items);
+        Self::build(items)
     }
 
-    fn build(mut e: Vec<(Tuple, V)>) -> Self {
-        if e.is_empty() {
+    /// A balanced tree over `items` (in key order, disjoint). A run is cut
+    /// only where a pivot falls inside it, so it keeps its compression.
+    pub(super) fn build(items: Vec<Item<Tuple, V>>) -> Self {
+        if items.is_empty() {
             return Tree::new();
         }
-        if e.len() <= B {
-            e.sort_by(|a, b| a.0.cmp(&b.0));
-            return Self::leaf(e);
+        let items = leaf::disjoint(items);
+        if items.len() <= B {
+            return Self::leaf(items);
         }
-        let col = widest(&e);
-        e.sort_by(|a, b| cell(&a.0, col).cmp(&cell(&b.0, col)).then_with(|| a.0.cmp(&b.0)));
-        let (i, pivot) = cut(&e, col);
-        let hi = e.split_off(i);
-        Self::split_node(col, pivot_of(pivot), Self::build(e), Self::build(hi))
+        let col = widest(&items);
+        let pivot = pivot_of(median(&items, col));
+        let (lo, hi) = leaf::split_on(items, col, &pivot);
+        Self::split_node(col, pivot, Self::build(lo), Self::build(hi))
     }
 
-    /// Every entry of the subtree under `t`, keys in `t`'s parent frame, in
+    /// Every item of the subtree under `t`, keys in `t`'s parent frame, in
     /// key order.
-    fn entries(t: &Self) -> Vec<(Tuple, V)> {
-        let mut all = Vec::with_capacity(t.len());
-        collect_all(t, 0, &mut all);
-        all.sort_by(|a, b| a.0.cmp(&b.0));
-        all.into_iter().map(|(k, v)| (k, v.clone())).collect()
+    pub(super) fn items_of(t: &Self) -> Vec<Item<Tuple, V>> {
+        fn walk<V: RunValue, M: Measure<Tuple, V>>(t: &Tree<Tuple, V, M>, off: i64, out: &mut Vec<Item<Tuple, V>>) {
+            let Some(n) = t.root.as_deref() else { return };
+            let off = off.wrapping_add(t.dsp);
+            match n.kind() {
+                Kind::Leaf(items) => out.extend(items.iter().map(|it| it.displaced(off))),
+                Kind::Split { children, .. } => {
+                    for c in children {
+                        walk(c, off, out);
+                    }
+                }
+                Kind::Internal { children, .. } => {
+                    for c in children {
+                        walk(c, off, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(t, 0, &mut out);
+        out.sort_by(|a, b| a.lo_key().cmp(b.lo_key()));
+        out
     }
 
-    /// A split over `lo` and `hi` that tolerates an empty side, and folds a
-    /// subtree small enough for one leaf back into one.
+    /// A split over `lo` and `hi` that tolerates an empty side, and folds two
+    /// leaves small enough for one back into one.
     fn make(col: usize, pivot: Tuple, lo: Self, hi: Self) -> Self {
         if lo.is_empty() {
             return hi;
@@ -163,11 +186,23 @@ where
         if hi.is_empty() {
             return lo;
         }
-        if lo.len() + hi.len() <= MIN {
-            let mut e = Self::entries(&lo);
-            e.extend(Self::entries(&hi));
-            e.sort_by(|a, b| a.0.cmp(&b.0));
-            return Self::leaf(e);
+        let leaf_items = |t: &Self| match t.root.as_deref().map(|n| n.kind()) {
+            Some(Kind::Leaf(items)) => Some(items.len()),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (leaf_items(&lo), leaf_items(&hi)) {
+            // Siblings split on another column may interleave in key order;
+            // only two whose keys do not are folded, side by side.
+            let apart = lo.max_key() < hi.min_key() || hi.max_key() < lo.min_key();
+            if a + b <= MIN && apart {
+                let (mut x, mut y) = (Self::items_of(&lo), Self::items_of(&hi));
+                if x[0].lo_key() > y[0].lo_key() {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                x.extend(y);
+                leaf::compress(&mut x);
+                return Self::leaf(x);
+            }
         }
         Self::split_node(col, pivot, lo, hi)
     }
@@ -177,7 +212,7 @@ where
     /// `key → val` inserted or replaced, in the k-d layout.
     pub fn kd_insert(&self, key: Tuple, val: V) -> Self {
         if self.is_empty() {
-            return Self::leaf(vec![(key, val)]);
+            return Self::leaf(vec![Item::One(key, val)]);
         }
         Self::kd_ins(self, key, val).0
     }
@@ -187,20 +222,19 @@ where
     /// root down to the leaf written.
     fn kd_ins(t: &Self, key: Tuple, val: V) -> (Self, usize) {
         match Self::open(t) {
-            Open::Leaf(mut e) => match e.binary_search_by(|(k, _)| k.cmp(&key)) {
-                Ok(i) => {
-                    e[i] = (key, val);
+            Open::Leaf(mut e) => {
+                leaf::insert(&mut e, key, val);
+                if e.len() > B {
+                    leaf::compress(&mut e);
+                }
+                if e.len() <= B {
                     (Self::leaf(e), 0)
+                } else {
+                    let built = Self::build(e);
+                    let depth = kd_height_of(&built);
+                    (built, depth)
                 }
-                Err(i) => {
-                    e.insert(i, (key, val));
-                    if e.len() <= B {
-                        (Self::leaf(e), 0)
-                    } else {
-                        (Self::build(e), 1)
-                    }
-                }
-            },
+            }
             Open::Split(col, pivot, [lo, hi]) => {
                 let below = key.cmp_column(col, &pivot, 0) == Ordering::Less;
                 let (lo, hi, levels) = if below {
@@ -214,7 +248,7 @@ where
                 let levels = levels + 1;
                 if too_deep(levels, node.len()) {
                     // The scapegoat: rebuild this subtree balanced.
-                    let rebuilt = Self::build(Self::entries(&node));
+                    let rebuilt = Self::build(Self::items_of(&node));
                     let depth = kd_height_of(&rebuilt);
                     (rebuilt, depth)
                 } else {
@@ -233,16 +267,16 @@ where
 
     /// Remove `key` from the subtree under `t`, or `None` if absent. `off`
     /// carries `t`'s parent frame to `key`'s; the result is in `t`'s parent
-    /// frame. A split left with one child becomes it, and a split small
-    /// enough for one leaf becomes one.
+    /// frame. A split left with one child becomes it, and two small leaves
+    /// become one.
     fn kd_rem(t: &Self, key: &Tuple, off: i64) -> Option<Self> {
         let n = t.root.as_deref()?;
         let off = off.wrapping_add(t.dsp);
         match n.kind() {
-            Kind::Leaf(entries) => {
-                let i = entries.binary_search_by(|(k, _)| k.cmp_displaced(off, key)).ok()?;
+            Kind::Leaf(items) => {
+                let (i, j) = leaf::find_row(items, off, key)?;
                 let Open::Leaf(mut e) = Self::open(t) else { unreachable!() };
-                e.remove(i);
+                leaf::remove_at(&mut e, i, j);
                 Some(if e.is_empty() { Tree::new() } else { Self::leaf(e) })
             }
             Kind::Split { col, pivot, children } => {
@@ -254,6 +288,38 @@ where
                 Some(Self::make(col, pivot, lo, hi))
             }
             Kind::Internal { .. } => unreachable!("a k-d remove met a B+ internal node"),
+        }
+    }
+
+    /// **Reserve `span`'s keys as a hole**, in the k-d layout (see
+    /// [`reserve`](Tree::reserve)). The hole is routed down the splits, cut at
+    /// any pivot that falls inside it, and merged into the leaves it reaches.
+    pub fn kd_reserve(&self, span: Span<Tuple>) -> Option<Self> {
+        if span.n == 0 {
+            return Some(self.clone());
+        }
+        if !self.free(&span) {
+            return None;
+        }
+        Some(Self::kd_put(self, vec![Item::Hole(span)]))
+    }
+
+    /// `items`, in `t`'s parent frame and holding no key `t` holds, merged
+    /// into the subtree under `t`.
+    fn kd_put(t: &Self, items: Vec<Item<Tuple, V>>) -> Self {
+        if items.is_empty() {
+            return t.clone();
+        }
+        if t.is_empty() {
+            return Self::build(items);
+        }
+        match Self::open(t) {
+            Open::Leaf(e) => Self::build(leaf::merge(e, items)),
+            Open::Split(col, pivot, [lo, hi]) => {
+                let (a, b) = leaf::split_on(items, col, &pivot);
+                Self::split_node(col, pivot, Self::kd_put(&lo, a), Self::kd_put(&hi, b))
+            }
+            Open::Internal(..) => unreachable!("a k-d reserve met a B+ internal node"),
         }
     }
 
@@ -372,16 +438,15 @@ where
             }
         }
         match Self::open(t) {
-            Open::Leaf(mut e) => {
-                let i = e.partition_point(|(k, _)| k < key);
-                if i == 0 {
+            Open::Leaf(e) => {
+                let (l, r) = leaf::split_at(e, key);
+                if l.is_empty() {
                     return (Tree::new(), t.clone());
                 }
-                if i == e.len() {
+                if r.is_empty() {
                     return (t.clone(), Tree::new());
                 }
-                let r = e.split_off(i);
-                (Self::leaf(e), Self::leaf(r))
+                (Self::leaf(l), Self::leaf(r))
             }
             Open::Split(0, pivot, [lo, hi]) => {
                 if *key <= pivot {
@@ -471,13 +536,21 @@ where
             return;
         }
         match n.kind() {
-            Kind::Leaf(entries) => {
-                for (k, v) in entries {
-                    let k = moved(k, off);
-                    let Some(x) = cell(&k, col) else { continue };
-                    let x = pivot_of(x.clone());
-                    if *lo <= x && x < *hi {
-                        out.push((k.into_owned(), v.clone()));
+            Kind::Leaf(items) => {
+                for it in items {
+                    if it.rows() > 1 {
+                        // A run is placed by its own extent before its rows.
+                        let m = it.measure::<M>().displace(off);
+                        if m.side_of(col, lo) == Some(true) || m.side_of(col, hi) == Some(false) {
+                            continue;
+                        }
+                    }
+                    for (k, v) in it.each_row(off) {
+                        let Some(x) = cell(&k, col) else { continue };
+                        let x = pivot_of(x.clone());
+                        if *lo <= x && x < *hi {
+                            out.push((k, v.clone()));
+                        }
                     }
                 }
             }
@@ -508,17 +581,24 @@ pub(super) fn kd_height_of<K, V, M>(t: &Tree<K, V, M>) -> usize {
     }
 }
 
-/// The column of widest spread among `entries` (at least two, distinct keys).
+/// What an item weighs in a median: its rows, or the keys a hole reserves.
+fn weight<V>(it: &Item<Tuple, V>) -> u64 {
+    it.rows() + it.reserved()
+}
+
+/// The column of widest spread among `items` (at least two keys, distinct).
 ///
 /// A numeric column (every cell an entity, every cell an integer, or every
 /// cell a float) spreads as far as its range; the widest positive range wins,
 /// the lower column on a tie. Only if none varies does a column of anything
-/// else count, by its number of distinct cells (a missing cell is one).
-fn widest<V>(entries: &[(Tuple, V)]) -> usize {
-    let arity = entries.iter().map(|(k, _)| k.as_slice().len()).max().unwrap_or(0);
+/// else count, by its number of distinct cells (a missing cell is one). A run
+/// moves linearly, so its first and last keys bound it in every column.
+fn widest<V>(items: &[Item<Tuple, V>]) -> usize {
+    let ends: Vec<Tuple> = items.iter().flat_map(|it| [it.lo_key().clone(), it.hi_key().into_owned()]).collect();
+    let arity = ends.iter().map(|k| k.as_slice().len()).max().unwrap_or(0);
     let mut best: Option<(usize, f64)> = None;
     for col in 0..arity {
-        if let Some(range) = numeric_range(entries, col) {
+        if let Some(range) = numeric_range(&ends, col) {
             if range > 0.0 && best.is_none_or(|(_, r)| range > r) {
                 best = Some((col, range));
             }
@@ -529,7 +609,7 @@ fn widest<V>(entries: &[(Tuple, V)]) -> usize {
     }
     let mut best: Option<(usize, usize)> = None;
     for col in 0..arity {
-        let mut cells: Vec<Option<&Value>> = entries.iter().map(|(k, _)| cell(k, col)).collect();
+        let mut cells: Vec<Option<&Value>> = ends.iter().map(|k| cell(k, col)).collect();
         cells.sort();
         cells.dedup();
         let distinct = cells.len();
@@ -540,9 +620,9 @@ fn widest<V>(entries: &[(Tuple, V)]) -> usize {
     best.map(|(col, _)| col).expect("distinct keys differ in some column")
 }
 
-/// The range of column `col` if every entry holds a number of one kind there.
-fn numeric_range<V>(entries: &[(Tuple, V)], col: usize) -> Option<f64> {
-    let mut cells = entries.iter().map(|(k, _)| cell(k, col));
+/// The range of column `col` if every key holds a number of one kind there.
+fn numeric_range(keys: &[Tuple], col: usize) -> Option<f64> {
+    let mut cells = keys.iter().map(|k| cell(k, col));
     match cells.next()?? {
         Value::Ent(first) => {
             let (mut lo, mut hi) = (first.0, first.0);
@@ -575,33 +655,79 @@ fn numeric_range<V>(entries: &[(Tuple, V)], col: usize) -> Option<f64> {
     }
 }
 
-/// Where to cut `entries`, sorted by column `col`: the index of the first
-/// entry at or above the pivot, and the pivot, nearest the median that leaves
-/// both sides non-empty. The column must hold at least two distinct cells.
-fn cut<V>(entries: &[(Tuple, V)], col: usize) -> (usize, Value) {
-    let n = entries.len();
-    let m = n / 2;
-    let at = cell(&entries[m].0, col);
-    // Pivot at the median's own cell: everything strictly below it goes left.
-    let i1 = entries.partition_point(|(k, _)| cell(k, col) < at);
-    // Pivot at the next cell above it: the median's run goes left too.
-    let i2 = entries.partition_point(|(k, _)| cell(k, col) <= at);
-    let ok1 = at.is_some() && i1 > 0;
-    let ok2 = i2 < n;
-    let i = match (ok1, ok2) {
-        (true, true) => {
-            if m.abs_diff(i1) <= i2.abs_diff(m) {
-                i1
+/// How much of `items` weighs below a pivot `p` on column `col`. A run moves
+/// linearly, so the keys below the pivot are a prefix of it or a suffix,
+/// found by bisection.
+fn weight_below<V>(items: &[Item<Tuple, V>], col: usize, p: &Tuple) -> u64 {
+    let below = |k: &Tuple| k.cmp_column(col, p, 0) == Ordering::Less;
+    items
+        .iter()
+        .map(|it| match it {
+            Item::One(k, _) => u64::from(below(k)),
+            Item::Run(s, _) | Item::Hole(s) => {
+                let first = below(&s.first);
+                let (mut a, mut b) = (0u64, s.n);
+                while a < b {
+                    let mid = a + (b - a) / 2;
+                    if below(&s.row(mid)) == first {
+                        a = mid + 1;
+                    } else {
+                        b = mid;
+                    }
+                }
+                if first { a } else { s.n - a }
+            }
+        })
+        .sum()
+}
+
+/// A pivot on column `col` nearest the weighted median of `items` that leaves
+/// weight on both sides. The column must hold at least two distinct cells.
+fn median<V>(items: &[Item<Tuple, V>], col: usize) -> Value {
+    let total: u64 = items.iter().map(weight).sum();
+    // Every cell a run or hole can step is an entity or integer: find the
+    // pivot by bisection on the value. Anything else is constant per item.
+    let ends: Vec<Tuple> = items.iter().flat_map(|it| [it.lo_key().clone(), it.hi_key().into_owned()]).collect();
+    let ints: Option<Vec<(bool, i128)>> = ends
+        .iter()
+        .map(|k| match cell(k, col)? {
+            Value::Ent(e) => Some((true, e.0 as i128)),
+            Value::Int(n) => Some((false, *n as i128)),
+            _ => None,
+        })
+        .collect();
+    if let Some(ints) = ints.filter(|v| v.iter().all(|(e, _)| *e == v[0].0)) {
+        let ent = ints[0].0;
+        let at = |x: i128| if ent { Value::Ent(grmpl_core::Entity(x as u64)) } else { Value::Int(x as i64) };
+        let (lo, hi) = (ints.iter().map(|x| x.1).min().unwrap(), ints.iter().map(|x| x.1).max().unwrap());
+        // The least pivot in (lo, hi] with half the weight below it.
+        let (mut a, mut b) = (lo + 1, hi);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if 2 * weight_below(items, col, &pivot_of(at(mid))) >= total {
+                b = mid;
             } else {
-                i2
+                a = mid + 1;
             }
         }
-        (true, false) => i1,
-        (false, true) => i2,
-        (false, false) => unreachable!("the column holds at least two distinct cells"),
-    };
-    let pivot = cell(&entries[i].0, col).expect("a cell at or above another is present").clone();
-    (i, pivot)
+        return at(a);
+    }
+    // Constant cells: the weighted median among them, nudged so both sides
+    // keep weight.
+    let mut cells: Vec<(Option<Value>, u64)> = items.iter().map(|it| (cell(it.lo_key(), col).cloned(), weight(it))).collect();
+    cells.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut acc = 0;
+    let mut pick = None;
+    for (i, (c, w)) in cells.iter().enumerate() {
+        if i > 0 && c.is_some() && cells[i - 1].0 != *c && acc > 0 {
+            pick = c.clone();
+            if 2 * acc >= total {
+                break;
+            }
+        }
+        acc += w;
+    }
+    pick.expect("the column holds at least two distinct cells")
 }
 
 /// One item of a [`kd_diff_into`](Tree::kd_diff_into) side: a whole subtree
@@ -654,7 +780,7 @@ fn side_of<K: Ord>(region: &Region<K>, col: usize, pivot: &K) -> Option<bool> {
 impl<K, V, M> Tree<K, V, M>
 where
     K: Ord + Displace,
-    V: Clone,
+    V: RunValue,
     M: Measure<K, V>,
 {
     /// [`diff`](Tree::diff) for k-d trees, **shape-independent** as the B+
@@ -754,20 +880,23 @@ where
             None => {}
         }
         match n.kind() {
-            Kind::Leaf(entries) => {
-                let sides: Vec<bool> =
-                    entries.iter().map(|(k, _)| moved(k, off).cmp_column(col, pivot, 0) == Ordering::Less).collect();
-                if sides.iter().all(|b| *b) {
+            Kind::Leaf(items) => {
+                // A run moves linearly, so its two ends say which side it is on
+                // unless the pivot falls inside it.
+                let below = |k: &K| k.displace(off).cmp_column(col, pivot, 0) == Ordering::Less;
+                let sides: Vec<(bool, bool)> = items.iter().map(|it| (below(it.lo_key()), below(&it.hi_key()))).collect();
+                if sides.iter().all(|&(a, b)| a && b) {
                     lo.push(Piece::Node(t, poff, narrowed(&region, col, pivot, true)));
-                } else if sides.iter().all(|b| !*b) {
+                } else if sides.iter().all(|&(a, b)| !a && !b) {
                     hi.push(Piece::Node(t, poff, narrowed(&region, col, pivot, false)));
                 } else {
-                    for ((k, v), below) in entries.iter().zip(sides) {
-                        let e = Piece::Entry(moved(k, off).into_owned(), v);
-                        if below {
-                            lo.push(e);
-                        } else {
-                            hi.push(e);
+                    for it in items {
+                        for (k, v) in it.each_row(off) {
+                            let e = Piece::Entry(k, v);
+                            match &e {
+                                Piece::Entry(k, _) if k.cmp_column(col, pivot, 0) == Ordering::Less => lo.push(e),
+                                _ => hi.push(e),
+                            }
                         }
                     }
                 }
@@ -892,7 +1021,7 @@ fn cancel_shared<'a, K, V, M>(
 impl<K, V, M> Tree<K, V, M>
 where
     K: Ord + Displace + std::fmt::Debug,
-    V: Clone,
+    V: RunValue,
     M: Measure<K, V>,
 {
     /// Assert the k-d invariants through the displaced frames: no B+ internal
@@ -915,18 +1044,21 @@ where
         let n = t.root.as_deref().expect("no empty subtree in a k-d tree");
         let off = off.wrapping_add(t.dsp);
         match n.kind() {
-            Kind::Leaf(entries) => {
-                assert!(!entries.is_empty(), "empty leaf");
-                assert!(entries.len() <= B, "leaf over arity");
-                assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "leaf out of order");
-                for (k, _) in entries {
-                    let k = k.displace(off);
-                    for (col, pivot, below) in sides.iter() {
-                        let is_below = k.cmp_column(*col, pivot, 0) == Ordering::Less;
-                        assert_eq!(is_below, *below, "key {k:?} on the wrong side of a split on {col} at {pivot:?}");
+            Kind::Leaf(items) => {
+                assert!(!items.is_empty(), "empty leaf");
+                assert!(items.len() <= B, "leaf over arity");
+                leaf::check_items(items);
+                // A run moves linearly: its ends bound it on every side.
+                for it in items {
+                    for k in [it.lo_key().displace(off), it.hi_key().displace(off)] {
+                        for (col, pivot, below) in sides.iter() {
+                            let is_below = k.cmp_column(*col, pivot, 0) == Ordering::Less;
+                            assert_eq!(is_below, *below, "key {k:?} on the wrong side of a split on {col} at {pivot:?}");
+                        }
                     }
                 }
-                assert_eq!(n.size, entries.len());
+                let (_, size, reserved) = leaf::summary::<K, V, M>(items);
+                assert_eq!((n.size, n.reserved), (size, reserved));
             }
             Kind::Split { col, pivot, children } => {
                 let p = pivot.displace(off);
@@ -936,6 +1068,7 @@ where
                     sides.pop();
                 }
                 assert_eq!(n.size, children[0].len() + children[1].len(), "cached size disagrees with the children");
+                assert_eq!(n.reserved, children[0].reserved() + children[1].reserved(), "cached holes disagree");
             }
             Kind::Internal { .. } => panic!("a B+ internal node inside a k-d tree"),
         }

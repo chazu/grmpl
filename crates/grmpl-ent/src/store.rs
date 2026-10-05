@@ -118,6 +118,8 @@ enum PatchRecord {
     Graft { rels: Vec<u32>, block: (u64, u64), shift: i64, origin: Origin },
 }
 
+crate::run_values_by_eq!(PatchRecord);
+
 /// Where a merge replayed a patch from: the `(branch, edition)` it was first
 /// committed at. `None` for a patch first committed here. A later merge skips
 /// a copy whose original it reaches, so nothing is replayed twice.
@@ -206,6 +208,8 @@ enum LogEntry {
     Graft(Tuple, Tuple),
 }
 
+crate::run_values_by_eq!(LogEntry);
+
 impl Persist for LogEntry {
     fn encode(&self, e: &mut Enc<'_, '_>) {
         match self {
@@ -280,6 +284,13 @@ struct RelRoots {
     /// maintained with every commit, so the cost is paid only for columns some
     /// query actually asks about.
     orders: OrderTree,
+}
+
+/// Relations' roots are never a run's shared value.
+impl crate::tree::RunValue for RelRoots {
+    fn same(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 /// A relation's roots persist as three links, so a Rel enfilade leaf names its
@@ -605,6 +616,13 @@ struct Inner {
     layout: Layout,
     /// **The layout directory**: relations laid out otherwise.
     layouts: LayoutTree,
+}
+
+/// A branch's state is never a run's shared value.
+impl crate::tree::RunValue for Inner {
+    fn same(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 /// A branch's state persists as its clock and links to its trees. The canopy
@@ -2530,14 +2548,8 @@ fn pieces(t: &FactTree, lo: &Tuple, hi: &Tuple) -> Vec<(ContentKey, i64, usize)>
                 out.push((ck, off, t.len()));
                 return;
             }
-            if let Some(crate::tree::NodeRef::Leaf(entries)) = t.node() {
-                let n = entries
-                    .iter()
-                    .filter(|(k, _)| {
-                        let k = k.displace(off);
-                        &k >= lo && &k < hi
-                    })
-                    .count();
+            if let Some(crate::tree::NodeRef::Leaf(items)) = t.node() {
+                let n = crate::tree::leaf::count_in(items, off, lo, hi);
                 if n > 0 {
                     out.push((ck, off, n));
                 }
@@ -2577,14 +2589,8 @@ fn pieces(t: &FactTree, lo: &Tuple, hi: &Tuple) -> Vec<(ContentKey, i64, usize)>
             return;
         }
         match t.node() {
-            Some(crate::tree::NodeRef::Leaf(entries)) => {
-                let n = entries
-                    .iter()
-                    .filter(|(k, _)| {
-                        let k = k.displace(off);
-                        &k >= lo && &k < hi
-                    })
-                    .count();
+            Some(crate::tree::NodeRef::Leaf(items)) => {
+                let n = crate::tree::leaf::count_in(items, off, lo, hi);
                 if n > 0 {
                     out.push((ck, off, n));
                 }

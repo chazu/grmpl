@@ -264,8 +264,10 @@ fn frames(n: u64, copy: u64) -> (u64, u64) {
         // has the k-d layout's.
         store.set_default_layout(Layout::Ordered).unwrap();
         let ids: Vec<u64> = (0..n).chain(1_000_000..1_000_000 + copy).collect();
+        // Irregular tags, so no run folds the rows: these bounds are about
+        // copies the compare must read row by row.
         for chunk in ids.chunks(5_000) {
-            store.commit(&chunk.iter().map(|&e| (R, row(e, 0), 1)).collect::<Vec<_>>()).unwrap();
+            store.commit(&chunk.iter().map(|&e| (R, row(e, (e * e % 97) as i64), 1)).collect::<Vec<_>>()).unwrap();
         }
         let a = store.current();
         (a, store.instance_template(&[R], 1_000_000, 1_000_000 + copy, 4_000_000).unwrap())

@@ -243,8 +243,8 @@ mod tests {
     /// find both versions, not only the roots at the top of the climb.
     #[test]
     fn a_root_that_is_also_an_inner_node_is_found_as_both() {
-        let leaf = T::leaf_of(vec![(t(1), 1), (t(2), 1)]);
-        let other = T::leaf_of(vec![(t(5), 1)]);
+        let leaf = T::leaf_of(vec![crate::tree::Item::One(t(1), 1), crate::tree::Item::One(t(2), 1)]);
+        let other = T::leaf_of(vec![crate::tree::Item::One(t(5), 1)]);
         let parent = T::internal_of(vec![t(5)], vec![leaf.clone(), other]);
         let dag = Dag::new();
         let mut h = History::default();

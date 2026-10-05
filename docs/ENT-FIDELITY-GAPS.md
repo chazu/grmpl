@@ -5,14 +5,15 @@ Gold's Ent, as the source shows it. Each Gold gap is backed by the line-by-line
 audit [`ENT-GOLD-AUDIT.md`](ENT-GOLD-AUDIT.md). Gaps against `idea.md`'s
 extrapolations of the Ent are kept separately below, since they are not Gold.
 Update this file when a gap closes or a new one is found.
-**Last updated:** 2026-10-04, after step 6 (k-d splits).
+**Last updated:** 2026-10-04, after step 7 (run leaves).
 
 The step reports say what each step built and what it cost:
 [`ENT-FIDELITY-STEP-2.md`](ENT-FIDELITY-STEP-2.md),
 [`ENT-FIDELITY-STEP-3.md`](ENT-FIDELITY-STEP-3.md),
 [`ENT-FIDELITY-STEP-4.md`](ENT-FIDELITY-STEP-4.md),
-[`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md) and
-[`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md).
+[`ENT-FIDELITY-STEP-5.md`](ENT-FIDELITY-STEP-5.md),
+[`ENT-FIDELITY-STEP-6.md`](ENT-FIDELITY-STEP-6.md) and
+[`ENT-FIDELITY-STEP-7.md`](ENT-FIDELITY-STEP-7.md).
 
 ---
 
@@ -48,14 +49,15 @@ measurements before it counts as closed, as in steps 2–3.
 | G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ⛔ declined as a faithful build ([below](#declined-canopies-and-recorders-g5-g6)); watches are relational, a different thing |
 | G7 | **The Agenda:** persistent, crash-resumable background work | ⏸ only as needed: one job (history indexing) runs deferred, in bounded durable steps. Gold's other big users of the Agenda were canopy propagation and recorder triggers, now declined |
 | G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ✅ step 6: a per-relation k-d layout of binary splits, beside the B+ one. Every column prunes, at about √n for a read on any one column |
-| G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ❌ |
+| G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ✅ step 7: leaves of items. A run (rows stepped by a per-column stride, one value) is run-length and lazy at once; a hole is a minimal partial loaf. Runs form by themselves. They coarsen identity, since grmpl's identity is node sharing |
 | G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
 | G11 | **Unloading clean nodes** back to stubs | ❌ (a paged node never unloads) |
 
 Already faithful: versions as roots, the persisted version DAG (tree case),
 `isLE`-style ancestry, `O(1)` relocation, copy by sharing subtrees, paged stubs,
 one root with everything beneath it, since step 4 the history layer, and since
-step 5 merges in the version DAG, and since step 6 splits on any column.
+step 5 merges in the version DAG, since step 6 splits on any column, and
+since step 7 run-length, lazy and partial leaves.
 
 ### Identity compare is complete ✅ (fixed 2026-10-04, after step 6)
 

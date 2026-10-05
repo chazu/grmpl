@@ -23,8 +23,10 @@ fn ent(n: u64) -> Value {
     Value::Ent(Entity(n))
 }
 
+/// A row with an irregular tag, so no run folds a block into one item: these
+/// laws are about sharing nodes, which a run coarsens to one leaf.
 fn row(e: u64) -> Tuple {
-    Tuple::from([ent(e), Value::Int(0)])
+    Tuple::from([ent(e), Value::Int((e * e % 97) as i64)])
 }
 
 const N: u64 = 20_000;

@@ -650,3 +650,26 @@ of the leaves. Sorted output costs a sort (ten-fold on `read_at`). Commits and
 grafts cost the same, since a commit is bound by its `fsync`. At 10k rows the
 shape is the same at a smaller scale (box: 319 frames against 23; lead read: 5
 against 94).
+
+## 13. Run leaves (Ent-fidelity step 7)
+
+`entbench runs`: one relation of 100k `(entity, tag)` rows in 1,000-row
+commits, B+ layout. *Regular* rows share a tag, so they fold into runs;
+*irregular* rows carry a tag no step repeats, so they cannot. Cold reads on a
+reopened store; release build, one run each.
+
+| | regular (runs) | irregular (rows) |
+|---|---|---|
+| nodes stored after consolidation | 5 | 3,229 |
+| 1,000-row range, cold | 3 frames, 60 µs | 39 frames, 132 µs |
+| `read_at` the whole relation | 5.4 ms | 2.4 ms |
+| commit of two rows inside the block | 6 frames written | 11 frames written |
+| compare across that commit, cold | 4 frames | 23 frames |
+| `backfollow` of a 1,000-row template after a graft | finds 0 rows of the copy | finds 896 rows |
+
+Runs fold the relation into a handful of nodes, so ranges, edits and compares
+read almost nothing. Two costs come with them. A full scan computes every row
+(each a fresh tuple), about twice the time of copying stored ones. And
+identity, which is node sharing, coarsens to the run's leaf: the template and
+its copy no longer share a node, so sharing-based provenance finds nothing of
+the copy.
