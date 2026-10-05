@@ -345,11 +345,17 @@ where
     /// A new tree with `key → val` inserted or replaced. Persistent: the prior
     /// tree is unchanged and shares every untouched subtree.
     pub fn insert(&self, key: K, val: V) -> Self {
+        self.insert_with(key, val, false)
+    }
+
+    /// [`insert`](Self::insert), folding rows into runs if `runs` ([`leaf`]):
+    /// what a relation that opted into runs writes with.
+    pub fn insert_with(&self, key: K, val: V, runs: bool) -> Self {
         debug_assert!(!self.is_kd(), "a B+ insert into a k-d tree");
         if self.root.is_none() {
             return Self::leaf(vec![Item::One(key, val)]);
         }
-        match Self::ins(self, key, val) {
+        match Self::ins(self, key, val, runs) {
             Ins::Done(t) => t,
             Ins::Split(l, sep, r) => Self::internal(vec![sep], vec![l, r]),
         }
@@ -814,9 +820,9 @@ where
     /// A rewritten leaf, its runs folded and split in two if it overflowed:
     /// a block written row by row ends as one item, not a chain of full
     /// leaves.
-    fn finish_leaf(mut e: Vec<Item<K, V>>) -> Ins<K, V, M> {
+    fn finish_leaf(mut e: Vec<Item<K, V>>, runs: bool) -> Ins<K, V, M> {
         if e.len() > B {
-            leaf::compress(&mut e);
+            leaf::compress(&mut e, runs);
         }
         if e.len() <= B {
             return Ins::Done(if e.is_empty() { Tree::new() } else { Self::leaf(e) });
@@ -904,15 +910,15 @@ where
 
     /// Insert into the subtree under `t`; `key` and the result are in `t`'s
     /// parent frame.
-    fn ins(t: &Self, key: K, val: V) -> Ins<K, V, M> {
+    fn ins(t: &Self, key: K, val: V, runs: bool) -> Ins<K, V, M> {
         match Self::open(t) {
             Open::Leaf(mut e) => {
-                leaf::insert(&mut e, key, val);
-                Self::finish_leaf(e)
+                leaf::insert(&mut e, key, val, runs);
+                Self::finish_leaf(e, runs)
             }
             Open::Internal(mut ks, mut ch) => {
                 let i = child_index(&ks, 0, &key);
-                match Self::ins(&ch[i], key, val) {
+                match Self::ins(&ch[i], key, val, runs) {
                     Ins::Done(c) => {
                         ch[i] = c;
                         // Joining runs can leave a leaf fewer items than before.
@@ -947,7 +953,7 @@ where
                 let (i, j) = leaf::find_row(items, off, key)?;
                 let Open::Leaf(mut e) = Self::open(t) else { unreachable!() };
                 leaf::remove_at(&mut e, i, j);
-                Some(Self::finish_leaf(e))
+                Some(Self::finish_leaf(e, false))
             }
             Kind::Internal { keys, children } => {
                 let i = child_index(keys, off, key);

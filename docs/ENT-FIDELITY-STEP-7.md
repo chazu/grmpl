@@ -1,7 +1,8 @@
 # Ent fidelity, step 7: run-length, lazy and partial leaves
 
-**Status:** on the working tree, format v10 (a fresh-store cutover: a leaf is
-a run of tagged items, and every child and link records its reserved keys).
+**Status:** landed on `main`, format v10 (a fresh-store cutover: a leaf is
+a run of tagged items, and every child and link records its reserved keys);
+runs made opt-in per relation in format v11 (§6).
 **Question it set out to answer:** Gold's content tree ends in loaves of
 several kinds. A `RegionLoaf` maps a whole region to one shared range
 element, an `OVirtualLoaf` holds a primitive array and fakes an object per key
@@ -21,6 +22,8 @@ This closes gap G9 (see [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md)).
   `0` holds a column fixed). That covers `kind(e, "room")` over a block, and
   exits whose entity cells all move together, as a displacement moves them.
 * **Runs form by themselves.** No API changes.
+* **Then, after measuring: runs are opt-in per relation, off by default**
+  (§6).
 * **A minimal partial leaf**: keys reserved but unfilled.
 
 ## 2. What was built
@@ -118,13 +121,26 @@ From [`PERFORMANCE-ENT.md`](PERFORMANCE-ENT.md) §13, 100k rows, B+ layout:
   that splits a leaf under a displaced node, which only the first remove on a
   path can meet, since a path copy pushes displacements down.
 
-## 6. Not done
+## 6. Runs became opt-in
+
+The measurements in §4 settled what runs are for. They pay only where rows
+form arithmetic patterns (blocks of ids sharing a value, exits whose entity
+cells step together), and there they cost provenance, which is the Ent's
+point. So a relation's rows fold only if it asks: `set_runs(rel, true)`, or a
+branch's `set_default_runs`. The choice is held with the layout as the
+relation's **shape** (format v11): fixed once the relation is written,
+durable, carried by forks and united by merges. With runs off, a relation is
+exactly as it was before this step, provenance included; with runs on over
+rows that cannot fold, nothing measurable changes. The conformance suite runs
+every law of the language on a third substrate, `ent-runs`, so the mechanism
+stays exercised whoever opts in.
+
+## 7. Not done
 
 * **Long runs as their own nodes.** Gold's region loaf is a node, not an item.
-  Giving a long run a leaf of its own would recover identity at run grain, so
-  a graft that copies a whole run would share it. It needs B+ occupancy rules
-  for a leaf that holds one item and many rows, and fusing rules that do not
-  fold small leaves into it. This is the open design question of this step.
+  Giving a long run a leaf of its own would recover identity at run grain. It
+  needs B+ occupancy rules for a leaf that holds one item and many rows.
+  Declined for now: with runs opt-in, its payoff is narrow.
 * **Iteration allocates a tuple per computed row.** Stepping from the
   previous row in place would close most of the 2× on full scans.
 * **Holes have no store writer.** Reserving keys at the store needs an

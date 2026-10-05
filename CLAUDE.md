@@ -126,10 +126,15 @@ row `i` being the first key stepped `i` times by a per-column stride, one
 value), or a **hole** (keys reserved, holding no rows; Gold's
 `OPartialLoaf`).
 
+* **Runs are opt-in per relation, off by default** (`set_runs`, or a
+  branch's `set_default_runs`, held with the layout in the relation's
+  **shape**: fixed once written, carried by forks and merges). Every tree
+  write takes the flag; without it rows never fold.
 * **A run is a representation, never a change.** It holds exactly the rows it
-  computes; every read answers as if they were rows. Runs form by themselves:
-  a row that continues a run joins it, three rows in a step become one, a leaf
-  folds its runs before it splits, and a write inside a run splits it.
+  computes; every read answers as if they were rows. Where a relation opts
+  in, runs form by themselves: a row that continues a run joins it, three
+  rows in a step become one, a leaf folds its runs before it splits, and a
+  write inside a run splits it.
 * **Items in a leaf never interleave.** In the k-d layout a run's key range
   can enclose keys of another leaf, so a rebuild cuts runs apart
   (`leaf::disjoint`) before it makes a leaf.
@@ -141,8 +146,9 @@ value), or a **hole** (keys reserved, holding no rows; Gold's
   writing a row at a hole's key fills it.
 * **Runs coarsen identity.** A run makes one leaf hold many rows, so sharing,
   which is by node, is found at that coarser grain: `backfollow` and
-  `shared_region` find less of a copy whose rows folded. Laws about sharing use
-  rows that cannot fold.
+  `shared_region` find less of a copy whose rows folded. That is why they are
+  opt-in. The conformance suite runs every law on an `ent-runs` substrate
+  too.
 
 ### Extents and the spanfilade (`grmpl-ent::measure`, `spanfilade`)
 

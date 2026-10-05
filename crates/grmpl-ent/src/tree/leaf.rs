@@ -19,12 +19,18 @@
 //!   `OPartialLoaf`'s placeholders are. Reads skip a hole; writing a row at
 //!   one of its keys fills that key.
 //!
-//! **Runs form by themselves.** A row that continues the run before it, or
+//! **Runs form by themselves, where a tree asks for them.** A relation opts in
+//! (`EntStore::set_runs`); every write here takes a `runs` flag, and without
+//! it rows never fold. With it, a row that continues the run before it, or
 //! starts the one after it, joins it; three rows in a step become a run; a
 //! leaf that overflows folds its runs before it splits; a write inside a run
 //! splits it around the row. So a block of ids loaded row by row ends as one
 //! item, and the tree's balance and arity count items, not rows. A key type
 //! whose [`stride_to`](Displace::stride_to) is `None` never forms a run.
+//!
+//! Runs are opt-in because they coarsen identity, which is node sharing: a
+//! relation folded into a few nodes leaves `backfollow` and the identity
+//! compare nothing to find of its copies (`docs/ENT-FIDELITY-STEP-7.md`).
 //!
 //! Every function here takes a leaf's items in their stored frame and an
 //! offset carrying them to the caller's, as the tree's walks do: stored keys
@@ -430,7 +436,7 @@ fn split_item<K: Displace, V: Clone>(item: &Item<K, V>, key: &K) -> Halves<K, V>
 /// `key → val` written into `items`: a row replaced, a run or hole split
 /// around it (writing a hole's key fills it), or a new row; then joined with
 /// the runs around it.
-pub fn insert<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, key: K, val: V) {
+pub fn insert<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, key: K, val: V, runs: bool) {
     /// What the write does to the item that could hold the key.
     enum Act {
         Front,
@@ -485,7 +491,7 @@ pub fn insert<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, key: K, val
             at
         }
     };
-    join_around(items, at);
+    join_around(items, at, runs);
 }
 
 /// Where the row at `key` (items moved up by `off`) is: its item, and its
@@ -551,7 +557,7 @@ pub fn disjoint<K: Displace, V: Clone>(mut items: Vec<Item<K, V>>) -> Vec<Item<K
 /// `b`'s items placed among `a`'s, and the result joined. Each item of `b`
 /// must lie in a key range holding none of `a`'s keys, though it may fall
 /// between two rows of one of `a`'s runs, which is cut around it.
-pub fn merge<K: Displace, V: RunValue>(a: Vec<Item<K, V>>, b: Vec<Item<K, V>>) -> Vec<Item<K, V>> {
+pub fn merge<K: Displace, V: RunValue>(a: Vec<Item<K, V>>, b: Vec<Item<K, V>>, runs: bool) -> Vec<Item<K, V>> {
     let mut out = a;
     for it in b {
         let (mut lo, hi) = split_at(out, it.lo_key());
@@ -559,7 +565,7 @@ pub fn merge<K: Displace, V: RunValue>(a: Vec<Item<K, V>>, b: Vec<Item<K, V>>) -
         lo.extend(hi);
         out = lo;
     }
-    compress(&mut out);
+    compress(&mut out, runs);
     out
 }
 
@@ -593,15 +599,15 @@ fn triple<K: Displace, V: RunValue>(a: &Item<K, V>, b: &Item<K, V>, c: &Item<K, 
 }
 
 /// Join the items around index `at` while any pair or triple there continues
-/// one another.
-fn join_around<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, at: usize) {
+/// one another. Without `runs`, only holes join: rows never fold.
+fn join_around<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, at: usize, runs: bool) {
     let mut at = at.min(items.len().saturating_sub(1));
     loop {
         let lo = at.saturating_sub(2);
         let hi = (at + 2).min(items.len().saturating_sub(1));
         let mut changed = false;
         for i in lo..=hi {
-            if i + 2 < items.len() {
+            if runs && i + 2 < items.len() {
                 if let Some(r) = triple(&items[i], &items[i + 1], &items[i + 2]) {
                     items.splice(i..i + 3, [r]);
                     at = i;
@@ -610,7 +616,7 @@ fn join_around<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, at: usize)
                 }
             }
             if i + 1 < items.len() {
-                if let Some(r) = joined(&items[i], &items[i + 1]) {
+                if let Some(r) = joined(&items[i], &items[i + 1]).filter(|r| runs || matches!(r, Item::Hole(_))) {
                     items.splice(i..i + 2, [r]);
                     at = i;
                     changed = true;
@@ -624,11 +630,12 @@ fn join_around<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, at: usize)
     }
 }
 
-/// Fold every run the items hold: what a leaf does before it splits.
-pub fn compress<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>) {
+/// Fold every run the items hold (with `runs`; else join only holes): what a
+/// leaf does before it splits.
+pub fn compress<K: Displace, V: RunValue>(items: &mut Vec<Item<K, V>>, runs: bool) {
     let mut i = 0;
     while i < items.len() {
-        join_around(items, i);
+        join_around(items, i, runs);
         i += 1;
     }
 }

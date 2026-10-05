@@ -49,7 +49,7 @@ measurements before it counts as closed, as in steps 2–3.
 | G6 | **Recorders:** standing backfollow queries, past then future, into a trail | ⛔ declined as a faithful build ([below](#declined-canopies-and-recorders-g5-g6)); watches are relational, a different thing |
 | G7 | **The Agenda:** persistent, crash-resumable background work | ⏸ only as needed: one job (history indexing) runs deferred, in bounded durable steps. Gold's other big users of the Agenda were canopy propagation and recorder triggers, now declined |
 | G8 | **Splits on any dimension** (k-d-like `SplitLoaf`s) | ✅ step 6: a per-relation k-d layout of binary splits, beside the B+ one. Every column prunes, at about √n for a read on any one column |
-| G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ✅ step 7: leaves of items. A run (rows stepped by a per-column stride, one value) is run-length and lazy at once; a hole is a minimal partial loaf. Runs form by themselves. They coarsen identity, since grmpl's identity is node sharing |
+| G9 | **Lazy and run-length leaves:** region, virtual and partial loaves | ✅ step 7: leaves of items. A run (rows stepped by a per-column stride, one value) is run-length and lazy at once; a hole is a minimal partial loaf. Runs are opt-in per relation, off by default, because they coarsen identity, which in grmpl is node sharing |
 | G10 | **Per-dimension dsps** (`GenericCrossDsp`) | ❌ (one shift for every entity cell) |
 | G11 | **Unloading clean nodes** back to stubs | ❌ (a paged node never unloads) |
 

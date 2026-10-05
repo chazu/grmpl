@@ -453,16 +453,17 @@ fn main() {
 }
 
 /// **G9: run leaves.** One relation of 100k rows, loaded in 1 000-row commits,
-/// two ways: regular (`(room, 0)`, which folds into runs) and irregular (a tag
-/// no step repeats). Then reads, an edit inside the block, a compare across
-/// it, and what backfollow finds of a template after a graft.
+/// three ways: regular rows (`(room, 0)`) with runs on, the same with runs off
+/// (the default), and irregular rows (a tag no step repeats) with runs on.
+/// Then reads, an edit inside the block, a compare across it, and what
+/// backfollow finds of a template after a graft.
 fn runs() {
     header(
         "Runs — rows that fold against rows that cannot",
         "100k rows, B+ layout; cold reads on a reopened store.",
     );
     let n = 100_000u64;
-    for (label, regular) in [("regular", true), ("irregular", false)] {
+    for (label, regular, runs) in [("regular, runs", true, true), ("regular, no runs", true, false), ("irregular, runs", false, true)] {
         let fact = move |e: u64| {
             let tag = if regular { 0 } else { (e * e % 97) as i64 };
             Tuple::from([Value::Ent(Entity(e)), Value::Int(tag)])
@@ -470,6 +471,7 @@ fn runs() {
         let dir = tempfile::tempdir().unwrap();
         let (load, nodes, bytes) = {
             let store = EntStore::open(dir.path()).unwrap();
+            store.set_runs(REL, runs).unwrap();
             let start = Instant::now();
             let all: Vec<u64> = (0..n).collect();
             for chunk in all.chunks(1_000) {

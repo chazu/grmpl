@@ -654,22 +654,24 @@ against 94).
 ## 13. Run leaves (Ent-fidelity step 7)
 
 `entbench runs`: one relation of 100k `(entity, tag)` rows in 1,000-row
-commits, B+ layout. *Regular* rows share a tag, so they fold into runs;
-*irregular* rows carry a tag no step repeats, so they cannot. Cold reads on a
-reopened store; release build, one run each.
+commits, B+ layout. *Regular* rows share a tag, so they can fold into runs;
+*irregular* rows carry a tag no step repeats, so they cannot. Runs are
+opt-in per relation (`set_runs`), off by default. Cold reads on a reopened
+store; release build, one run each.
 
-| | regular (runs) | irregular (rows) |
-|---|---|---|
-| nodes stored after consolidation | 5 | 3,229 |
-| 1,000-row range, cold | 3 frames, 60 µs | 39 frames, 132 µs |
-| `read_at` the whole relation | 5.4 ms | 2.4 ms |
-| commit of two rows inside the block | 6 frames written | 11 frames written |
-| compare across that commit, cold | 4 frames | 23 frames |
-| `backfollow` of a 1,000-row template after a graft | finds 0 rows of the copy | finds 896 rows |
+| | regular, runs on | regular, runs off (default) | irregular, runs on |
+|---|---|---|---|
+| nodes stored after consolidation | 6 | 3,229 | 3,230 |
+| 1,000-row range, cold | 3 frames, 58 µs | 39 frames, 118 µs | 39 frames, 113 µs |
+| `read_at` the whole relation | 5.3 ms | 2.2 ms | 2.2 ms |
+| commit of two rows inside the block | 6 frames written | 11 frames written | 11 frames written |
+| compare across that commit, cold | 4 frames | 23 frames | 23 frames |
+| `backfollow` of a 1,000-row template after a graft | finds 0 rows of the copy | finds 896 rows | finds 896 rows |
 
 Runs fold the relation into a handful of nodes, so ranges, edits and compares
 read almost nothing. Two costs come with them. A full scan computes every row
 (each a fresh tuple), about twice the time of copying stored ones. And
 identity, which is node sharing, coarsens to the run's leaf: the template and
 its copy no longer share a node, so sharing-based provenance finds nothing of
-the copy.
+the copy. With runs off, a relation is as it was before step 7; runs on over
+rows that cannot fold costs nothing measurable.

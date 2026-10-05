@@ -127,11 +127,16 @@ where
 
     /// **A balanced k-d tree** over `entries`, which must have distinct keys:
     /// each node splits on the column of widest spread at its median, down to
-    /// leaves of at most [`B`] items. Rows that form runs are folded first.
-    pub fn kd_build(mut entries: Vec<(Tuple, V)>) -> Self {
+    /// leaves of at most [`B`] items.
+    pub fn kd_build(entries: Vec<(Tuple, V)>) -> Self {
+        Self::kd_build_with(entries, false)
+    }
+
+    /// [`kd_build`](Self::kd_build), folding rows into runs first if `runs`.
+    pub fn kd_build_with(mut entries: Vec<(Tuple, V)>, runs: bool) -> Self {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut items: Vec<Item<Tuple, V>> = entries.into_iter().map(|(k, v)| Item::One(k, v)).collect();
-        leaf::compress(&mut items);
+        leaf::compress(&mut items, runs);
         Self::build(items)
     }
 
@@ -200,7 +205,6 @@ where
                     std::mem::swap(&mut x, &mut y);
                 }
                 x.extend(y);
-                leaf::compress(&mut x);
                 return Self::leaf(x);
             }
         }
@@ -211,21 +215,26 @@ where
 
     /// `key → val` inserted or replaced, in the k-d layout.
     pub fn kd_insert(&self, key: Tuple, val: V) -> Self {
+        self.kd_insert_with(key, val, false)
+    }
+
+    /// [`kd_insert`](Self::kd_insert), folding rows into runs if `runs`.
+    pub fn kd_insert_with(&self, key: Tuple, val: V, runs: bool) -> Self {
         if self.is_empty() {
             return Self::leaf(vec![Item::One(key, val)]);
         }
-        Self::kd_ins(self, key, val).0
+        Self::kd_ins(self, key, val, runs).0
     }
 
     /// Insert into the subtree under `t` (`key` and the result in `t`'s
     /// parent frame), returning it with the number of split levels from its
     /// root down to the leaf written.
-    fn kd_ins(t: &Self, key: Tuple, val: V) -> (Self, usize) {
+    fn kd_ins(t: &Self, key: Tuple, val: V, runs: bool) -> (Self, usize) {
         match Self::open(t) {
             Open::Leaf(mut e) => {
-                leaf::insert(&mut e, key, val);
+                leaf::insert(&mut e, key, val, runs);
                 if e.len() > B {
-                    leaf::compress(&mut e);
+                    leaf::compress(&mut e, runs);
                 }
                 if e.len() <= B {
                     (Self::leaf(e), 0)
@@ -238,10 +247,10 @@ where
             Open::Split(col, pivot, [lo, hi]) => {
                 let below = key.cmp_column(col, &pivot, 0) == Ordering::Less;
                 let (lo, hi, levels) = if below {
-                    let (c, d) = Self::kd_ins(&lo, key, val);
+                    let (c, d) = Self::kd_ins(&lo, key, val, runs);
                     (c, hi, d)
                 } else {
-                    let (c, d) = Self::kd_ins(&hi, key, val);
+                    let (c, d) = Self::kd_ins(&hi, key, val, runs);
                     (lo, c, d)
                 };
                 let node = Self::split_node(col, pivot, lo, hi);
@@ -314,7 +323,7 @@ where
             return Self::build(items);
         }
         match Self::open(t) {
-            Open::Leaf(e) => Self::build(leaf::merge(e, items)),
+            Open::Leaf(e) => Self::build(leaf::merge(e, items, false)),
             Open::Split(col, pivot, [lo, hi]) => {
                 let (a, b) = leaf::split_on(items, col, &pivot);
                 Self::split_node(col, pivot, Self::kd_put(&lo, a), Self::kd_put(&hi, b))
@@ -700,14 +709,23 @@ fn median<V>(items: &[Item<Tuple, V>], col: usize) -> Value {
         let ent = ints[0].0;
         let at = |x: i128| if ent { Value::Ent(grmpl_core::Entity(x as u64)) } else { Value::Int(x as i64) };
         let (lo, hi) = (ints.iter().map(|x| x.1).min().unwrap(), ints.iter().map(|x| x.1).max().unwrap());
-        // The least pivot in (lo, hi] with half the weight below it.
+        // The least pivot in (lo, hi] with half the weight below it, or the
+        // one before it if that cuts nearer the middle: repeated cells put a
+        // whole run of weight on one side or the other.
+        let below = |x: i128| weight_below(items, col, &pivot_of(at(x)));
         let (mut a, mut b) = (lo + 1, hi);
         while a < b {
             let mid = a + (b - a) / 2;
-            if 2 * weight_below(items, col, &pivot_of(at(mid))) >= total {
+            if 2 * below(mid) >= total {
                 b = mid;
             } else {
                 a = mid + 1;
+            }
+        }
+        if a > lo + 1 {
+            let (here, before) = (below(a), below(a - 1));
+            if before > 0 && total.abs_diff(2 * before) < total.abs_diff(2 * here) {
+                return at(a - 1);
             }
         }
         return at(a);

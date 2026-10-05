@@ -65,13 +65,13 @@ impl Model {
     }
 }
 
-/// The tree in one layout, with its writes.
-struct Lay(Layout);
+/// The tree in one layout, with its writes, folding runs or not.
+struct Lay(Layout, bool);
 impl Lay {
     fn insert(&self, t: &T, k: Tuple, v: i64) -> T {
         match self.0 {
-            Layout::Ordered => t.insert(k, v),
-            Layout::Kd => t.kd_insert(k, v),
+            Layout::Ordered => t.insert_with(k, v, self.1),
+            Layout::Kd => t.kd_insert_with(k, v, self.1),
         }
     }
     fn remove(&self, t: &T, k: &Tuple) -> T {
@@ -291,8 +291,8 @@ fn step(lay: &Lay, t: &mut T, m: &mut Model, rng: &mut Rng) {
 
 #[test]
 fn runs_and_holes_never_change_an_answer() {
-    for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+    for (layout, runs) in [(Layout::Ordered, true), (Layout::Kd, true), (Layout::Ordered, false), (Layout::Kd, false)] {
+        let lay = Lay(layout, runs);
         for seed in 0..16u64 {
             let mut rng = Rng::new(seed);
             let (mut t, mut m) = (T::new(), Model::default());
@@ -308,8 +308,12 @@ fn runs_and_holes_never_change_an_answer() {
                     reads_agree(&t, &m, &mut rng, by);
                 }
             }
-            let (items, runs) = items_of(&t);
-            assert!(runs > 0, "{layout:?} seed {seed}: no run formed from {} rows in {items} items", t.len());
+            let (items, folded) = items_of(&t);
+            if runs {
+                assert!(folded > 0, "{layout:?} seed {seed}: no run formed from {} rows in {items} items", t.len());
+            } else {
+                assert_eq!(folded, 0, "{layout:?} seed {seed}: a run formed where runs are off");
+            }
         }
     }
 }
@@ -317,7 +321,7 @@ fn runs_and_holes_never_change_an_answer() {
 #[test]
 fn a_block_loaded_row_by_row_is_one_item() {
     for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+        let lay = Lay(layout, true);
         let mut t = T::new();
         for e in 0..100_000u64 {
             t = lay.insert(&t, room(e), 1);
@@ -344,7 +348,7 @@ fn a_block_loaded_row_by_row_is_one_item() {
 #[test]
 fn runs_and_holes_round_trip_through_the_granfilade() {
     for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+        let lay = Lay(layout, true);
         let dir = tempfile::tempdir().unwrap();
         let gran = Granfilade::open(dir.path()).unwrap();
         let mut rng = Rng::new(9);
@@ -365,7 +369,7 @@ fn runs_and_holes_round_trip_through_the_granfilade() {
 #[test]
 fn a_hole_is_filled_key_by_key_and_refuses_what_it_overlaps() {
     for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+        let lay = Lay(layout, true);
         let mut t = T::new();
         for e in 0..2 * B as u64 {
             t = lay.insert(&t, Tuple::from([ent(e * 10_000), Value::text("anchor")]), 1);
@@ -400,7 +404,7 @@ fn interleaving_runs_come_apart_in_one_leaf() {
             rows.insert(Tuple::from([ent(e), Value::Int(0), ent(9_000 + e)]), 2);
         }
     }
-    let t = T::kd_build(rows.iter().map(|(k, v)| (k.clone(), *v)).collect());
+    let t = T::kd_build_with(rows.iter().map(|(k, v)| (k.clone(), *v)).collect(), true);
     t.kd_check();
     assert_eq!(contents(&t), rows);
     // And through edits that rebuild subtrees.
@@ -414,7 +418,7 @@ fn interleaving_runs_come_apart_in_one_leaf() {
             t = t.kd_remove(&k);
             m.remove(&k);
         } else {
-            t = t.kd_insert(k.clone(), 1);
+            t = t.kd_insert_with(k.clone(), 1, true);
             m.insert(k, 1);
         }
     }
@@ -425,7 +429,7 @@ fn interleaving_runs_come_apart_in_one_leaf() {
 #[test]
 fn a_cut_at_a_runs_own_rows_splits_it_there() {
     for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+        let lay = Lay(layout, true);
         let mut t = T::new();
         for e in 0..1_000u64 {
             t = lay.insert(&t, room(e), 1);
@@ -469,7 +473,7 @@ fn a_changed_text_cell_never_steps() {
     // `(e, "a")`, `(e+1, "b")`, `(e+2, "b")`: a stride that ignored the text
     // would fold them into a run computing `(e+1, "a")`.
     for layout in [Layout::Ordered, Layout::Kd] {
-        let lay = Lay(layout);
+        let lay = Lay(layout, true);
         let rows = [
             Tuple::from([ent(10), Value::text("a")]),
             Tuple::from([ent(11), Value::text("b")]),
@@ -515,7 +519,7 @@ fn cutting_every_run_of_a_copy_keeps_the_tree_sound() {
     for g in 0..96u64 {
         for j in 0..3 {
             let k = Tuple::from([ent(g * 10 + j), Value::Int(0)]);
-            t = t.insert(k.clone(), 1);
+            t = t.insert_with(k.clone(), 1, true);
             m.insert(k, 1);
         }
     }

@@ -248,23 +248,38 @@ type OrderTree = Tree<u32, FactTree, Count>;
 /// single WID range measure — `O(log n)`, no scan of the interval.
 type FiredTree = Tree<(u64, u64), (), Count>;
 
-/// The **layout directory**: `relation → the shape of its Fact trees`, for
-/// every relation laid out other than by the branch's default. A directory
-/// beside the Rel enfilade rather than a field of each relation's roots, so a
-/// relation can be laid out before its first fact, and a fork or a merge
-/// carries the choice whether or not the relation has rows yet.
-type LayoutTree = Tree<u32, Layout, Count>;
+/// **How a relation's Fact trees are built**: their layout ([`Layout`]), and
+/// whether rows fold into runs (`tree::leaf`). Runs are off unless a
+/// relation opts in, because they coarsen identity, which is node sharing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    pub layout: Layout,
+    pub runs: bool,
+}
 
-/// A layout persists as its one-byte tag.
-impl Persist for Layout {
+crate::run_values_by_eq!(Shape);
+
+/// A shape persists as its layout's tag and a runs flag.
+impl Persist for Shape {
     fn encode(&self, e: &mut Enc<'_, '_>) {
-        e.put(&[self.tag()]);
+        e.put(&[self.layout.tag(), u8::from(self.runs)]);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
-        let tag = d.take(1)?[0];
-        Layout::from_tag(tag).ok_or_else(|| Error::Codec(format!("ent: unknown layout tag {tag}")))
+        let b = d.take(2)?;
+        let layout = Layout::from_tag(b[0]).ok_or_else(|| Error::Codec(format!("ent: unknown layout tag {}", b[0])))?;
+        match b[1] {
+            0 | 1 => Ok(Shape { layout, runs: b[1] == 1 }),
+            t => Err(Error::Codec(format!("ent: bad runs flag {t}"))),
+        }
     }
 }
+
+/// The **shape directory**: `relation → its shape`, for every relation shaped
+/// other than by the branch's default. A directory beside the Rel enfilade
+/// rather than a field of each relation's roots, so a relation can be shaped
+/// before its first fact, and a fork or a merge carries the choice whether or
+/// not the relation has rows yet.
+type ShapeTree = Tree<u32, Shape, Count>;
 
 /// One relation's roots: its versioned Fact enfilade, its Edition log, and any
 /// **Arrangements** — alternate orderings of the same facts (G-9).
@@ -612,10 +627,10 @@ struct Inner {
     /// **The patch log**: what every edition of this branch's own was, with
     /// its preconditions, so a merge can replay it on another branch.
     patches: PatchTree,
-    /// The layout a relation's Fact trees take unless `layouts` names one.
-    layout: Layout,
-    /// **The layout directory**: relations laid out otherwise.
-    layouts: LayoutTree,
+    /// The shape a relation's Fact trees take unless `shapes` names one.
+    shape: Shape,
+    /// **The shape directory**: relations shaped otherwise.
+    shapes: ShapeTree,
 }
 
 /// A branch's state is never a run's shared value.
@@ -640,8 +655,8 @@ impl Persist for Inner {
         e.link(&self.registered);
         self.grafts.encode(e);
         e.link(&self.patches);
-        self.layout.encode(e);
-        e.link(&self.layouts);
+        self.shape.encode(e);
+        e.link(&self.shapes);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         Ok(Inner {
@@ -655,8 +670,8 @@ impl Persist for Inner {
             registered: d.link()?,
             grafts: Spanfilade::decode(d)?,
             patches: d.link()?,
-            layout: Layout::decode(d)?,
-            layouts: d.link()?,
+            shape: Shape::decode(d)?,
+            shapes: d.link()?,
         })
     }
 }
@@ -676,9 +691,19 @@ impl Inner {
         self.roots(rel).map(|r| &r.log)
     }
 
+    /// The shape `rel`'s Fact trees take.
+    fn shape_of(&self, rel: RelId) -> Shape {
+        self.shapes.get(&rel.0).copied().unwrap_or(self.shape)
+    }
+
     /// The layout `rel`'s Fact trees take.
     fn layout_of(&self, rel: RelId) -> Layout {
-        self.layouts.get(&rel.0).copied().unwrap_or(self.layout)
+        self.shape_of(rel).layout
+    }
+
+    /// Whether `rel` has ever been written.
+    fn written(&self, rel: RelId) -> bool {
+        self.roots(rel).is_some_and(|r| !r.versions.is_empty() || !r.log.is_empty())
     }
 
     /// Replace `rel`'s roots, creating the entry if it is new.
@@ -800,41 +825,75 @@ impl EntStore {
         self.inner.lock().unwrap().layout_of(rel)
     }
 
-    /// **Lay `rel` out** as `layout`. A relation's layout is fixed once it has
-    /// a version, since its trees are built in it, so this is refused for a
+    /// Whether `rel`'s rows fold into **runs** (Gold's region and virtual
+    /// loaves, fidelity gap G9). Off unless the relation opts in.
+    pub fn runs(&self, rel: RelId) -> bool {
+        self.inner.lock().unwrap().shape_of(rel).runs
+    }
+
+    /// **Lay `rel` out** as `layout`. A relation's shape is fixed once it has
+    /// a version, since its trees are built in it, so a change is refused for a
     /// relation that has ever been written. Durable when it returns, and
     /// carried by forks and merges.
     pub fn set_layout(&self, rel: RelId, layout: Layout) -> Result<()> {
+        self.reshape(rel, "set_layout", |s| s.layout = layout)
+    }
+
+    /// **Let `rel`'s rows fold into runs**, or not: rows that step together
+    /// become one item, which folds a regular relation into a few nodes, and
+    /// coarsens what sharing-based provenance can find of it to those nodes.
+    /// Fixed, durable and carried as [`set_layout`](Self::set_layout) is.
+    pub fn set_runs(&self, rel: RelId, runs: bool) -> Result<()> {
+        self.reshape(rel, "set_runs", |s| s.runs = runs)
+    }
+
+    fn reshape(&self, rel: RelId, op: &str, change: impl FnOnce(&mut Shape)) -> Result<()> {
         let seq = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.roots(rel).is_some_and(|r| !r.versions.is_empty() || !r.log.is_empty()) {
-                if inner.layout_of(rel) == layout {
+            let mut shape = inner.shape_of(rel);
+            change(&mut shape);
+            if inner.written(rel) {
+                if shape == inner.shape_of(rel) {
                     return Ok(());
                 }
-                return Err(Error::Store(format!("set_layout: relation {} already has versions", rel.0)));
+                return Err(Error::Store(format!("{op}: relation {} already has versions", rel.0)));
             }
-            inner.layouts = inner.layouts.insert(rel.0, layout);
+            // Named even where it matches the default, so the relation keeps it
+            // if the default later moves.
+            inner.shapes = inner.shapes.insert(rel.0, shape);
             self.stage(&inner)?
         };
         self.await_durable(seq)
     }
 
-    /// **The layout of every relation not laid out by
-    /// [`set_layout`](Self::set_layout)**, including relations already written:
-    /// so this too is refused once any relation that would change has a
-    /// version. Durable when it returns.
+    /// **The layout of every relation not shaped by name**, including
+    /// relations already written: so this too is refused once any relation
+    /// that would change has a version. Durable when it returns.
     pub fn set_default_layout(&self, layout: Layout) -> Result<()> {
+        self.reshape_default("set_default_layout", |s| s.layout = layout)
+    }
+
+    /// **Whether rows fold into runs in every relation not shaped by name.**
+    /// Refused, as [`set_default_layout`](Self::set_default_layout) is, once a
+    /// relation it would change has a version.
+    pub fn set_default_runs(&self, runs: bool) -> Result<()> {
+        self.reshape_default("set_default_runs", |s| s.runs = runs)
+    }
+
+    fn reshape_default(&self, op: &str, change: impl FnOnce(&mut Shape)) -> Result<()> {
         let seq = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.layout == layout {
+            let mut shape = inner.shape;
+            change(&mut shape);
+            if shape == inner.shape {
                 return Ok(());
             }
-            for (rel, roots) in inner.rels.iter() {
-                if inner.layouts.get(&rel).is_none() && (!roots.versions.is_empty() || !roots.log.is_empty()) {
-                    return Err(Error::Store(format!("set_default_layout: relation {rel} already has versions")));
+            for (rel, _) in inner.rels.iter() {
+                if inner.shapes.get(&rel).is_none() && inner.written(RelId(rel)) {
+                    return Err(Error::Store(format!("{op}: relation {rel} already has versions")));
                 }
             }
-            inner.layout = layout;
+            inner.shape = shape;
             self.stage(&inner)?
         };
         self.await_durable(seq)
@@ -1219,15 +1278,15 @@ impl EntStore {
                 None => merged.ctx = merged.ctx.insert(k, v.clone()),
             }
         }
-        // Layouts: united too, so a relation the other side laid out keeps its
+        // Shapes: united too, so a relation the other side shaped keeps its
         // shape here.
-        for (rel, l) in theirs.layouts.iter() {
-            match merged.layouts.get(&rel) {
+        for (rel, l) in theirs.shapes.iter() {
+            match merged.shapes.get(&rel) {
                 Some(ml) if *ml != *l => {
-                    return conflict(other.branch, theirs.current, format!("relation {rel} is laid out differently"));
+                    return conflict(other.branch, theirs.current, format!("relation {rel} is shaped differently"));
                 }
                 Some(_) => {}
-                None if merged.layout_of(RelId(rel)) != *l => merged.layouts = merged.layouts.insert(rel, *l),
+                None if merged.shape_of(RelId(rel)) != *l => merged.shapes = merged.shapes.insert(rel, *l),
                 None => {}
             }
         }
@@ -1429,8 +1488,8 @@ impl EntStore {
             // The child's patch log starts empty: what it inherited is its
             // parent's, reached through the DAG.
             patches: PatchTree::new(),
-            layout: inner.layout,
-            layouts: inner.layouts.clone(),
+            shape: inner.shape,
+            shapes: inner.shapes.clone(),
         };
         // Graft a new branch onto this one at the fork edition in the shared
         // DagWood and stage its state, under one root lock so no root record
@@ -1694,8 +1753,8 @@ impl Inner {
             registered: Tree::new(),
             grafts: Spanfilade::new(),
             patches: PatchTree::new(),
-            layout: Layout::default(),
-            layouts: LayoutTree::new(),
+            shape: Shape::default(),
+            shapes: ShapeTree::new(),
         }
     }
 
@@ -1706,11 +1765,12 @@ impl Inner {
         let base = roots.versions.last_le(&e).map(|(_, t)| t.clone()).unwrap_or_default();
         let cur = base.get(tuple).copied().unwrap_or(0);
         let net = cur + diff;
-        let root = match (self.layout_of(rel), net) {
+        let shape = self.shape_of(rel);
+        let root = match (shape.layout, net) {
             (Layout::Ordered, 0) => base.remove(tuple),
-            (Layout::Ordered, _) => base.insert(tuple.clone(), net),
+            (Layout::Ordered, _) => base.insert_with(tuple.clone(), net, shape.runs),
             (Layout::Kd, 0) => base.kd_remove(tuple),
-            (Layout::Kd, _) => base.kd_insert(tuple.clone(), net),
+            (Layout::Kd, _) => base.kd_insert_with(tuple.clone(), net, shape.runs),
         };
         roots.versions = roots.versions.insert(e, root);
         // Keep every existing Arrangement in step with the primary order.

@@ -69,9 +69,10 @@ const CK_LEN: usize = 32;
 /// and a second parent to merged branches. v9 added the k-d split frame, each
 /// branch's layout default and layout directory, and a count of entity cells
 /// in every extent. v10 made a leaf a run of tagged items (rows, runs, holes)
-/// and recorded every child's and link's reserved keys. Like every
-/// cutover before it, v10 is fresh-store-only: a v10 binary rejects every
-/// older persisted node before interpreting its payload.
+/// and recorded every child's and link's reserved keys. v11 made each
+/// branch's layout directory a directory of shapes (layout and runs). Like
+/// every cutover before it, v11 is fresh-store-only: a v11 binary rejects
+/// every older persisted node before interpreting its payload.
 const NODE_FORMAT_VERSION: u8 = wire::FORMAT_VERSION;
 
 /// The meta key of the root record — the granfilade's one mutable slot.

@@ -15,10 +15,11 @@
 //! runs it on every substrate — so "the language runs on the Ent" is a property
 //! the suite checks rather than a sentence in a doc.
 //!
-//! The LSM is gone, so today "every substrate" is the Ent in its two layouts:
-//! B+ Fact trees, and k-d Fact trees (`grmpl_ent::Layout::Kd`). The
-//! indirection is what made the LSM cutover checkable, and it is what made the
-//! k-d layout one more variant rather than ~90 rewritten laws. The store contract itself is now stated absolutely against the Ent in
+//! The LSM is gone, so today "every substrate" is the Ent in three shapes: B+
+//! Fact trees, k-d Fact trees (`grmpl_ent::Layout::Kd`), and B+ Fact trees
+//! whose rows fold into runs. The indirection is what made the LSM cutover
+//! checkable, and it is what made each new shape one more variant rather than
+//! ~90 rewritten laws. The store contract itself is now stated absolutely against the Ent in
 //! `grmpl-ent/tests/store_laws.rs`, rather than as agreement with another store.
 //!
 //! **This crate is above the bright line and dev-only.** It names `grmpl-ent`
@@ -88,6 +89,7 @@ impl Case {
     pub fn sibling(&self) -> Case {
         match self.name {
             "ent-kd" => ent_kd(),
+            "ent-runs" => ent_runs(),
             _ => ent(),
         }
     }
@@ -95,22 +97,26 @@ impl Case {
 
 /// Which substrate a location holds.
 ///
-/// One store, in two layouts: the Ent with its Fact trees as B+ trees, and the
-/// same Ent with every relation laid out as a k-d tree ([`Layout::Kd`]). The
-/// layout changes every tree shape the laws run over and none of the answers,
-/// so it is a substrate here as a second store would be.
+/// One store, in three shapes: the Ent with its Fact trees as B+ trees, the
+/// same Ent with every relation laid out as a k-d tree ([`Layout::Kd`]), and
+/// the B+ Ent with every relation's rows folding into runs. A shape changes
+/// every tree the laws run over and none of the answers, so each is a
+/// substrate here as a second store would be.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Kind {
     Ent,
     EntKd,
+    EntRuns,
 }
 
 /// Open the Ent at `dir`, laid out as `kind` says. The layout is durable, so a
 /// reopen keeps it.
 fn open_ent(dir: &std::path::Path, kind: Kind) -> EntStore {
     let store = EntStore::open(dir).expect("open ent store");
-    if kind == Kind::EntKd {
-        store.set_default_layout(Layout::Kd).expect("lay the store out as k-d trees");
+    match kind {
+        Kind::Ent => {}
+        Kind::EntKd => store.set_default_layout(Layout::Kd).expect("lay the store out as k-d trees"),
+        Kind::EntRuns => store.set_default_runs(true).expect("let every relation fold into runs"),
     }
     store
 }
@@ -141,7 +147,7 @@ impl World {
 
 /// Run one crash-recovery law against every substrate.
 pub fn for_each_world(mut body: impl FnMut(&World)) {
-    for (kind, name) in [(Kind::Ent, "ent"), (Kind::EntKd, "ent-kd")] {
+    for (kind, name) in [(Kind::Ent, "ent"), (Kind::EntKd, "ent-kd"), (Kind::EntRuns, "ent-runs")] {
         let dir = tempfile::tempdir().expect("tempdir");
         body(&World { name, kind, dir });
     }
@@ -149,7 +155,7 @@ pub fn for_each_world(mut body: impl FnMut(&World)) {
 
 /// Every substrate implementation, each freshly created.
 pub fn each_store() -> Vec<Case> {
-    vec![ent(), ent_kd()]
+    vec![ent(), ent_kd(), ent_runs()]
 }
 
 /// Just the ent-native store — for laws that are specifically about it.
@@ -164,6 +170,13 @@ pub fn ent_kd() -> Case {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_ent(dir.path(), Kind::EntKd);
     Case { name: "ent-kd", store: Arc::new(store), _dir: dir }
+}
+
+/// The ent-native store with every relation's rows folding into runs.
+pub fn ent_runs() -> Case {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_ent(dir.path(), Kind::EntRuns);
+    Case { name: "ent-runs", store: Arc::new(store), _dir: dir }
 }
 
 /// The **logical projection** of a store: for each relation, its raw updates in
