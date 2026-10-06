@@ -712,6 +712,15 @@ impl Program {
         Ok(())
     }
 
+    /// The schemas this program declares, as a read-only [`SchemaCatalog`] in
+    /// effect at every edition: exactly what [`register_schemas`](Self::register_schemas)
+    /// would record, readable before anything is written. Checking a world
+    /// against it lets a load refuse an ill-typed program without leaving its
+    /// schemas behind in the store.
+    pub fn declared_schemas(&self) -> DeclaredSchemas<'_> {
+        DeclaredSchemas(self)
+    }
+
     /// Instantiate a view as a runnable `Query`, binding its parameters to
     /// `args`. This is [`view_ir`](Self::view_ir) followed by the final
     /// [`QueryIr::lower`].
@@ -2273,5 +2282,23 @@ impl Schemas for Program {
 
     fn rel_arity(&self, rel: &str) -> Option<usize> {
         self.rels.get(rel).map(|r| r.arity())
+    }
+}
+
+/// A program's declared schemas as a read-only [`SchemaCatalog`]; see
+/// [`Program::declared_schemas`].
+pub struct DeclaredSchemas<'a>(&'a Program);
+
+impl SchemaCatalog for DeclaredSchemas<'_> {
+    fn put_schema(&self, _rel: RelId, _schema: &Schema, _at: Edition) -> CoreResult<()> {
+        Err(grmpl_core::Error::Store("a program's declared schemas are read-only".into()))
+    }
+
+    fn schema(&self, rel: RelId) -> CoreResult<Option<Schema>> {
+        Ok(self.0.rels.values().find(|r| r.id == rel).map(|r| Schema::new(r.columns.clone())))
+    }
+
+    fn schema_at(&self, rel: RelId, _at: Edition) -> CoreResult<Option<Schema>> {
+        self.schema(rel)
     }
 }

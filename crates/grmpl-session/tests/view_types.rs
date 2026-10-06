@@ -68,6 +68,11 @@ fn an_ill_typed_package_view_installs_nothing() {
     };
     assert!(error.contains("view `crossed`"), "{error}");
     assert_eq!(store.current(), Edition::ZERO, "the bootstrap never commits");
+    // The views are checked before the schemas are registered, so a refused
+    // world leaves none behind to collide with its corrected source.
+    for (name, rel) in store.entries().unwrap() {
+        assert_eq!(store.schema(rel).unwrap(), None, "`{name}` kept a schema");
+    }
 }
 
 #[test]

@@ -167,10 +167,12 @@ impl Runtime {
             rel_base,
         )?);
         let effective = Edition(store.current().0 + 1);
+        // Type-check against the declared schemas first, so an ill-typed world
+        // is refused before anything about it is written.
+        check_views(&program, &program.declared_schemas(), effective).map_err(|e| e.to_string())?;
         program
             .register_schemas(store.as_ref(), store.as_ref(), effective)
             .map_err(|e| e.to_string())?;
-        check_views(&program, store.as_ref(), effective).map_err(|e| e.to_string())?;
         let views = view_maintainers(&program)?;
         for view in &views {
             if view.cursor(store.as_ref()).map_err(|e| e.to_string())?.is_none() {
@@ -223,11 +225,11 @@ impl Runtime {
         let package = CompiledPackage::compile_with_catalog(source, store.as_ref(), rel_base)?;
         let grants = Arc::new(package.resolve_grants(host_grants)?);
         let effective = Edition(store.current().0 + 1);
+        check_views(&package.program, &package.program.declared_schemas(), effective)
+            .map_err(|error| error.to_string())?;
         package
             .program
             .register_schemas(store.as_ref(), store.as_ref(), effective)
-            .map_err(|error| error.to_string())?;
-        check_views(&package.program, store.as_ref(), effective)
             .map_err(|error| error.to_string())?;
 
         let expected = package.marker_tuple();

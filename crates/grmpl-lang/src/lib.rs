@@ -43,7 +43,7 @@ pub use behavior::{
     select_behavior, StoredBehavior,
 };
 pub use behavior_ir::{BehaviorIr, BehaviorOp, BoolExpr, CompareOp, ExprIr, FindArg, ValueExpr};
-pub use compile::{CapabilityKind, Program};
+pub use compile::{CapabilityKind, DeclaredSchemas, Program};
 pub use concat::{ConcatArm, Schemas, StackEffect, Word};
 pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};
 pub use package::{
