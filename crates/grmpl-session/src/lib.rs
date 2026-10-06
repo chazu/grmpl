@@ -21,7 +21,7 @@ pub mod session;
 pub mod watch;
 
 pub use moo::{MooRelations, MooRuntime};
-pub use net::serve;
+pub use net::{serve, serve_with, NetLimits};
 pub use runtime::{
     tokenize, DriveReport, DriveStatus, NamedAuthority, NamedScope, Runtime, RuntimePolicy,
 };
