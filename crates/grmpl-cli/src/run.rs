@@ -382,9 +382,7 @@ impl Repl {
             .any(|a| a.entity == entity && a.inbox_name == inbox);
         if !actor {
             let process = self.process(entity, inbox)?;
-            process
-                .run_to_idle_retrying(store, store, self.runtime.policy())
-                .map_err(|e| e.to_string())?;
+            self.runtime.run_to_idle(&process).map_err(|e| e.to_string())?;
         }
         if self.actors.is_empty() {
             self.runtime.refresh_views().map_err(|e| e.to_string())?;

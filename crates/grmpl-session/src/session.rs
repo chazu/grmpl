@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use grmpl_core::{Edition, Entity, Error, Fact, Patch, Result, Tuple, Value, WorldStore};
 use grmpl_diff::Snapshot;
-use grmpl_proc::{commit_patch, commit_retrying, Alloc, Backoff, CommitOutcome, Process, SeqAlloc};
+use grmpl_proc::{
+    commit_patch_checked, commit_retrying, Alloc, Backoff, CommitOutcome, Process, SeqAlloc,
+};
 
 use crate::moo::{MooRuntime, FOYER, ID_BASE};
 use crate::watch::Subscription;
@@ -80,6 +82,7 @@ impl Server {
         let rels = self.world.relations();
         let store = self.world.store();
         let authority = self.world.player_authority();
+        let checker = self.world.runtime().behavior_checker();
         let mut spawned = None;
         commit_retrying(self.policy.clone(), || {
             let snap = Snapshot::at_current(store);
@@ -109,7 +112,7 @@ impl Server {
                         Tuple::from([Value::Ent(player), Value::Ent(player)]),
                     )),
             );
-            let outcome = commit_patch(store, store, &patch, &authority)?;
+            let outcome = commit_patch_checked(store, store, &checker, &patch, &authority)?;
             if matches!(outcome, CommitOutcome::Committed(_)) {
                 spawned = Some(player);
             }
@@ -139,8 +142,12 @@ impl Session {
         let shared = self.server.world.shared_store();
         let store = &*shared;
         self.server.world.enqueue(self.player, line)?;
-        self.process
-            .run_to_idle_retrying(store, store, self.server.policy.clone())?;
+        self.process.run_to_idle_retrying_checked(
+            store,
+            store,
+            &self.server.world.runtime().behavior_checker(),
+            self.server.policy.clone(),
+        )?;
         self.drain_output(store)
     }
 

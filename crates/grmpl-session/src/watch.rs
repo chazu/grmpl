@@ -271,7 +271,8 @@ impl Subscription {
 
         // Advance the durable delivery cursor over exactly the streamed batch,
         // guarded on its present value so a re-drain resolves idempotently. From
-        // absent (`from == 0`) there is no prior row to retract.
+        // absent (`from == 0`) there is no prior row to retract. The patch
+        // asserts no fact, so it installs no code and needs no behavior check.
         let next = from + pending.len() as i64;
         let mut patch = Patch::new();
         if from > 0 {

@@ -11,12 +11,12 @@
 //! * crash *after* commit → the cursor already advanced, the message is skipped.
 
 use grmpl_core::{
-    Authority, CursorMove, Diff, Edition, Entity, Error, Fact, Patch, RelId, Result, SchemaCatalog,
-    TraceStore, Tuple, Value,
+    Authority, BehaviorChecker, CursorMove, Diff, Edition, Entity, Error, Fact, NoBehaviorCheck,
+    Patch, RelId, Result, SchemaCatalog, TraceStore, Tuple, Value,
 };
 use grmpl_diff::Snapshot;
 
-use crate::commit::{commit_patch, CommitOutcome};
+use crate::commit::{commit_patch_checked, CommitOutcome};
 use crate::SeqAlloc;
 
 /// A pure handler: `Snapshot × message-body → Patch` (Replay law — deterministic
@@ -141,10 +141,25 @@ impl Process {
         store: &dyn TraceStore,
         schemas: &dyn SchemaCatalog,
     ) -> Result<Option<CommitOutcome>> {
+        self.step_checked(store, schemas, &NoBehaviorCheck)
+    }
+
+    /// [`step`](Self::step), re-checking through `checker` any stored code the
+    /// step's patch installs (P12): the commit goes through
+    /// [`commit_patch_checked`], so a handler that stores a behavior writing
+    /// outside this process's authority fails with
+    /// [`Error::Authority`](grmpl_core::Error::Authority), its cursor unmoved.
+    pub fn step_checked(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+        checker: &dyn BehaviorChecker,
+    ) -> Result<Option<CommitOutcome>> {
         match self.prepare(store)? {
-            Some(prepared) => Ok(Some(commit_patch(
+            Some(prepared) => Ok(Some(commit_patch_checked(
                 store,
                 schemas,
+                checker,
                 &prepared.patch,
                 &self.authority,
             )?)),
@@ -198,6 +213,18 @@ impl Process {
         schemas: &dyn SchemaCatalog,
         policy: crate::retry::Backoff,
     ) -> Result<usize> {
+        self.run_to_idle_retrying_checked(store, schemas, &NoBehaviorCheck, policy)
+    }
+
+    /// [`run_to_idle_retrying`](Self::run_to_idle_retrying), each step
+    /// committed through [`step_checked`](Self::step_checked).
+    pub fn run_to_idle_retrying_checked(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+        checker: &dyn BehaviorChecker,
+        policy: crate::retry::Backoff,
+    ) -> Result<usize> {
         let mut n = 0;
         loop {
             // `step` returns `None` only when the inbox is idle; a rejection
@@ -205,7 +232,7 @@ impl Process {
             // message against fresh state.
             let mut attempt = policy.clone();
             loop {
-                match self.step(store, schemas)? {
+                match self.step_checked(store, schemas, checker)? {
                     None => return Ok(n),
                     Some(CommitOutcome::Committed(_)) => {
                         n += 1;
@@ -234,9 +261,21 @@ impl Process {
         schemas: &dyn SchemaCatalog,
         policy: crate::retry::Backoff,
     ) -> Result<Option<Edition>> {
+        self.step_retrying_checked(store, schemas, &NoBehaviorCheck, policy)
+    }
+
+    /// [`step_retrying`](Self::step_retrying), each attempt committed through
+    /// [`step_checked`](Self::step_checked).
+    pub fn step_retrying_checked(
+        &self,
+        store: &dyn TraceStore,
+        schemas: &dyn SchemaCatalog,
+        checker: &dyn BehaviorChecker,
+        policy: crate::retry::Backoff,
+    ) -> Result<Option<Edition>> {
         let mut attempt = policy;
         loop {
-            match self.step(store, schemas)? {
+            match self.step_checked(store, schemas, checker)? {
                 None => return Ok(None),
                 Some(CommitOutcome::Committed(edition)) => return Ok(Some(edition)),
                 Some(CommitOutcome::Rejected) => {

@@ -21,7 +21,7 @@ use grmpl_proc::{
     enqueue_seq, Backoff, ClockDriver, FireNextOutcome, Materialized, OnWatch, Process,
     Scheduler,
 };
-use grmpl_type::check_handler_authority;
+use grmpl_type::{check_handler_authority, EffectChecker};
 
 const DEFAULT_DRIVE_FUEL: usize = 1_024;
 
@@ -482,7 +482,12 @@ impl Runtime {
                 });
             };
             let actor = &driven.actors[index].1;
-            match actor.step_retrying(self.store(), self.store(), self.policy.clone()) {
+            match actor.step_retrying_checked(
+                self.store(),
+                self.store(),
+                &self.behavior_checker(),
+                self.policy.clone(),
+            ) {
                 Ok(Some(_)) => {
                     remaining -= 1;
                     actor_steps += 1;
@@ -548,6 +553,26 @@ impl Runtime {
     /// The retry policy used by processes driven through this runtime.
     pub fn policy(&self) -> Backoff {
         self.policy.clone()
+    }
+
+    /// The commit-boundary re-check of stored code (P12): every behavior a
+    /// runtime commit installs as a [`Value::Code`] cell must write only within
+    /// the committing authority and invoke only capabilities the host granted.
+    /// Every process commit the runtime makes goes through it; a fact carrying
+    /// no code passes at the cost of one scan of its cells.
+    pub fn behavior_checker(&self) -> EffectChecker<'_> {
+        EffectChecker::with_grants(&self.program, &self.grants)
+    }
+
+    /// Drain `process`'s inbox until idle, under this runtime's schemas, stored
+    /// code re-check and retry policy. Returns how many messages committed.
+    pub fn run_to_idle(&self, process: &Process) -> Result<usize> {
+        process.run_to_idle_retrying_checked(
+            self.store(),
+            self.store(),
+            &self.behavior_checker(),
+            self.policy(),
+        )
     }
 
     /// Resolve a declared relation through the program's durable catalog ids.

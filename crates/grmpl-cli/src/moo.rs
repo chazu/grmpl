@@ -350,9 +350,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         // The player's verb, through the compiled behavior.
         let before = self.store.current();
         self.world.enqueue(PLAYER, line).map_err(err)?;
-        self.player
-            .run_to_idle_retrying(self.store, self.store, self.world.runtime().policy())
-            .map_err(err)?;
+        self.world.runtime().run_to_idle(&self.player).map_err(err)?;
 
         let told = self.drain_tell(before)?;
         let verb = line.split_whitespace().next().unwrap_or("");
@@ -508,9 +506,7 @@ Cribbage (scoring is grmpl views; the host only tallies the rows):
         let player_room = self.room_of(PLAYER).ok().flatten();
         let before = self.room_of(CAT).ok().flatten();
         self.world.enqueue(CAT, "tick").map_err(err)?;
-        self.cat
-            .run_to_idle_retrying(self.store, self.store, self.world.runtime().policy())
-            .map_err(err)?;
+        self.world.runtime().run_to_idle(&self.cat).map_err(err)?;
         let after = self.room_of(CAT).ok().flatten();
 
         let known = self.known_by(PLAYER);

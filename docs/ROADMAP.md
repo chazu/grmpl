@@ -427,11 +427,16 @@ corresponding tickets for detail.
   is the recursive `implements(entity, behavior)` view (`idea.md` §3), and
   `select_behavior` picks the least matching behavior — so redefinition is an
   ordinary `Patch` and the next dispatch follows (the live-code law). The P8b
-  effect/authority re-check of a committed behavior exists as the core
-  `BehaviorChecker` hook (`grmpl_type::EffectChecker`) and is tested at the
-  `grmpl_proc::commit_patch_checked` boundary, but **no runtime path uses it
-  yet**: runtime commits go through `commit_patch` (the `NoBehaviorCheck`
-  variant), and stored behaviors are reachable only from the `showcase` demo.
+  effect/authority re-check of a committed behavior is the core
+  `BehaviorChecker` hook (`grmpl_type::EffectChecker`), run at the
+  `grmpl_proc::commit_patch_checked` boundary by every runtime commit of a
+  language process: driven actors, `Runtime::run_to_idle`, session commands
+  and player spawn (`Runtime::behavior_checker`, built from the program and
+  its host grants). A handler that stores a behavior it was sent cannot store
+  one writing outside its own authority. Maintenance commits (watch pumps,
+  materialized views, the scheduler) stay unchecked: they copy or forward
+  rows already admitted, installing nothing. Dispatch from stored behaviors
+  is still reachable only from the `showcase` demo.
   Law oracles: behavior-codec round-trip, dispatch-equals-model under churn,
   and commit-boundary-recheck ⇔ static verdict + runtime soundness.
 * **P13 — Benchmarks,** then engine statefulness. **Partly landed:**
