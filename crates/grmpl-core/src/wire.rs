@@ -25,6 +25,16 @@
 //! byte and (being greenfield — no schema bytes predate it) starts at v1. It
 //! uses a *separate* `Ty` tag namespace from the value tags below; changing
 //! either the value tags or the schema `Ty` tags bumps [`FORMAT_VERSION`].
+//!
+//! ## Hostile bytes
+//!
+//! Messages arrive from other domains and stored cells from players, so every
+//! decoder here returns `Error::Codec` on any input, never panics, and never
+//! lets the input size an allocation or the stack:
+//!
+//! * a value nests at most [`MAX_DEPTH`] tuples deep (part of the format);
+//! * a count read from the input reserves no more elements than there are
+//!   bytes left to hold them, since every encoded element takes at least one.
 
 use std::sync::Arc;
 
@@ -37,6 +47,14 @@ use crate::value::{Entity, RelId, Tuple, Value};
 /// on any change to the tag set or framing so stale bytes are rejected rather
 /// than misread. All framings (`message`, store `record`) share this byte.
 pub const FORMAT_VERSION: u8 = 11;
+
+/// **The deepest a value may nest**: a tuple value may hold tuples to this
+/// many levels, counting from the outermost tuple value. Part of the format: a
+/// decoder refuses deeper input with `Error::Codec` rather than recursing until
+/// hostile bytes exhaust the stack. The encoder does not check it, since no
+/// value grmpl builds comes near it; one that did would encode and then be
+/// refused on the way back in.
+pub const MAX_DEPTH: usize = 64;
 
 const TAG_ENT: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -106,7 +124,7 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
 pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
     let mut pos = read_version(bytes)?;
     let ncols = read_u32(bytes, &mut pos)? as usize;
-    let mut columns = Vec::with_capacity(ncols);
+    let mut columns = Vec::with_capacity(capacity(ncols, bytes, pos));
     for _ in 0..ncols {
         let tag = *bytes
             .get(pos)
@@ -114,14 +132,10 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         pos += 1;
         let ty = ty_from_tag(tag)?;
         let len = read_u32(bytes, &mut pos)? as usize;
-        let end = pos + len;
-        let slice = bytes
-            .get(pos..end)
-            .ok_or_else(|| Error::Codec("unexpected end (column name)".into()))?;
+        let slice = read_slice(bytes, &mut pos, len, "column name")?;
         let name = std::str::from_utf8(slice)
             .map_err(|e| Error::Codec(e.to_string()))?
             .to_string();
-        pos = end;
         columns.push(Column { name, ty });
     }
     if pos != bytes.len() {
@@ -158,13 +172,10 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
 
 pub fn decode_message(bytes: &[u8]) -> Result<Message> {
     let mut pos = read_version(bytes)?;
-    let inbox_bytes = bytes
-        .get(pos..pos + 4)
-        .ok_or_else(|| Error::Codec("message shorter than inbox header".into()))?;
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(inbox_bytes);
-    let inbox = RelId(u32::from_be_bytes(buf));
-    pos += 4;
+    let inbox = RelId(
+        read_u32(bytes, &mut pos)
+            .map_err(|_| Error::Codec("message shorter than inbox header".into()))?,
+    );
     let (body, pos) = decode_tuple(bytes, pos)?;
     if pos != bytes.len() {
         return Err(Error::Codec("trailing bytes after message body".into()));
@@ -179,15 +190,21 @@ pub fn encode_tuple(t: &Tuple, out: &mut Vec<u8>) {
     }
 }
 
-pub fn decode_tuple(bytes: &[u8], mut pos: usize) -> Result<(Tuple, usize)> {
+pub fn decode_tuple(bytes: &[u8], pos: usize) -> Result<(Tuple, usize)> {
+    let (vals, pos) = decode_cells(bytes, pos, 0)?;
+    Ok((Tuple(Arc::from(vals)), pos))
+}
+
+/// A count, then that many values, each `depth` tuples deep.
+fn decode_cells(bytes: &[u8], mut pos: usize, depth: usize) -> Result<(Vec<Value>, usize)> {
     let len = read_u32(bytes, &mut pos)? as usize;
-    let mut vals = Vec::with_capacity(len);
+    let mut vals = Vec::with_capacity(capacity(len, bytes, pos));
     for _ in 0..len {
-        let (v, next) = decode_value(bytes, pos)?;
+        let (v, next) = decode_value_at(bytes, pos, depth)?;
         vals.push(v);
         pos = next;
     }
-    Ok((Tuple(Arc::from(vals)), pos))
+    Ok((vals, pos))
 }
 
 /// Encode a single [`Value`] onto `out` (no leading version byte — the caller's
@@ -240,7 +257,12 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) {
 /// Decode a single [`Value`] at `pos` (no leading version byte — the caller's
 /// framing consumed it). The public counterpart of [`encode_value`], for
 /// framings that embed values (see that function).
-pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
+pub fn decode_value(bytes: &[u8], pos: usize) -> Result<(Value, usize)> {
+    decode_value_at(bytes, pos, 0)
+}
+
+/// [`decode_value`] for a value inside `depth` tuple values.
+fn decode_value_at(bytes: &[u8], mut pos: usize, depth: usize) -> Result<(Value, usize)> {
     let tag = *bytes
         .get(pos)
         .ok_or_else(|| Error::Codec("unexpected end (tag)".into()))?;
@@ -256,12 +278,9 @@ pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
         }
         TAG_TEXT => {
             let len = read_u32(bytes, &mut pos)? as usize;
-            let end = pos + len;
-            let slice = bytes
-                .get(pos..end)
-                .ok_or_else(|| Error::Codec("unexpected end (text)".into()))?;
+            let slice = read_slice(bytes, &mut pos, len, "text")?;
             let s = std::str::from_utf8(slice).map_err(|e| Error::Codec(e.to_string()))?;
-            Ok((Value::text(s), end))
+            Ok((Value::text(s), pos))
         }
         TAG_BOOL => {
             let b = *bytes
@@ -270,55 +289,51 @@ pub fn decode_value(bytes: &[u8], mut pos: usize) -> Result<(Value, usize)> {
             Ok((Value::Bool(b != 0), pos + 1))
         }
         TAG_TUPLE => {
-            let len = read_u32(bytes, &mut pos)? as usize;
-            let mut vals = Vec::with_capacity(len);
-            for _ in 0..len {
-                let (v, next) = decode_value(bytes, pos)?;
-                vals.push(v);
-                pos = next;
+            if depth >= MAX_DEPTH {
+                return Err(Error::Codec(format!("value nests deeper than {MAX_DEPTH} tuples")));
             }
+            let (vals, pos) = decode_cells(bytes, pos, depth + 1)?;
             Ok((Value::Tuple(Arc::from(vals)), pos))
         }
         TAG_BYTES => {
             let len = read_u32(bytes, &mut pos)? as usize;
-            let end = pos + len;
-            let slice = bytes
-                .get(pos..end)
-                .ok_or_else(|| Error::Codec("unexpected end (bytes)".into()))?;
-            Ok((Value::Bytes(Arc::from(slice)), end))
+            let slice = read_slice(bytes, &mut pos, len, "bytes")?;
+            Ok((Value::Bytes(Arc::from(slice)), pos))
         }
         TAG_CODE => {
             let len = read_u32(bytes, &mut pos)? as usize;
-            let end = pos + len;
-            let slice = bytes
-                .get(pos..end)
-                .ok_or_else(|| Error::Codec("unexpected end (code)".into()))?;
-            Ok((Value::Code(Arc::from(slice)), end))
+            let slice = read_slice(bytes, &mut pos, len, "code")?;
+            Ok((Value::Code(Arc::from(slice)), pos))
         }
         other => Err(Error::Codec(format!("unknown value tag {other}"))),
     }
 }
 
+/// A capacity for `n` elements about to be decoded from `bytes` at `pos`: no
+/// more than the bytes left, since each element takes at least one. A corrupt
+/// count then fails on the bytes it lacks, not on the allocation it asked for.
+pub fn capacity(n: usize, bytes: &[u8], pos: usize) -> usize {
+    n.min(bytes.len().saturating_sub(pos))
+}
+
+/// The `len` bytes at `*pos`, advancing past them.
+fn read_slice<'a>(bytes: &'a [u8], pos: &mut usize, len: usize, what: &str) -> Result<&'a [u8]> {
+    let slice = pos
+        .checked_add(len)
+        .and_then(|end| bytes.get(*pos..end))
+        .ok_or_else(|| Error::Codec(format!("unexpected end ({what})")))?;
+    *pos += len;
+    Ok(slice)
+}
+
 fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    let end = *pos + 4;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::Codec("unexpected end (u32)".into()))?;
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(slice);
-    *pos = end;
-    Ok(u32::from_be_bytes(buf))
+    let slice = read_slice(bytes, pos, 4, "u32")?;
+    Ok(u32::from_be_bytes(slice.try_into().expect("four bytes")))
 }
 
 fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let end = *pos + 8;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::Codec("unexpected end (u64)".into()))?;
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(slice);
-    *pos = end;
-    Ok(u64::from_be_bytes(buf))
+    let slice = read_slice(bytes, pos, 8, "u64")?;
+    Ok(u64::from_be_bytes(slice.try_into().expect("eight bytes")))
 }
 
 #[cfg(test)]

@@ -6,6 +6,17 @@ run = "cargo build --workspace"
 description = "Run the full test suite"
 run = "cargo test --workspace"
 
+# Needs a nightly toolchain and `cargo install cargo-fuzz`. Each target runs
+# for FUZZ_SECONDS (default 30); findings land in fuzz/artifacts/<target>/.
+[tasks.fuzz]
+description = "Fuzz every decoder of hostile bytes briefly (cargo-fuzz, nightly)"
+dir = "{{config_root}}"
+run = '''
+for t in decode_message decode_schema decode_value behavior node_frame; do
+  cargo +nightly fuzz run "$t" -- -max_total_time="${FUZZ_SECONDS:-30}" || exit 1
+done
+'''
+
 [tasks.moo]
 description = "Play the MOO example (worlds/moo.grmpl) in a REPL against a persistent store"
 dir = "{{config_root}}"

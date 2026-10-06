@@ -202,6 +202,12 @@ impl<'a> Dec<'a> {
         Ok(b)
     }
 
+    /// A capacity for `n` elements about to be read from the payload: see
+    /// [`wire::capacity`]. A count read from a frame sizes nothing by itself.
+    pub fn cap(&self, n: usize) -> usize {
+        wire::capacity(n, self.bytes, self.pos)
+    }
+
     /// Decode with a `(bytes, pos) -> (value, pos)` codec such as
     /// `wire::decode_tuple`.
     pub fn with<T>(&mut self, f: impl FnOnce(&[u8], usize) -> Result<(T, usize)>) -> Result<T> {
@@ -355,7 +361,7 @@ impl Persist for Extent {
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         let rows = u64::decode(d)?;
         let n = u32::decode(d)? as usize;
-        let (mut bounds, mut ents) = (Vec::with_capacity(n.min(256)), Vec::with_capacity(n.min(256)));
+        let (mut bounds, mut ents) = (Vec::with_capacity(d.cap(n)), Vec::with_capacity(d.cap(n)));
         for _ in 0..n {
             bounds.push(Option::<(u64, u64)>::decode(d)?);
             ents.push(u64::decode(d)?);
@@ -619,36 +625,43 @@ impl Granfilade {
             .map_err(store_err)?
             .ok_or_else(|| Error::Store("granfilade: node key not found".into()))?;
         self.paged_in.fetch_add(1, Ordering::Relaxed);
-        let bytes = frame.as_ref();
+        self.decode_node(frame.as_ref())
+    }
+
+    /// Decode one node frame. A frame is data from disk, so a corrupt one is
+    /// refused with `Error::Codec`, never a panic: every count it carries is
+    /// checked against its bytes and its sums before a node is built on it.
+    fn decode_node<K, V, M>(self: &Arc<Self>, bytes: &[u8]) -> Result<Tree<K, V, M>>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
         let (tag, refs, pos) = decode_header(bytes)?;
         let mut d = Dec { bytes, pos, refs: &refs, next_ref: 0, gran: self };
         let count = u32::decode(&mut d)? as usize;
-        match tag {
+        let tree = match tag {
             TAG_LEAF => {
-                let mut items = Vec::with_capacity(count);
+                let mut items = Vec::with_capacity(d.cap(count));
                 for _ in 0..count {
                     items.push(match d.take(1)?[0] {
                         ITEM_ROW => Item::One(K::decode(&mut d)?, V::decode(&mut d)?),
                         ITEM_RUN => {
-                            let n = u64::decode(&mut d)?;
-                            let (first, stride) = (K::decode(&mut d)?, K::decode(&mut d)?);
-                            Item::Run(Span { first, stride, n }, V::decode(&mut d)?)
+                            let span = decode_span(&mut d)?;
+                            Item::Run(span, V::decode(&mut d)?)
                         }
-                        ITEM_HOLE => {
-                            let n = u64::decode(&mut d)?;
-                            let (first, stride) = (K::decode(&mut d)?, K::decode(&mut d)?);
-                            Item::Hole(Span { first, stride, n })
-                        }
+                        ITEM_HOLE => Item::Hole(decode_span(&mut d)?),
                         t => return Err(Error::Codec(format!("granfilade: unknown leaf item tag {t}"))),
                     });
                 }
+                check_sums(items.iter().map(|it| (it.rows(), it.reserved())))?;
                 if d.next_ref != refs.len() {
                     return Err(Error::Codec("granfilade: leaf links disagree with its references".into()));
                 }
-                Ok(Tree::leaf_of(items))
+                Tree::leaf_of(items)
             }
             TAG_INTERNAL => {
-                let mut keys = Vec::with_capacity(count);
+                let mut keys = Vec::with_capacity(d.cap(count));
                 for _ in 0..count {
                     keys.push(K::decode(&mut d)?);
                 }
@@ -658,13 +671,10 @@ impl Granfilade {
                 let pager = self.pager::<K, V, M>();
                 let mut children = Vec::with_capacity(refs.len());
                 for c in &refs {
-                    let dsp = i64::decode(&mut d)?;
-                    let size = u64::decode(&mut d)? as usize;
-                    let reserved = u64::decode(&mut d)?;
-                    let measure = M::decode(&mut d)?;
-                    children.push(self.stub(*c, size, reserved, measure, &pager).relocate(dsp));
+                    children.push(self.decode_child(&mut d, *c, &pager)?);
                 }
-                Ok(Tree::internal_of(keys, children))
+                check_sums(children.iter().map(|c| (c.len() as u64, c.reserved())))?;
+                Tree::internal_of(keys, children)
             }
             TAG_SPLIT => {
                 let pivot = K::decode(&mut d)?;
@@ -672,18 +682,54 @@ impl Granfilade {
                     return Err(Error::Codec("granfilade: malformed split node".into()));
                 };
                 let pager = self.pager::<K, V, M>();
-                let mut child = |ck: ContentKey| -> Result<Tree<K, V, M>> {
-                    let dsp = i64::decode(&mut d)?;
-                    let size = u64::decode(&mut d)? as usize;
-                    let reserved = u64::decode(&mut d)?;
-                    let measure = M::decode(&mut d)?;
-                    Ok(self.stub(ck, size, reserved, measure, &pager).relocate(dsp))
-                };
-                let (lo, hi) = (child(lo)?, child(hi)?);
-                Ok(Tree::split_of(count, pivot, lo, hi))
+                let lo = self.decode_child(&mut d, lo, &pager)?;
+                let hi = self.decode_child(&mut d, hi, &pager)?;
+                check_sums([&lo, &hi].map(|c| (c.len() as u64, c.reserved())))?;
+                Tree::split_of(count, pivot, lo, hi)
             }
-            _ => Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
+            _ => return Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
+        };
+        if d.pos != bytes.len() {
+            return Err(Error::Codec("granfilade: trailing bytes after node".into()));
         }
+        Ok(tree)
+    }
+
+    /// One child of an internal or split frame: its dsp, size, reserved keys
+    /// and measure, as a paged node.
+    fn decode_child<K, V, M>(&self, d: &mut Dec<'_>, ck: ContentKey, pager: &Arc<dyn Pager<K, V, M>>) -> Result<Tree<K, V, M>>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        let dsp = i64::decode(d)?;
+        let size = usize::try_from(u64::decode(d)?).map_err(|_| Error::Codec("granfilade: child size out of range".into()))?;
+        let reserved = u64::decode(d)?;
+        let measure = M::decode(d)?;
+        Ok(self.stub(ck, size, reserved, measure, pager).relocate(dsp))
+    }
+
+    /// Decode `frame` as a node of a Fact tree and frame it again: the round
+    /// trip the `node_frame` fuzz target drives. Not API.
+    #[doc(hidden)]
+    pub fn reframe_for_fuzz(self: &Arc<Self>, frame: &[u8]) -> Result<Vec<u8>> {
+        self.reframe::<Tuple, i64, (Count, Extent)>(frame)
+    }
+
+    /// Decode a node frame and encode the node again. Its children and links
+    /// come back paged under their keys, so the result is that one frame.
+    fn reframe<K, V, M>(self: &Arc<Self>, frame: &[u8]) -> Result<Vec<u8>>
+    where
+        K: PersistKey,
+        V: PersistVal,
+        M: PersistMeasure<K, V>,
+    {
+        let tree = self.decode_node::<K, V, M>(frame)?;
+        let mut sink = Sink { gran: Some(self), out: Vec::new() };
+        collect_nodes(&tree, &mut sink);
+        let (_, frame) = sink.out.pop().expect("a decoded node has no key yet, so it is framed");
+        Ok(frame)
     }
 
     fn pager<K, V, M>(self: &Arc<Self>) -> Arc<dyn Pager<K, V, M>>
@@ -976,7 +1022,7 @@ fn decode_header(frame: &[u8]) -> Result<(u8, Vec<ContentKey>, usize)> {
     let tag = *frame.get(1).ok_or_else(|| trunc("node tag"))?;
     let n = u32::from_be_bytes(frame.get(2..6).ok_or_else(|| trunc("count"))?.try_into().unwrap()) as usize;
     let mut pos = 6;
-    let mut refs = Vec::with_capacity(n);
+    let mut refs = Vec::with_capacity(n.min((frame.len() - pos) / CK_LEN));
     for _ in 0..n {
         let end = pos + CK_LEN;
         let b = frame.get(pos..end).ok_or_else(|| trunc("content key"))?;
@@ -1134,6 +1180,27 @@ where
         sink.out.push((ck, bytes));
     }
     Some(ck)
+}
+
+/// A run's or a hole's count, first key and stride. Only a key type that
+/// steps ([`Displace::RUNS`]) has runs, and none is empty: anything else in a
+/// frame is corrupt, and would panic or spin the first time it was stepped.
+fn decode_span<K: PersistKey>(d: &mut Dec<'_>) -> Result<Span<K>> {
+    let n = u64::decode(d)?;
+    let (first, stride) = (K::decode(d)?, K::decode(d)?);
+    if !K::RUNS || n == 0 {
+        return Err(Error::Codec(format!("granfilade: a span of {n} keys its key type cannot hold")));
+    }
+    Ok(Span { first, stride, n })
+}
+
+/// Rows and reserved keys, per item or per child, that sum without
+/// overflow, as every real node's do: the node built on them sums them.
+fn check_sums(parts: impl IntoIterator<Item = (u64, u64)>) -> Result<()> {
+    let total = parts.into_iter().try_fold((0usize, 0u64), |(rows, reserved), (r, h)| {
+        Some((rows.checked_add(usize::try_from(r).ok()?)?, reserved.checked_add(h)?))
+    });
+    total.map(|_| ()).ok_or_else(|| Error::Codec("granfilade: a node holds more keys than there are".into()))
 }
 
 fn hex(ck: &ContentKey) -> String {
@@ -1295,6 +1362,168 @@ mod tests {
         let err = Granfilade::open(dir.path()).err().expect("an old store opened").to_string();
         assert!(err.contains("no root record"), "{err}");
         assert!(err.contains("fresh store"), "{err}");
+    }
+
+    type Fact = Tree<Tuple, i64, (Count, Extent)>;
+    /// A directory keyed by a type with no runs, its values links.
+    type Links = Tree<u64, Fact, Count>;
+    /// Keys with no runs, under a measure that folds a run row by row as
+    /// [`Measure::run`] does by default (the canopy's and the spanfilade's
+    /// do): a run in its frame must be refused before it reaches one.
+    type Scalar = Tree<u64, i64, Rows>;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Rows(u64);
+
+    impl Measure<u64, i64> for Rows {
+        fn empty() -> Self {
+            Rows(0)
+        }
+        fn entry(_k: &u64, _v: &i64) -> Self {
+            Rows(1)
+        }
+        fn combine(&self, right: &Self) -> Self {
+            Rows(self.0.wrapping_add(right.0))
+        }
+        fn displace(&self, _by: i64) -> Self {
+            self.clone()
+        }
+    }
+
+    impl Persist for Rows {
+        fn encode(&self, e: &mut Enc<'_, '_>) {
+            self.0.encode(e);
+        }
+        fn decode(d: &mut Dec<'_>) -> Result<Self> {
+            Ok(Rows(u64::decode(d)?))
+        }
+    }
+
+    /// Deterministic xorshift64*.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// One to four random edits: a bit flipped, a byte or a count-sized word
+    /// overwritten, a tail cut off, a byte inserted.
+    fn mutate(rng: &mut Rng, bytes: &[u8]) -> Vec<u8> {
+        let mut b = bytes.to_vec();
+        for _ in 0..1 + rng.below(4) {
+            let at = rng.below(b.len());
+            match rng.below(5) {
+                0 if !b.is_empty() => b[at] ^= 1 << rng.below(8),
+                1 if !b.is_empty() => b[at] = rng.next() as u8,
+                2 if b.len() >= 8 => {
+                    let word = [0, 1, i64::MAX as u64, u64::MAX, rng.next()][rng.below(5)];
+                    let at = at.min(b.len() - 8);
+                    b[at..at + 8].copy_from_slice(&word.to_be_bytes());
+                }
+                3 => b.truncate(at),
+                _ => b.insert(at, rng.next() as u8),
+            }
+        }
+        b
+    }
+
+    /// Frames of every kind: leaves of rows, runs, holes and links, B+
+    /// internal nodes, and k-d splits with a displaced child.
+    fn every_frame(gran: &Granfilade) -> Vec<Vec<u8>> {
+        let ent = |n: u64| Value::Ent(grmpl_core::Entity(n));
+        let mut bplus = Fact::new();
+        for i in 0..400u64 {
+            // Blocks of ids that fold into runs, and scattered rows between.
+            bplus = bplus.insert_with(Tuple::from([ent(i / 8 * 100 + i % 8), Value::Int(1)]), 1, true);
+            bplus = bplus.insert_with(Tuple::from([ent(i * i + 7), Value::text("x")]), 2, true);
+        }
+        let hole = Span { first: Tuple::from([ent(90_000)]), stride: Tuple::from([Value::Int(1)]), n: 5 };
+        bplus = bplus.reserve(hole).expect("a free span");
+        let mut kd = Fact::new();
+        for i in 0..300u64 {
+            kd = kd.kd_insert(Tuple::from([ent(i * 37 % 1000), ent(i * 91 % 1000)]), 1);
+        }
+        kd = kd.kd_graft(&t(0), &t(1_000), 5_000).expect("an empty target");
+        let links = (0..100u64).fold(Links::new(), |d, i| d.insert(i, if i % 9 == 0 { Fact::new() } else { kd.clone() }));
+        let scalar = (0..300u64).fold(Scalar::new(), |s, i| s.insert(i * 3, i as i64));
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        frames.extend(gran.collect_tree(&bplus).1.into_iter().map(|(_, f)| f));
+        frames.extend(gran.collect_tree(&kd).1.into_iter().map(|(_, f)| f));
+        frames.extend(gran.collect_tree(&links).1.into_iter().map(|(_, f)| f));
+        frames.extend(gran.collect_tree(&scalar).1.into_iter().map(|(_, f)| f));
+        let tags: HashSet<u8> = frames.iter().map(|f| f[1]).collect();
+        assert_eq!(tags.len(), 3, "the corpus lacks a node kind");
+        frames
+    }
+
+    /// `bytes` decoded as a node of a `Tree<K, V, M>` and framed again, or
+    /// `None` if refused, which must be with `Error::Codec`. What decodes
+    /// frames to a fixed point of decoding.
+    fn reframes<K: PersistKey, V: PersistVal, M: PersistMeasure<K, V>>(gran: &Arc<Granfilade>, bytes: &[u8]) -> Option<Vec<u8>> {
+        match gran.reframe::<K, V, M>(bytes) {
+            Ok(once) => {
+                assert_eq!(gran.reframe::<K, V, M>(&once).ok().as_ref(), Some(&once), "not a fixed point");
+                Some(once)
+            }
+            Err(e) => {
+                assert!(matches!(e, Error::Codec(_)), "{e}");
+                None
+            }
+        }
+    }
+
+    /// `bytes` read as a node of every tree type in the corpus.
+    fn every_type(gran: &Arc<Granfilade>, bytes: &[u8]) -> [Option<Vec<u8>>; 3] {
+        [
+            reframes::<Tuple, i64, (Count, Extent)>(gran, bytes),
+            reframes::<u64, Fact, Count>(gran, bytes),
+            reframes::<u64, i64, Rows>(gran, bytes),
+        ]
+    }
+
+    /// **Corrupt frames are refused, never a panic.** Every real frame decodes
+    /// and frames again to the same bytes; a mutated one decodes or is refused
+    /// with `Error::Codec`, whichever tree type reads it, and what decodes
+    /// frames to bytes that are a fixed point of decoding.
+    #[test]
+    fn mutated_frames_decode_or_err_and_never_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let gran = Granfilade::open_with(dir.path(), Durability::Os).unwrap();
+        let frames = every_frame(&gran);
+        let mut read_as = [0; 3];
+        for f in &frames {
+            let types = every_type(&gran, f);
+            let first = types.iter().position(Option::is_some).expect("a real frame does not decode");
+            assert_eq!(types[first].as_ref(), Some(f), "a real frame does not frame again to itself");
+            read_as[first] += 1;
+        }
+        assert!(read_as.iter().all(|&n| n > 0), "a tree type read no frame: {read_as:?}");
+
+        // A run of keys that cannot step, and a run of no keys: neither is
+        // ever written, and a measure that folds the one would panic.
+        let unsteppable = Tree::<u64, i64, Count>::leaf_of(vec![Item::Run(Span { first: 1, stride: 1, n: 3 }, 5)]);
+        let empty = Fact::leaf_of(vec![Item::Run(Span { first: t(1), stride: t(1), n: 0 }, 5)]);
+        for bad in [gran.collect_tree(&unsteppable).1, gran.collect_tree(&empty).1] {
+            assert_eq!(every_type(&gran, &bad[0].1), [None, None, None]);
+        }
+
+        let mut rng = Rng(0xF8A3E);
+        for iter in 0..6_000 {
+            let pick = rng.below(frames.len());
+            let bytes = mutate(&mut rng, &frames[pick]);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| every_type(&gran, &bytes))).is_err() {
+                panic!("iteration {iter} panicked on {bytes:02x?}");
+            }
+        }
     }
 
     #[test]

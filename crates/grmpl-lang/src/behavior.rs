@@ -277,6 +277,23 @@ const OP_RETRACT: u8 = 7;
 const OP_EMIT: u8 = 8;
 const OP_CAPABILITY: u8 = 9;
 
+/// **The deepest a stored behavior's IR may nest**: predicates, operations and
+/// expressions inside one another, counted together. Part of the format, as
+/// [`wire::MAX_DEPTH`] is for values (each literal gets that budget afresh):
+/// a stored behavior is player-supplied, so the decoder refuses deeper input
+/// with `Error::Codec` rather than recursing until it exhausts the stack.
+/// Far deeper than any body a person writes, shallow enough to decode on a
+/// test thread's stack.
+pub const MAX_IR_DEPTH: usize = 256;
+
+/// One level further in, or `Err` past [`MAX_IR_DEPTH`].
+fn nest(depth: usize) -> Result<usize> {
+    if depth >= MAX_IR_DEPTH {
+        return Err(Error::Codec(format!("behavior nests deeper than {MAX_IR_DEPTH} levels")));
+    }
+    Ok(depth + 1)
+}
+
 /// Serialize the guard, message bindings, and canonical executable IR under
 /// the one shared format byte. Literal cells reuse the core value codec.
 pub fn encode_behavior(behavior: &StoredBehavior) -> Vec<u8> {
@@ -290,9 +307,9 @@ pub fn encode_behavior(behavior: &StoredBehavior) -> Vec<u8> {
 
 pub fn decode_behavior(bytes: &[u8]) -> Result<StoredBehavior> {
     let mut pos = wire::read_version(bytes)?;
-    let guard = get_pred(bytes, &mut pos)?;
+    let guard = get_pred(bytes, &mut pos, 0)?;
     let parameters = get_strings(bytes, &mut pos)?;
-    let operations = get_ops(bytes, &mut pos)?;
+    let operations = get_ops(bytes, &mut pos, 0)?;
     if pos != bytes.len() {
         return Err(Error::Codec("trailing bytes after behavior".into()));
     }
@@ -320,7 +337,8 @@ fn put_pred(p: &PredExpr, out: &mut Vec<u8>) {
     }
 }
 
-fn get_pred(bytes: &[u8], pos: &mut usize) -> Result<PredExpr> {
+fn get_pred(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<PredExpr> {
+    let depth = nest(depth)?;
     match get_tag(bytes, pos)? {
         PRED_EQ => {
             let a = get_row(bytes, pos)?;
@@ -329,9 +347,9 @@ fn get_pred(bytes: &[u8], pos: &mut usize) -> Result<PredExpr> {
         }
         PRED_AND => {
             let n = get_u32(bytes, pos)? as usize;
-            let mut ps = Vec::with_capacity(n);
+            let mut ps = Vec::with_capacity(wire::capacity(n, bytes, *pos));
             for _ in 0..n {
-                ps.push(get_pred(bytes, pos)?);
+                ps.push(get_pred(bytes, pos, depth)?);
             }
             Ok(PredExpr::And(ps))
         }
@@ -371,9 +389,9 @@ fn put_ops(operations: &[BehaviorOp], out: &mut Vec<u8>) {
     }
 }
 
-fn get_ops(bytes: &[u8], pos: &mut usize) -> Result<Vec<BehaviorOp>> {
+fn get_ops(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<Vec<BehaviorOp>> {
     let count = get_u32(bytes, pos)? as usize;
-    (0..count).map(|_| get_op(bytes, pos)).collect()
+    (0..count).map(|_| get_op(bytes, pos, depth)).collect()
 }
 
 fn put_op(operation: &BehaviorOp, out: &mut Vec<u8>) {
@@ -452,25 +470,26 @@ fn put_op(operation: &BehaviorOp, out: &mut Vec<u8>) {
     }
 }
 
-fn get_op(bytes: &[u8], pos: &mut usize) -> Result<BehaviorOp> {
+fn get_op(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<BehaviorOp> {
+    let depth = nest(depth)?;
     Ok(match get_tag(bytes, pos)? {
         OP_RESOLVE => BehaviorOp::Resolve {
             view: get_str(bytes, pos)?,
-            arguments: get_exprs(bytes, pos)?,
+            arguments: get_exprs(bytes, pos, depth)?,
             column: get_str(bytes, pos)?,
             op: match get_tag(bytes, pos)? {
                 0 => MatchOp::Exact,
                 1 => MatchOp::Word,
                 tag => return Err(Error::Codec(format!("unknown match op tag {tag}"))),
             },
-            rhs: get_expr(bytes, pos)?,
+            rhs: get_expr(bytes, pos, depth)?,
             destinations: get_strings(bytes, pos)?,
         },
         OP_FIND => {
             let relation = get_str(bytes, pos)?;
             let count = get_u32(bytes, pos)? as usize;
             let arguments = (0..count)
-                .map(|_| get_find_arg(bytes, pos))
+                .map(|_| get_find_arg(bytes, pos, depth))
                 .collect::<Result<_>>()?;
             BehaviorOp::Find {
                 relation,
@@ -479,32 +498,32 @@ fn get_op(bytes: &[u8], pos: &mut usize) -> Result<BehaviorOp> {
         }
         OP_LET => BehaviorOp::Let {
             local: get_str(bytes, pos)?,
-            value: get_expr(bytes, pos)?,
+            value: get_expr(bytes, pos, depth)?,
         },
         OP_IF => BehaviorOp::If {
-            condition: get_bool(bytes, pos)?,
-            then_ops: get_ops(bytes, pos)?,
-            else_ops: get_ops(bytes, pos)?,
+            condition: get_bool(bytes, pos, depth)?,
+            then_ops: get_ops(bytes, pos, depth)?,
+            else_ops: get_ops(bytes, pos, depth)?,
         },
-        OP_EXPECT => get_relation_op(bytes, pos, |relation, arguments| BehaviorOp::Expect {
+        OP_EXPECT => get_relation_op(bytes, pos, depth, |relation, arguments| BehaviorOp::Expect {
             relation,
             arguments,
         })?,
-        OP_ASSERT => get_relation_op(bytes, pos, |relation, arguments| BehaviorOp::Assert {
+        OP_ASSERT => get_relation_op(bytes, pos, depth, |relation, arguments| BehaviorOp::Assert {
             relation,
             arguments,
         })?,
-        OP_RETRACT => get_relation_op(bytes, pos, |relation, arguments| BehaviorOp::Retract {
+        OP_RETRACT => get_relation_op(bytes, pos, depth, |relation, arguments| BehaviorOp::Retract {
             relation,
             arguments,
         })?,
-        OP_EMIT => get_relation_op(bytes, pos, |relation, arguments| BehaviorOp::Emit {
+        OP_EMIT => get_relation_op(bytes, pos, depth, |relation, arguments| BehaviorOp::Emit {
             relation,
             arguments,
         })?,
         OP_CAPABILITY => BehaviorOp::InvokeCapability {
             capability: get_str(bytes, pos)?,
-            arguments: get_exprs(bytes, pos)?,
+            arguments: get_exprs(bytes, pos, depth)?,
             destinations: get_strings(bytes, pos)?,
         },
         tag => return Err(Error::Codec(format!("unknown behavior op tag {tag}"))),
@@ -517,11 +536,11 @@ fn put_relation_op(tag: u8, relation: &str, arguments: &[ExprIr], out: &mut Vec<
     put_exprs(arguments, out);
 }
 
-fn get_relation_op<F>(bytes: &[u8], pos: &mut usize, make: F) -> Result<BehaviorOp>
+fn get_relation_op<F>(bytes: &[u8], pos: &mut usize, depth: usize, make: F) -> Result<BehaviorOp>
 where
     F: FnOnce(String, Vec<ExprIr>) -> BehaviorOp,
 {
-    Ok(make(get_str(bytes, pos)?, get_exprs(bytes, pos)?))
+    Ok(make(get_str(bytes, pos)?, get_exprs(bytes, pos, depth)?))
 }
 
 fn put_find_arg(argument: &FindArg, out: &mut Vec<u8>) {
@@ -542,12 +561,12 @@ fn put_find_arg(argument: &FindArg, out: &mut Vec<u8>) {
     }
 }
 
-fn get_find_arg(bytes: &[u8], pos: &mut usize) -> Result<FindArg> {
+fn get_find_arg(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<FindArg> {
     Ok(match get_tag(bytes, pos)? {
-        FIND_MATCH => FindArg::Match(get_expr(bytes, pos)?),
+        FIND_MATCH => FindArg::Match(get_expr(bytes, pos, depth)?),
         FIND_BIND => FindArg::Bind(get_str(bytes, pos)?),
         FIND_MATCH_BIND => FindArg::MatchBind {
-            value: get_expr(bytes, pos)?,
+            value: get_expr(bytes, pos, depth)?,
             local: get_str(bytes, pos)?,
         },
         tag => return Err(Error::Codec(format!("unknown find argument tag {tag}"))),
@@ -561,9 +580,9 @@ fn put_exprs(expressions: &[ExprIr], out: &mut Vec<u8>) {
     }
 }
 
-fn get_exprs(bytes: &[u8], pos: &mut usize) -> Result<Vec<ExprIr>> {
+fn get_exprs(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<Vec<ExprIr>> {
     let count = get_u32(bytes, pos)? as usize;
-    (0..count).map(|_| get_expr(bytes, pos)).collect()
+    (0..count).map(|_| get_expr(bytes, pos, depth)).collect()
 }
 
 fn put_expr(expression: &ExprIr, out: &mut Vec<u8>) {
@@ -579,10 +598,11 @@ fn put_expr(expression: &ExprIr, out: &mut Vec<u8>) {
     }
 }
 
-fn get_expr(bytes: &[u8], pos: &mut usize) -> Result<ExprIr> {
+fn get_expr(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<ExprIr> {
+    let depth = nest(depth)?;
     match get_tag(bytes, pos)? {
-        EXPR_VALUE => Ok(ExprIr::Value(get_value_expr(bytes, pos)?)),
-        EXPR_BOOL => Ok(ExprIr::Bool(get_bool(bytes, pos)?)),
+        EXPR_VALUE => Ok(ExprIr::Value(get_value_expr(bytes, pos, depth)?)),
+        EXPR_BOOL => Ok(ExprIr::Bool(get_bool(bytes, pos, depth)?)),
         tag => Err(Error::Codec(format!("unknown expression tag {tag}"))),
     }
 }
@@ -608,7 +628,8 @@ fn put_value_expr(expression: &ValueExpr, out: &mut Vec<u8>) {
     }
 }
 
-fn get_value_expr(bytes: &[u8], pos: &mut usize) -> Result<ValueExpr> {
+fn get_value_expr(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<ValueExpr> {
+    let depth = nest(depth)?;
     Ok(match get_tag(bytes, pos)? {
         VALUE_LOCAL => ValueExpr::Local(get_str(bytes, pos)?),
         VALUE_LITERAL => {
@@ -620,7 +641,7 @@ fn get_value_expr(bytes: &[u8], pos: &mut usize) -> Result<ValueExpr> {
             let name = get_str(bytes, pos)?;
             let count = get_u32(bytes, pos)? as usize;
             let arguments = (0..count)
-                .map(|_| get_value_expr(bytes, pos))
+                .map(|_| get_value_expr(bytes, pos, depth))
                 .collect::<Result<_>>()?;
             ValueExpr::Intrinsic { name, arguments }
         }
@@ -657,22 +678,23 @@ fn put_bool(expression: &BoolExpr, out: &mut Vec<u8>) {
     }
 }
 
-fn get_bool(bytes: &[u8], pos: &mut usize) -> Result<BoolExpr> {
+fn get_bool(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<BoolExpr> {
+    let depth = nest(depth)?;
     Ok(match get_tag(bytes, pos)? {
-        BOOL_VALUE => BoolExpr::Value(get_value_expr(bytes, pos)?),
+        BOOL_VALUE => BoolExpr::Value(get_value_expr(bytes, pos, depth)?),
         BOOL_COMPARE => BoolExpr::Compare {
             op: get_compare(get_tag(bytes, pos)?)?,
-            left: get_value_expr(bytes, pos)?,
-            right: get_value_expr(bytes, pos)?,
+            left: get_value_expr(bytes, pos, depth)?,
+            right: get_value_expr(bytes, pos, depth)?,
         },
-        BOOL_NOT => BoolExpr::Not(Box::new(get_bool(bytes, pos)?)),
+        BOOL_NOT => BoolExpr::Not(Box::new(get_bool(bytes, pos, depth)?)),
         BOOL_AND => BoolExpr::And(
-            Box::new(get_bool(bytes, pos)?),
-            Box::new(get_bool(bytes, pos)?),
+            Box::new(get_bool(bytes, pos, depth)?),
+            Box::new(get_bool(bytes, pos, depth)?),
         ),
         BOOL_OR => BoolExpr::Or(
-            Box::new(get_bool(bytes, pos)?),
-            Box::new(get_bool(bytes, pos)?),
+            Box::new(get_bool(bytes, pos, depth)?),
+            Box::new(get_bool(bytes, pos, depth)?),
         ),
         tag => {
             return Err(Error::Codec(format!(
@@ -734,26 +756,25 @@ fn get_tag(bytes: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(t)
 }
 
+/// The `len` bytes at `*pos`, advancing past them.
+fn get_slice<'a>(bytes: &'a [u8], pos: &mut usize, len: usize, what: &str) -> Result<&'a [u8]> {
+    let slice = pos
+        .checked_add(len)
+        .and_then(|end| bytes.get(*pos..end))
+        .ok_or_else(|| Error::Codec(format!("unexpected end ({what})")))?;
+    *pos += len;
+    Ok(slice)
+}
+
 fn get_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    let end = *pos + 4;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::Codec("unexpected end (u32)".into()))?;
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(slice);
-    *pos = end;
-    Ok(u32::from_be_bytes(buf))
+    let slice = get_slice(bytes, pos, 4, "u32")?;
+    Ok(u32::from_be_bytes(slice.try_into().expect("four bytes")))
 }
 
 fn get_str(bytes: &[u8], pos: &mut usize) -> Result<String> {
     let len = get_u32(bytes, pos)? as usize;
-    let end = *pos + len;
-    let slice = bytes
-        .get(*pos..end)
-        .ok_or_else(|| Error::Codec("unexpected end (str)".into()))?;
-    let s = std::str::from_utf8(slice)
+    let slice = get_slice(bytes, pos, len, "str")?;
+    Ok(std::str::from_utf8(slice)
         .map_err(|e| Error::Codec(e.to_string()))?
-        .to_string();
-    *pos = end;
-    Ok(s)
+        .to_string())
 }

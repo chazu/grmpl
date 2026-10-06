@@ -163,7 +163,7 @@ impl Persist for PatchRecord {
         match u32::decode(d)? {
             0 => {
                 let n = u32::decode(d)? as usize;
-                let mut pre = Vec::with_capacity(n.min(1024));
+                let mut pre = Vec::with_capacity(d.cap(n));
                 for _ in 0..n {
                     pre.push((RelId(u32::decode(d)?), Tuple::decode(d)?));
                 }
@@ -189,7 +189,7 @@ fn encode_rels(rels: &[u32], e: &mut Enc<'_, '_>) {
 
 fn decode_rels(d: &mut Dec<'_>) -> Result<Vec<u32>> {
     let n = u32::decode(d)? as usize;
-    let mut out = Vec::with_capacity(n.min(1024));
+    let mut out = Vec::with_capacity(d.cap(n));
     for _ in 0..n {
         out.push(u32::decode(d)?);
     }

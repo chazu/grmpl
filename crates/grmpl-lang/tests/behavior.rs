@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashSet};
 use grmpl_core::{Authority, DomainId, Entity, NoSchemas, RelId, Scope, Tuple, Value};
 use grmpl_diff::Snapshot;
 use grmpl_lang::ast::MatchOp;
-use grmpl_lang::behavior::{decode_behavior, encode_behavior};
+use grmpl_lang::behavior::{decode_behavior, encode_behavior, MAX_IR_DEPTH};
 use grmpl_lang::{
     dispatch, implemented_behaviors, select_behavior, BehaviorIr, BehaviorOp, BoolExpr, CompareOp,
     ExprIr, FindArg, PredExpr, Program, RowExpr, StoredBehavior, ValueExpr,
@@ -268,6 +268,102 @@ fn decode_rejects_wrong_version_and_garbage() {
         decode_behavior(&[]).is_err(),
         "empty buffer must be rejected"
     );
+}
+
+// ---- Oracle 1b: hostile bytes -------------------------------------------
+
+/// A behavior whose one `let` binds a condition `nots` negations deep.
+fn negated(nots: usize) -> StoredBehavior {
+    let mut condition = BoolExpr::Value(ValueExpr::Literal(Value::Bool(true)));
+    for _ in 0..nots {
+        condition = BoolExpr::Not(Box::new(condition));
+    }
+    StoredBehavior::new(
+        PredExpr::And(vec![]),
+        vec![],
+        BehaviorIr::new(vec![BehaviorOp::Let {
+            local: "x".into(),
+            value: ExprIr::Bool(condition),
+        }]),
+    )
+}
+
+/// A stored behavior is player-supplied, so its nesting is bounded: within
+/// [`MAX_IR_DEPTH`] it round-trips, past it the decoder refuses rather than
+/// recursing as deep as the bytes say — a million nested `not`s or `and`s used
+/// to overflow the stack.
+#[test]
+fn deep_behaviors_are_refused_not_a_stack_overflow() {
+    let shallow = negated(MAX_IR_DEPTH - 10);
+    assert_eq!(decode_behavior(&encode_behavior(&shallow)).unwrap(), shallow);
+    let deep = negated(MAX_IR_DEPTH + 10);
+    assert!(matches!(
+        decode_behavior(&encode_behavior(&deep)),
+        Err(grmpl_core::Error::Codec(_))
+    ));
+
+    // Hand-built, far past anything an encoder would produce: a `let` of a
+    // million `not`s, and a guard of a million one-element `and`s.
+    let v = grmpl_core::wire::FORMAT_VERSION;
+    let mut nots = vec![v, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 1, b'x', 2];
+    nots.extend(std::iter::repeat_n(3u8, 1_000_000));
+    let mut ands = vec![v];
+    for _ in 0..1_000_000 {
+        ands.extend_from_slice(&[2, 0, 0, 0, 1]);
+    }
+    for bytes in [nots, ands] {
+        assert!(matches!(decode_behavior(&bytes), Err(grmpl_core::Error::Codec(_))));
+    }
+}
+
+/// A count read from the bytes reserves nothing they cannot fill.
+#[test]
+fn a_huge_count_in_a_behavior_is_refused() {
+    let v = grmpl_core::wire::FORMAT_VERSION;
+    let guard = [v, 2, 0xFF, 0xFF, 0xFF, 0xFF, 1];
+    assert!(matches!(decode_behavior(&guard), Err(grmpl_core::Error::Codec(_))));
+    let ops = [v, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 3];
+    assert!(matches!(decode_behavior(&ops), Err(grmpl_core::Error::Codec(_))));
+}
+
+/// One to four random edits: a bit flipped, a byte or a count-sized word
+/// overwritten, a tail cut off, a byte inserted.
+fn mutate(rng: &mut Rng, bytes: &[u8]) -> Vec<u8> {
+    let mut b = bytes.to_vec();
+    for _ in 0..1 + rng.below(4) {
+        let at = rng.below(b.len().max(1) as u64) as usize;
+        match rng.below(5) {
+            0 if !b.is_empty() => b[at] ^= 1 << rng.below(8),
+            1 if !b.is_empty() => b[at] = rng.next_u64() as u8,
+            2 if b.len() >= 4 => {
+                let word: u32 = [0, 1, 0x7FFF_FFFF, 0xFFFF_FFFF, rng.next_u64() as u32][rng.below(5) as usize];
+                let at = at.min(b.len() - 4);
+                b[at..at + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            3 => b.truncate(at),
+            _ => b.insert(at, rng.next_u64() as u8),
+        }
+    }
+    b
+}
+
+/// Mutated encodings of random behaviors decode or are refused, never panic;
+/// whatever decodes re-encodes to bytes that decode to it again.
+#[test]
+fn mutated_behaviors_decode_or_err_and_never_panic() {
+    let mut rng = Rng::new(0xB0D1);
+    let seeds: Vec<Vec<u8>> = (0..64).map(|_| encode_behavior(&rand_behavior(&mut rng))).collect();
+    for iter in 0..4_000 {
+        let pick = rng.below(seeds.len() as u64) as usize;
+        let bytes = mutate(&mut rng, &seeds[pick]);
+        let got = std::panic::catch_unwind(|| decode_behavior(&bytes))
+            .unwrap_or_else(|_| panic!("iteration {iter} panicked on {bytes:02x?}"));
+        if let Ok(b) = got {
+            let back = decode_behavior(&encode_behavior(&b))
+                .unwrap_or_else(|e| panic!("iteration {iter}: re-encoding {b:?} does not decode: {e}"));
+            assert_eq!(back, b, "iteration {iter}: not a round trip");
+        }
+    }
 }
 
 // ---- Oracle 2: dispatch = the implements view over the live world -------

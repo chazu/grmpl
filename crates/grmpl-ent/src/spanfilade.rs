@@ -80,7 +80,7 @@ impl Persist for Leg {
     fn decode(d: &mut Dec<'_>) -> Result<Self> {
         let width = u64::decode(d)?;
         let n = u32::decode(d)? as usize;
-        let mut rels = Vec::with_capacity(n.min(1024));
+        let mut rels = Vec::with_capacity(d.cap(n));
         for _ in 0..n {
             rels.push(u32::decode(d)?);
         }

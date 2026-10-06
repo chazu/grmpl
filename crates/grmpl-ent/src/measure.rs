@@ -124,8 +124,10 @@ impl<K, V> Measure<K, V> for Count {
     fn entry(_k: &K, _v: &V) -> Self {
         Count(1)
     }
+    /// Wrapping, as a release build adds anyway: no real tree holds `2^64`
+    /// rows, and a corrupt frame's counts must not panic a debug build.
     fn combine(&self, right: &Self) -> Self {
-        Count(self.0 + right.0)
+        Count(self.0.wrapping_add(right.0))
     }
     fn displace(&self, _by: i64) -> Self {
         *self
@@ -210,7 +212,7 @@ impl Extent {
         if n == 0 {
             return;
         }
-        let last = first.step(stride, n as i64 - 1);
+        let last = first.step(stride, (n - 1) as i64);
         let (a, b) = (first.as_slice(), last.as_slice());
         if self.bounds.len() < a.len() {
             self.bounds.resize(a.len(), None);
@@ -223,10 +225,10 @@ impl Extent {
                     None => (lo, hi),
                     Some((l, h)) => (l.min(lo), h.max(hi)),
                 });
-                self.ents[c] += n;
+                self.ents[c] = self.ents[c].wrapping_add(n);
             }
         }
-        self.rows += n;
+        self.rows = self.rows.wrapping_add(n);
     }
 
     /// The bounds of column `col` if every row summarized holds an entity
@@ -262,10 +264,11 @@ impl<V> Measure<Tuple, V> for Extent {
                 (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
             };
         }
+        // Counts wrap, as `Count`'s do: a corrupt frame must not panic.
         for (mine, theirs) in self.ents.iter_mut().zip(&right.ents) {
-            *mine += theirs;
+            *mine = mine.wrapping_add(*theirs);
         }
-        self.rows += right.rows;
+        self.rows = self.rows.wrapping_add(right.rows);
     }
     fn absorb_entry(&mut self, key: &Tuple, _val: &V) {
         let cells = key.as_slice();
@@ -279,10 +282,10 @@ impl<V> Measure<Tuple, V> for Extent {
                     None => (e.0, e.0),
                     Some((lo, hi)) => (lo.min(e.0), hi.max(e.0)),
                 });
-                *n += 1;
+                *n = n.wrapping_add(1);
             }
         }
-        self.rows += 1;
+        self.rows = self.rows.wrapping_add(1);
     }
     /// Every bound moves with the entity cells it summarizes. The tree only
     /// displaces subtrees whose keys do not wrap, so the order of each pair

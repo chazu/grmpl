@@ -59,6 +59,12 @@ Decoders reject any other version loudly (`Error::Codec`) rather than misreading
 an evolved layout. **Bump `FORMAT_VERSION` on any change to the tag set or
 framing.**
 
+**Every decoder treats its bytes as hostile**: any input gives `Ok` or
+`Error::Codec`, never a panic. Nesting is bounded (`wire::MAX_DEPTH`,
+`behavior::MAX_IR_DEPTH`), and a count read from input reserves no more than
+the bytes left (`wire::capacity`, `Dec::cap`). Seeded mutation laws check it
+in the suite; `fuzz/` (`mise run fuzz`) checks it harder.
+
 ### Displacement (`grmpl-ent::tree`, `dsp`)
 
 Every `Tree` handle carries a **dsp** (its node's position relative to its

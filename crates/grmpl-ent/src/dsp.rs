@@ -64,6 +64,11 @@ pub trait Displace: Ord + Clone {
         pivot.cmp_displaced(by, self).reverse()
     }
 
+    /// Whether this key type forms runs: whether [`stride_to`](Self::stride_to)
+    /// ever answers `Some`, so [`step`](Self::step) may be called. A frame
+    /// holding a run or a hole of any other key type is corrupt.
+    const RUNS: bool = false;
+
     /// **Runs** (Gold's `RegionLoaf`; fidelity gap G9). The stride that takes
     /// this key to `next` in one step, if `next` is the next row of some run
     /// starting here: a key greater than this one, differing only in columns
@@ -88,6 +93,8 @@ pub trait Displace: Ord + Clone {
 /// shifted by `d`, and the variant order between an entity and a non-entity cell
 /// does not change.
 impl Displace for Tuple {
+    const RUNS: bool = true;
+
     fn displace(&self, by: i64) -> Self {
         if by == 0 {
             return self.clone();

@@ -1,0 +1,56 @@
+# cargo-fuzz targets for every decoder that reads hostile or corrupt bytes.
+# Excluded from the workspace (it needs nightly and libFuzzer); run with
+# `mise run fuzz` or `cargo +nightly fuzz run <target>` from the repo root.
+[package]
+name = "grmpl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root, so no enclosing workspace claims it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+grmpl-core = { path = "../crates/grmpl-core" }
+grmpl-ent = { path = "../crates/grmpl-ent" }
+grmpl-lang = { path = "../crates/grmpl-lang" }
+tempfile = "3"
+
+[[bin]]
+name = "decode_message"
+path = "fuzz_targets/decode_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_schema"
+path = "fuzz_targets/decode_schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_value"
+path = "fuzz_targets/decode_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "behavior"
+path = "fuzz_targets/behavior.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node_frame"
+path = "fuzz_targets/node_frame.rs"
+test = false
+doc = false
+bench = false

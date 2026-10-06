@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# cargo-fuzz targets: nightly-only, built on their own (`mise run fuzz`).
+exclude = ["fuzz"]
 members = [
     "crates/grmpl-core",
     "crates/grmpl-diff",
