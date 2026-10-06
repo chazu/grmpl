@@ -200,6 +200,7 @@ version = "0.0.1"
 name = "grmpl-diff"
 version = "0.0.1"
 dependencies = [
+ "grmpl-conformance",
  "grmpl-core",
  "grmpl-ent",
  "tempfile",

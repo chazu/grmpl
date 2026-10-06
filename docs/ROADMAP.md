@@ -135,7 +135,8 @@ columns (P1).
 * **Stateless boundary-recompute delta.** `Reduce` is non-linear, so its delta
   over `(from, to]` is `reduce(input@to) − reduce(input@from)` — the same
   recompute-on-change rule as `distinct`. Per-key incremental state (recompute
-  only the keys whose groups changed, `DESIGN.md` §3) is deferred to P13.
+  only the keys whose groups changed, `DESIGN.md` §3) is deferred to P13, and
+  has since landed there for inputs over one base relation.
 * **Threaded through the engine.** `collect_rels`, `eval_with`/`eval_inner`
   (Shared + Recur contexts), and `eval_delta` all handle `Reduce`. Aggregates
   are **rejected inside `Iterate`** (`Error::Query`): a recursive fixpoint over a
@@ -450,14 +451,22 @@ corresponding tickets for detail.
   (`distinct(A@e)(t) = [A@e(t) > 0]`, so only tuples whose weight actually
   changed can contribute), and all three non-linear operators now short-circuit
   to an empty delta when `touched_since` proves their base relations were not
-  touched. **Still open:** per-key incremental `Reduce` state. An aggregate over
-  a group depends on every member, so a changed row means re-folding its whole
-  group and the members are not in the difference; `compare` gives the affected
-  keys for free, but reading a group *by key* needs a primitive the substrate
-  does not have (`read_range` takes tuple bounds, and a group's exclusive upper
-  bound is not computable for an arbitrary `Value`). That primitive, or genuine
-  per-key state, is the remaining work. Laws:
-  `grmpl-diff/tests/compare_delta_law.rs`.
+  touched. **Per-key `Reduce` deltas** have landed for an input that is one base
+  relation (range-restricted or not) seen through `Filter`, `Project` and
+  `Distinct` — which covers the `reduce(distinct(project(…)))` a one-atom
+  aggregate view lowers to. An aggregate over a group depends on every member,
+  so a changed row still means re-folding its whole group; but `compare` names
+  the changed groups, one `TraceStore::lookup` on the key's lead column reads
+  their members at `to`, and their members at `from` are those with the
+  compare's old weights put back, so the past is never read. A one-row commit to
+  a 5,000-row relation in 500 groups now reads 12 rows where the boundary
+  recompute read 10,001. **Still open:** compound inputs (joins, unions, `Map`,
+  `Inherit`) and the global aggregate (empty key) keep the boundary recompute:
+  reading a join's groups by key means pushing the key restriction through the
+  plan, a rewrite rather than a read. Genuine per-key aggregate *state* (stored
+  folds, or the materialized copy for an aggregating view, whose delta still
+  comes from its plan) is also open. Laws:
+  `grmpl-diff/tests/compare_delta_law.rs`, `grmpl-diff/tests/reduce_stream.rs`.
 * **P14 — Diff generalization** (abelian groups).
 * **P15 — Distribution.**
 

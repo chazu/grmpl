@@ -72,10 +72,11 @@ pub enum Query {
     Negate(Box<Query>),
     Distinct(Box<Query>),
     /// Group `input` by `key` columns and fold each group with `agg` — a
-    /// non-linear boundary recompute (DESIGN.md §3, the "reduce / aggregate"
-    /// row). The result is `key-columns ++ [aggregate]`, one weight-1 tuple per
-    /// non-empty group. Stateless in v1 (per-key incremental state is P13); not
-    /// permitted inside an `Iterate`.
+    /// non-linear operator (DESIGN.md §3, the "reduce / aggregate" row). The
+    /// result is `key-columns ++ [aggregate]`, one weight-1 tuple per non-empty
+    /// group. Over one base relation, filtered and projected, its delta
+    /// re-folds only the groups that changed; otherwise it is a boundary
+    /// recompute. Not permitted inside an `Iterate`.
     Reduce { input: Box<Query>, key: Arc<[usize]>, agg: Agg },
     /// Reference to the enclosing `Iterate`'s current value (the recursion
     /// variable). Only meaningful inside an `Iterate`'s `step`.
@@ -808,6 +809,163 @@ fn matching(
     eval_snapshot(side, store, at)
 }
 
+/// A base relation seen through **row-wise** operators — `Filter`s and
+/// `Project`s, each of which sends a row to at most one row and keeps its
+/// weight — so the query at an edition is the relation's state there, each row
+/// replaced by its [`image`](Rows::image) and equal images summed.
+struct Rows<'a> {
+    base: BaseRel<'a>,
+    /// Innermost first.
+    steps: Vec<Step<'a>>,
+}
+
+enum Step<'a> {
+    Filter(&'a Pred),
+    Project(&'a [usize]),
+}
+
+impl Rows<'_> {
+    /// What the query makes of the base row `t`: `None` if its span or a
+    /// filter drops it.
+    fn image(&self, t: &Tuple) -> Option<Tuple> {
+        if !self.base.admits(t) {
+            return None;
+        }
+        let mut t = t.clone();
+        for step in &self.steps {
+            match step {
+                Step::Filter(pred) => {
+                    if !pred(&t) {
+                        return None;
+                    }
+                }
+                Step::Project(cols) => t = project_tuple(&t, cols),
+            }
+        }
+        Some(t)
+    }
+
+    /// The base column whose value the query's column `col` carries.
+    fn source(&self, mut col: usize) -> Option<usize> {
+        for step in self.steps.iter().rev() {
+            if let Step::Project(cols) = step {
+                col = *cols.get(col)?;
+            }
+        }
+        Some(col)
+    }
+}
+
+/// Recognize the row-wise shape. A `Map` is row-wise too, but it hides which
+/// base column a key came from, and that is what a lookup probes.
+fn rows_of(q: &Query) -> Option<Rows<'_>> {
+    match q {
+        Query::Filter { input, pred } => {
+            let mut rows = rows_of(input)?;
+            rows.steps.push(Step::Filter(pred));
+            Some(rows)
+        }
+        Query::Project { input, cols } => {
+            let mut rows = rows_of(input)?;
+            rows.steps.push(Step::Project(cols));
+            Some(rows)
+        }
+        Query::Shared(inner) => rows_of(inner),
+        _ => Some(Rows { base: base_of(q)?, steps: Vec::new() }),
+    }
+}
+
+/// `t`'s group under `key`, or `None` if `t` is too short to have one.
+fn group_of(t: &Tuple, key: &[usize]) -> Option<Vec<Value>> {
+    key.iter().map(|&c| t.as_slice().get(c).cloned()).collect()
+}
+
+/// **The per-key `reduce` delta.** `None` when the input is not a base relation
+/// seen through `distinct` and [row-wise](Rows) operators, or the key is empty
+/// (one global group is the whole input); the caller then recomputes both
+/// boundaries.
+///
+/// A group's aggregate can only change if one of its members did, and
+/// [`TraceStore::compare`] returns every base row whose weight changed, so the
+/// groups their images fall in are all the groups that can move. Each is
+/// re-folded whole at both ends, which is what keeps `Min`/`Max` right when the
+/// extreme is retracted, and a group that empties has no fold at `to`. The
+/// members at `to` are one [`TraceStore::lookup`] on the base column the key's
+/// lead comes from, for the groups' distinct leads. The members at `from` are
+/// those with the compare's weights at `from` put back — the relation at `from`
+/// *is* the relation at `to` with its changed rows restored — so the past is
+/// never read.
+///
+/// `reduce` reads its input's *set* boundary, which `distinct` leaves as it is,
+/// so a `distinct` under it is seen through: that is the shape a one-atom
+/// aggregate view lowers to. A row too short for the key, which the snapshot
+/// refuses, sends the delta to the recompute so that it is refused the same
+/// way.
+///
+/// On the Ent this costs the edit plus the touched groups. On a store with the
+/// default `compare` and `lookup` it reads the relation three times where the
+/// recompute read it twice; with more leads than [`PROBE_LIMIT`] it falls back
+/// after the compare.
+fn reduce_by_key(
+    input: &Query,
+    key: &[usize],
+    agg: &Agg,
+    store: &dyn TraceStore,
+    from: Edition,
+    to: Edition,
+) -> Result<Option<Multiset>> {
+    let mut input = input;
+    loop {
+        match input {
+            Query::Distinct(inner) => input = inner,
+            Query::Shared(inner) => input = inner,
+            _ => break,
+        }
+    }
+    let (Some(rows), Some(&lead)) = (rows_of(input), key.first()) else {
+        return Ok(None);
+    };
+    let Some(col) = rows.source(lead) else {
+        return Ok(None);
+    };
+    // The changed groups, and how each image's weight at `from` differs from
+    // its weight at `to`.
+    let mut groups = std::collections::BTreeSet::new();
+    let mut back = Multiset::new();
+    for (t, w_from, w_to) in store.compare(rows.base.rel, from, to)? {
+        let Some(image) = rows.image(&t) else { continue };
+        let Some(group) = group_of(&image, key) else {
+            return Ok(None);
+        };
+        groups.insert(group);
+        multiset::add(&mut back, image, w_from - w_to);
+    }
+    let leads: std::collections::BTreeSet<&Value> = groups.iter().map(|g| &g[0]).collect();
+    if leads.is_empty() {
+        // No changed row reaches the input.
+        return Ok(Some(Multiset::new()));
+    }
+    if leads.len() > PROBE_LIMIT {
+        return Ok(None);
+    }
+    let leads: Vec<Value> = leads.into_iter().cloned().collect();
+    let mut at_to = Multiset::new();
+    for (t, w) in store.lookup(rows.base.rel, to, col, &leads)? {
+        let Some(image) = rows.image(&t) else { continue };
+        match group_of(&image, key) {
+            None => return Ok(None),
+            Some(group) if groups.contains(&group) => multiset::add(&mut at_to, image, w),
+            Some(_) => {}
+        }
+    }
+    let mut at_from = at_to.clone();
+    multiset::merge(&mut at_from, &back);
+    let mut out = reduce_snapshot(&at_to, key, agg);
+    multiset::merge(&mut out, &negate(&reduce_snapshot(&at_from, key, agg)));
+    multiset::strip_zeros(&mut out);
+    Ok(Some(out))
+}
+
 /// Is `q` **provably** unchanged over `(from, to]`?
 ///
 /// A query is a pure function of its base relations, so if the substrate can
@@ -831,8 +989,9 @@ fn quiet(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition) -> Resul
 
 /// The change in a query's result over `(from, to]` — computed incrementally
 /// from children's deltas (linear ops), the bilinear rule (join), a
-/// version-compare over the changed tuples (distinct over a base relation), or
-/// a boundary recompute. Equal to `snapshot(to) − snapshot(from)`.
+/// version-compare over the changed tuples (distinct over a base relation), the
+/// changed groups re-folded (reduce over a base relation), or a boundary
+/// recompute. Equal to `snapshot(to) − snapshot(from)`.
 pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition) -> Result<Multiset> {
     Ok(match q {
         Query::Rel(r) => {
@@ -956,23 +1115,24 @@ pub fn eval_delta(q: &Query, store: &dyn TraceStore, from: Edition, to: Edition)
             }
         }
         Query::Reduce { input, key, agg } => {
-            // Non-linear, like `distinct`: recompute the aggregate boundary at
-            // each end and difference.
+            // Non-linear, like `distinct`, but not answerable from the
+            // difference alone: an aggregate over a group depends on *every*
+            // member, so a changed row means re-folding its whole group, and
+            // the members are not in the difference.
             //
-            // Unlike `distinct` this cannot be answered from the difference
-            // alone: an aggregate over a group depends on *every* member, so a
-            // single changed row means re-folding its whole group, and the
-            // members are not in the difference. `compare` does give the
-            // **affected keys** for free, but reading a group by key needs a
-            // read-the-rows-with-this-key primitive the substrate does not have
-            // (`read_range` takes tuple bounds, and a group's exclusive upper
-            // bound is not computable for an arbitrary `Value`). Per-key
-            // incremental state (DESIGN.md §3) is P13 and is the real answer.
-            //
-            // What is available is the cheap exit: if no base relation was
-            // touched, the delta is empty and neither boundary need be built.
+            // If no base relation was touched, the delta is empty and nothing
+            // need be read. Otherwise, over a base relation, the delta is kept
+            // **per key** ([`reduce_by_key`]): the compare names the groups that
+            // changed and a keyed lookup reads just their members. Any other
+            // input — a join, a union, a `Map` — recomputes the aggregate
+            // boundary at each end and differences: reading its groups by key
+            // would mean pushing the key restriction through the operators
+            // below, which is a plan rewrite, not a read.
             if quiet(q, store, from, to)? {
                 return Ok(Multiset::new());
+            }
+            if let Some(out) = reduce_by_key(input, key, agg, store, from, to)? {
+                return Ok(out);
             }
             let to_set = reduce_snapshot(&eval_snapshot(input, store, to)?, key, agg);
             let from_set = reduce_snapshot(&eval_snapshot(input, store, from)?, key, agg);

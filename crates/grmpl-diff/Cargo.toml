@@ -9,5 +9,6 @@ description = "The differential engine: Query (a dataflow plan as a value), Snap
 grmpl-core = { workspace = true }
 
 [dev-dependencies]
+grmpl-conformance = { path = "../grmpl-conformance" }
 grmpl-ent = { path = "../grmpl-ent" }
 tempfile = "3"
