@@ -499,7 +499,9 @@ Not a numbered phase; tracked against Xanadu's `Ent` in
   every version holding some content across branches; `shared_region` compares
   two versions by identity. Laws: `grmpl-ent/src/history_laws.rs`,
   `grmpl-ent/tests/history.rs`.
-* **Open, in order:** merges in the version trace; the canopies, recorders and
-  a general Agenda; splits on any dimension. Also a transactional graft
-  effect in a patch (phase 3A of the world-package plan). The full list of fidelity gaps is
+* **Landed since the audit:** merges in the version DAG (step 5), splits on any
+  column (step 6), and run, lazy and partial leaves (step 7). Canopies,
+  recorders (G5, G6) and per-dimension dsps (G10) were examined and declined.
+* **Open:** a transactional graft effect in a patch (phase 3A of the
+  world-package plan). The standing list of fidelity gaps is
   [`ENT-FIDELITY-GAPS.md`](ENT-FIDELITY-GAPS.md).

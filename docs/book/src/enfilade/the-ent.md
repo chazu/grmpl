@@ -53,8 +53,9 @@ differently:
 
 Put them together and a version *point* is the pair `(branch, position)` — which
 is exactly what a `TracePosition` (`BoundedTrace`) is. In grmpl the linear run
-per branch is an enfilade and the branch graph ties them together; grmpl's
-branches form a tree, since it does not yet implement Gold's merges.
+per branch is an enfilade and the branch graph ties them together. Since
+fidelity step 5 that graph is a DAG, as Gold's is: a merge is a branch with two
+parents, built by replaying the merged branch's patches.
 
 Splitting it this way is what makes provenance cheap. The linear log alone cannot
 answer cross-branch questions, and a single flat DAG over every commit would make

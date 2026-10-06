@@ -28,8 +28,9 @@ here, because each one was on this page as future work and is now load-bearing:
   shared content keys, so comparing two editions costs the size of the
   difference.
 - **Persistent Derived enfilades** — a materialized view is an ordinary relation
-  in the Fact enfilade, so it survives a reopen and is carried by a fork. Built
-  and tested, but nothing in the runtime maintains one yet.
+  in the Fact enfilade, so it survives a reopen and is carried by a fork. The
+  runtime maintains every `materialized view` a world declares, per commit, and
+  reads it whenever it is provably current.
 - **The canopy on the reactive path** — the canopy is an enfilade, and the pump
   routes through the substrate instead of re-evaluating on every pump.
 
@@ -129,7 +130,7 @@ The through-line: grmpl already earns the name `Ent` by its laws and by an
 implementation with every distinctive structural component present *and on the
 running system's path*. The building phase is over; the persistent derived layer
 that used to head this chapter is now in the Fact enfilade with everything else,
-though not yet wired into the runtime.
+maintained by the runtime.
 What is left is to **spend** that structure — turning `O(depth)` search,
 `O(edit)` copy, upward interest summaries, and downward inherited context into a
 provenance surface, a parser, and, ultimately, a distributed world that migrates
