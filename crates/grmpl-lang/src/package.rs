@@ -8,7 +8,17 @@ use grmpl_core::{
 };
 
 use crate::ast::{BootstrapValue, Decl};
+use crate::diagnostic::{Diagnostic, Pos, Spanned};
 use crate::{parse, Program};
+
+/// The package source, for rendering an error at the declaration it concerns.
+struct Source<'a>(&'a str);
+
+impl Source<'_> {
+    fn at(&self, pos: Pos, msg: impl Into<String>) -> String {
+        Diagnostic::new(pos, msg).render(self.0, None)
+    }
+}
 
 /// Source cannot spell this identifier because relation names are identifiers;
 /// it is allocated through the same durable catalog as ordinary relations.
@@ -285,11 +295,12 @@ impl CompiledPackage {
         catalog: &dyn Catalog,
         rel_base: u32,
     ) -> Result<Self, String> {
-        let declarations = parse(source)?;
-        let (package_id, bootstrap_version) = package_header(&declarations)?;
-        let entities = compile_entities(&declarations)?;
-        let requirements = compile_requirements(&declarations, &entities)?;
-        let authority_requests = compile_authorities(&declarations)?;
+        let src = &Source(source);
+        let declarations = parse(source).map_err(|d| d.render(source, None))?;
+        let (package_id, bootstrap_version) = package_header(&declarations, src)?;
+        let entities = compile_entities(&declarations, src)?;
+        let requirements = compile_requirements(&declarations, &entities, src)?;
+        let authority_requests = compile_authorities(&declarations, src)?;
 
         let mut program = Program::compile_with_catalog(source, catalog, rel_base)?;
         program.validate_entity_namespace(&entities)?;
@@ -307,16 +318,18 @@ impl CompiledPackage {
         )?;
 
         validate_requirements(&program, &entities, &requirements)?;
-        program.validate_behaviors()?;
-        let bootstrap_facts = compile_bootstrap(&declarations, &program, &entities)?;
+        program
+            .validate_behaviors()
+            .map_err(|(pos, msg)| src.at(pos, msg))?;
+        let bootstrap_facts = compile_bootstrap(&declarations, &program, &entities, src)?;
         validate_resource_seeds(&bootstrap_facts, &requirements)?;
         let actors = compile_actors(
             &declarations,
             &program,
             &entities,
-            &authority_requests,
             &requirements,
             &bootstrap_facts,
+            src,
         )?;
         let bootstrap_digest = digest(
             &package_id,
@@ -485,59 +498,70 @@ impl CompiledPackage {
     }
 }
 
-fn package_header(declarations: &[Decl]) -> Result<(String, u32), String> {
+fn package_header(declarations: &[Spanned<Decl>], src: &Source) -> Result<(String, u32), String> {
     let headers: Vec<_> = declarations
         .iter()
-        .filter_map(|decl| match decl {
+        .filter_map(|decl| match &decl.node {
             Decl::Package {
                 id,
                 bootstrap_version,
-            } => Some((id.clone(), *bootstrap_version)),
+            } => Some((id.clone(), *bootstrap_version, decl.pos)),
             _ => None,
         })
         .collect();
     match headers.as_slice() {
-        [header] => Ok(header.clone()),
+        [(id, version, _)] => Ok((id.clone(), *version)),
         [] => Err("a loaded package requires exactly one `package` declaration".into()),
-        _ => Err("a package source declares `package` more than once".into()),
+        [_, (_, _, pos), ..] => {
+            Err(src.at(*pos, "a package source declares `package` more than once"))
+        }
     }
 }
 
-fn compile_entities(declarations: &[Decl]) -> Result<BTreeMap<String, Entity>, String> {
+fn compile_entities(
+    declarations: &[Spanned<Decl>],
+    src: &Source,
+) -> Result<BTreeMap<String, Entity>, String> {
     let mut entities = BTreeMap::new();
     let mut ids = BTreeSet::new();
-    for declaration in declarations {
-        let Decl::Entity { name, id } = declaration else {
+    for Spanned { node, pos } in declarations {
+        let Decl::Entity { name, id } = node else {
             continue;
         };
         if *id < 0 {
-            return Err(format!("entity `{name}` has negative id {id}"));
+            return Err(src.at(*pos, format!("entity `{name}` has negative id {id}")));
         }
         let entity = Entity(*id as u64);
         if entities.insert(name.clone(), entity).is_some() {
-            return Err(format!("entity `{name}` is declared twice"));
+            return Err(src.at(*pos, format!("entity `{name}` is declared twice")));
         }
         if !ids.insert(entity) {
-            return Err(format!("entity id {id} is declared twice"));
+            return Err(src.at(*pos, format!("entity id {id} is declared twice")));
         }
     }
     Ok(entities)
 }
 
-fn compile_authorities(declarations: &[Decl]) -> Result<Vec<AuthorityRequest>, String> {
+fn compile_authorities(
+    declarations: &[Spanned<Decl>],
+    src: &Source,
+) -> Result<Vec<AuthorityRequest>, String> {
     let mut requests = Vec::new();
     let mut names = BTreeSet::new();
-    for declaration in declarations {
-        let Decl::Authority { name, writes } = declaration else {
+    for Spanned { node, pos } in declarations {
+        let Decl::Authority { name, writes } = node else {
             continue;
         };
         if !names.insert(name.clone()) {
-            return Err(format!("authority `{name}` is declared twice"));
+            return Err(src.at(*pos, format!("authority `{name}` is declared twice")));
         }
         let mut writes = writes.clone();
         writes.sort();
         if writes.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(format!("authority `{name}` requests a relation twice"));
+            return Err(src.at(
+                *pos,
+                format!("authority `{name}` requests a relation twice"),
+            ));
         }
         requests.push(AuthorityRequest {
             name: name.clone(),
@@ -549,20 +573,24 @@ fn compile_authorities(declarations: &[Decl]) -> Result<Vec<AuthorityRequest>, S
 }
 
 fn compile_actors(
-    declarations: &[Decl],
+    declarations: &[Spanned<Decl>],
     program: &Program,
     entities: &BTreeMap<String, Entity>,
-    authorities: &[AuthorityRequest],
     requirements: &[CapabilityRequirement],
     bootstrap: &[CompiledBootstrapFact],
+    src: &Source,
 ) -> Result<Vec<CompiledActor>, String> {
-    let authority_names: BTreeSet<_> = authorities.iter().map(|a| a.name.as_str()).collect();
-    for authority in authorities {
-        for relation in &authority.writes {
+    let mut authority_names = BTreeSet::new();
+    for Spanned { node, pos } in declarations {
+        let Decl::Authority { name, writes } = node else {
+            continue;
+        };
+        authority_names.insert(name.as_str());
+        for relation in writes {
             if program.rel_id(relation).is_none() {
-                return Err(format!(
-                    "authority `{}` requests undeclared relation `{relation}`",
-                    authority.name
+                return Err(src.at(
+                    *pos,
+                    format!("authority `{name}` requests undeclared relation `{relation}`"),
                 ));
             }
         }
@@ -576,7 +604,7 @@ fn compile_actors(
         .collect();
     if declarations
         .iter()
-        .any(|declaration| matches!(declaration, Decl::Actor { .. }))
+        .any(|declaration| matches!(declaration.node, Decl::Actor { .. }))
         && sequence_names.len() != 1
     {
         return Err("static actors require exactly one schedule sequence relation".into());
@@ -585,34 +613,37 @@ fn compile_actors(
 
     let mut actors = Vec::new();
     let mut actor_names = BTreeSet::new();
-    for declaration in declarations {
+    for Spanned { node, pos } in declarations {
         let Decl::Actor {
             entity,
             inbox,
             cursor,
             authority,
-        } = declaration
+        } = node
         else {
             continue;
         };
+        let at = |msg: String| src.at(*pos, msg);
         if !actor_names.insert(entity.clone()) {
-            return Err(format!("actor `{entity}` is declared twice"));
+            return Err(at(format!("actor `{entity}` is declared twice")));
         }
         let entity_id = entities
             .get(entity)
             .copied()
-            .ok_or_else(|| format!("actor `{entity}` names no entity constant"))?;
+            .ok_or_else(|| at(format!("actor `{entity}` names no entity constant")))?;
         if !authority_names.contains(authority.as_str()) {
-            return Err(format!(
+            return Err(at(format!(
                 "actor `{entity}` names undeclared authority `{authority}`"
-            ));
+            )));
         }
         let inbox_id = program
             .rel_id(inbox)
-            .ok_or_else(|| format!("actor `{entity}` names undeclared inbox `{inbox}`"))?;
-        let cursor_id = program
-            .rel_id(cursor)
-            .ok_or_else(|| format!("actor `{entity}` names undeclared cursor `{cursor}`"))?;
+            .ok_or_else(|| at(format!("actor `{entity}` names undeclared inbox `{inbox}`")))?;
+        let cursor_id = program.rel_id(cursor).ok_or_else(|| {
+            at(format!(
+                "actor `{entity}` names undeclared cursor `{cursor}`"
+            ))
+        })?;
         if program.schema(inbox)
             != Some(Schema::new(vec![
                 Column::new("process", Ty::Ent),
@@ -620,9 +651,9 @@ fn compile_actors(
                 Column::new("body", Ty::Tuple),
             ]))
         {
-            return Err(format!(
+            return Err(at(format!(
                 "actor `{entity}` inbox `{inbox}` must have schema `(process: Ent, seq: Int, body: Tuple)`"
-            ));
+            )));
         }
         if program.schema(cursor)
             != Some(Schema::new(vec![
@@ -630,11 +661,11 @@ fn compile_actors(
                 Column::new("pos", Ty::Int),
             ]))
         {
-            return Err(format!(
+            return Err(at(format!(
                 "actor `{entity}` cursor `{cursor}` must have schema `(process: Ent, pos: Int)`"
-            ));
+            )));
         }
-        program.handler_irs(inbox)?;
+        program.handler_irs(inbox).map_err(at)?;
 
         let sequence_name = sequence_name.expect("checked above");
         let sequence_rows: Vec<_> = bootstrap
@@ -647,12 +678,12 @@ fn compile_actors(
         let next = match sequence_rows.as_slice() {
             [row] => match row.fact.tuple.as_slice() {
                 [Value::Ent(_), Value::Int(next)] if *next >= 0 => *next,
-                _ => return Err(format!("actor `{entity}` has invalid sequence seed")),
+                _ => return Err(at(format!("actor `{entity}` has invalid sequence seed"))),
             },
             _ => {
-                return Err(format!(
+                return Err(at(format!(
                     "actor `{entity}` needs exactly one non-negative bootstrap sequence row"
-                ))
+                )))
             }
         };
         let mut inbox_sequences: Vec<_> = bootstrap
@@ -673,9 +704,9 @@ fn compile_actors(
             .collect();
         inbox_sequences.sort();
         if inbox_sequences != (0..next).collect::<Vec<_>>() {
-            return Err(format!(
+            return Err(at(format!(
                 "actor `{entity}` bootstrap inbox must occupy contiguous sequence range 0..{next}"
-            ));
+            )));
         }
         let cursor_rows: Vec<_> = bootstrap
             .iter()
@@ -696,7 +727,7 @@ fn compile_actors(
                 .first()
                 .is_some_and(|position| *position < 0 || *position > next)
         {
-            return Err(format!("actor `{entity}` has invalid bootstrap cursor"));
+            return Err(at(format!("actor `{entity}` has invalid bootstrap cursor")));
         }
         actors.push(CompiledActor {
             name: entity.clone(),
@@ -713,14 +744,16 @@ fn compile_actors(
 }
 
 fn compile_requirements(
-    declarations: &[Decl],
+    declarations: &[Spanned<Decl>],
     entities: &BTreeMap<String, Entity>,
+    src: &Source,
 ) -> Result<Vec<CapabilityRequirement>, String> {
     let mut requirements = Vec::new();
     let mut names = BTreeSet::new();
     let mut ranges = Vec::new();
-    for declaration in declarations {
-        let requirement = match declaration {
+    for Spanned { node, pos } in declarations {
+        let at = |msg: String| src.at(*pos, msg);
+        let requirement = match node {
             Decl::RequireAllocate {
                 name,
                 counter,
@@ -728,23 +761,23 @@ fn compile_requirements(
                 last,
             } => {
                 if *first < 0 || first > last || *last == i64::MAX {
-                    return Err(format!(
+                    return Err(at(format!(
                         "allocate requirement `{name}` has invalid range; the final counter successor must fit Int"
-                    ));
+                    )));
                 }
                 for entity in entities.values() {
                     let id = entity.0 as i64;
                     if (*first..=*last).contains(&id) {
-                        return Err(format!(
+                        return Err(at(format!(
                             "entity id {id} lies inside allocation range `{name}`"
-                        ));
+                        )));
                     }
                 }
                 for (other_name, other_first, other_last) in &ranges {
                     if *first <= *other_last && *other_first <= *last {
-                        return Err(format!(
+                        return Err(at(format!(
                             "allocation ranges `{other_name}` and `{name}` overlap"
-                        ));
+                        )));
                     }
                 }
                 ranges.push((name.clone(), *first, *last));
@@ -762,7 +795,9 @@ fn compile_requirements(
                 algorithm,
             } => {
                 let owner = entities.get(owner).copied().ok_or_else(|| {
-                    format!("random requirement `{name}` has unknown owner `{owner}`")
+                    at(format!(
+                        "random requirement `{name}` has unknown owner `{owner}`"
+                    ))
                 })?;
                 CapabilityRequirement::Random {
                     name: name.clone(),
@@ -785,10 +820,10 @@ fn compile_requirements(
             _ => continue,
         };
         if !names.insert(requirement.name().to_owned()) {
-            return Err(format!(
+            return Err(at(format!(
                 "capability `{}` is declared twice",
                 requirement.name()
-            ));
+            )));
         }
         requirements.push(requirement);
     }
@@ -891,50 +926,60 @@ fn validate_requirements(
 }
 
 fn compile_bootstrap(
-    declarations: &[Decl],
+    declarations: &[Spanned<Decl>],
     program: &Program,
     entities: &BTreeMap<String, Entity>,
+    src: &Source,
 ) -> Result<Vec<CompiledBootstrapFact>, String> {
     let blocks: Vec<_> = declarations
         .iter()
-        .filter_map(|decl| match decl {
-            Decl::Bootstrap { facts } => Some(facts),
+        .filter_map(|decl| match &decl.node {
+            Decl::Bootstrap { facts } => Some((facts, decl.pos)),
             _ => None,
         })
         .collect();
     let facts = match blocks.as_slice() {
-        [facts] => *facts,
+        [(facts, _)] => *facts,
         [] => return Err("a loaded package requires exactly one `bootstrap` block".into()),
-        _ => return Err("a package source declares `bootstrap` more than once".into()),
+        [_, (_, pos), ..] => {
+            return Err(src.at(*pos, "a package source declares `bootstrap` more than once"))
+        }
     };
 
     let mut compiled = Vec::new();
     let mut seen = BTreeSet::new();
     for source_fact in facts.iter() {
+        let at = |msg: String| src.at(source_fact.pos, msg);
         if source_fact.rel == INSTALL_MARKER_RELATION {
-            return Err("bootstrap cannot reference the reserved install marker".into());
+            return Err(at(
+                "bootstrap cannot reference the reserved install marker".into()
+            ));
         }
-        let relation = program
-            .rel_id(&source_fact.rel)
-            .ok_or_else(|| format!("bootstrap names undeclared relation `{}`", source_fact.rel))?;
+        let relation = program.rel_id(&source_fact.rel).ok_or_else(|| {
+            at(format!(
+                "bootstrap names undeclared relation `{}`",
+                source_fact.rel
+            ))
+        })?;
         let values = source_fact
             .values
             .iter()
             .map(|value| lower_bootstrap_value(value, entities))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(at)?;
         let tuple = Tuple::new(values);
         let schema = program
             .schema(&source_fact.rel)
             .expect("declared relation has schema");
         schema
             .check(&tuple)
-            .map_err(|error| format!("bootstrap `{}`: {error}", source_fact.rel))?;
+            .map_err(|error| at(format!("bootstrap `{}`: {error}", source_fact.rel)))?;
         let key = (source_fact.rel.clone(), tuple.clone());
         if !seen.insert(key) {
-            return Err(format!(
+            return Err(at(format!(
                 "bootstrap fact `{}` is duplicated",
                 source_fact.rel
-            ));
+            )));
         }
         compiled.push(CompiledBootstrapFact {
             relation_name: source_fact.rel.clone(),

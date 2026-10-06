@@ -9,9 +9,12 @@
 pub struct ColDecl {
     pub name: String,
     pub ty: Option<String>,
+    pub pos: Pos,
 }
 
 use grmpl_core::{FiniteF64, Value};
+
+use crate::diagnostic::Pos;
 
 /// An argument to a view atom: a variable, or a literal.
 #[derive(Clone, PartialEq, Debug)]
@@ -40,6 +43,7 @@ pub enum BootstrapValue {
 pub struct BootstrapFact {
     pub rel: String,
     pub values: Vec<BootstrapValue>,
+    pub pos: Pos,
 }
 
 /// A body atom of a `view`: `rel(arg, arg, ...)`.
@@ -51,6 +55,8 @@ pub struct Atom {
     /// inherits for `key` from the `context` relation `ctx`, rather than
     /// matching a stored row.
     pub inherit: bool,
+    /// Where the atom starts, for the errors it causes.
+    pub pos: Pos,
 }
 
 /// An aggregate function that may head a `yield` item: `count`, `sum`, `min`,

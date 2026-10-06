@@ -56,6 +56,17 @@ Everything below is syntax for producing relations, views, and behaviors.
   Floats are finite binary64; NaN and infinities are not values.
 * Whitespace and newlines are insignificant except as token separators.
 
+Errors name the line and column (counted in characters, from 1) of what caused
+them — the offending token, or the declaration, column, or view atom a compile
+check rejects — and quote the line:
+
+```text
+error: bad.grmpl:2:1: expected `)`, found `view`
+  |
+2 | view x() { foo(a) yield a }
+  | ^
+```
+
 A program is a sequence of top-level declarations: `package`, `entity`,
 `requires`, `authority`, `actor`, `bootstrap`, `rel`, `view`, `form`, and `on`.
 Order is free (a `view` may mention a `rel` declared later).

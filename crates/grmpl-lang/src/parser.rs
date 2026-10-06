@@ -19,6 +19,9 @@
 //! rule    := patom+ "->" Ident "(" identlist? ")"
 //! patom   := Str | Ident
 //! ```
+//!
+//! Every error is a [`Diagnostic`] at the offending token, or at the end of
+//! input when the source stops short.
 
 use grmpl_core::Value;
 
@@ -27,51 +30,107 @@ use crate::ast::{
     Expr, FormRule, MatchOp, PAtom, SArg, Stmt, UnaryOp,
 };
 use crate::concat::{ConcatArm, Word};
+use crate::diagnostic::{Diagnostic, Pos, Spanned};
 use crate::lexer::{lex, Token};
 
-pub fn parse(src: &str) -> Result<Vec<Decl>, String> {
-    let tokens = lex(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+/// Parse a source into its top-level declarations, each with the position of
+/// its first token.
+pub fn parse(src: &str) -> Result<Vec<Spanned<Decl>>, Diagnostic> {
+    let lexed = lex(src)?;
+    let mut p = Parser {
+        tokens: lexed.tokens,
+        pos: 0,
+        end: lexed.end,
+    };
     let mut decls = Vec::new();
     while p.peek().is_some() {
-        decls.push(p.decl()?);
+        let pos = p.here();
+        decls.push(Spanned {
+            node: p.decl()?,
+            pos,
+        });
     }
     Ok(decls)
 }
 
+type PResult<T> = Result<T, Diagnostic>;
+
+/// How a message names what was found: the token, or the end of input.
+fn found(token: &Option<Token>) -> String {
+    match token {
+        Some(token) => token.to_string(),
+        None => "end of input".into(),
+    }
+}
+
 struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<Spanned<Token>>,
     pos: usize,
+    /// Where the input ends: the position an error at end of input points to.
+    end: Pos,
 }
 
 impl Parser {
     fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+        self.tokens.get(self.pos).map(|t| &t.node)
     }
     fn next(&mut self) -> Option<Token> {
-        let t = self.tokens.get(self.pos).cloned();
+        let t = self.tokens.get(self.pos).map(|t| t.node.clone());
         if t.is_some() {
             self.pos += 1;
         }
         t
     }
-    fn expect(&mut self, want: &Token) -> Result<(), String> {
+    /// Where the next token starts, or the end of input.
+    fn here(&self) -> Pos {
+        self.tokens.get(self.pos).map_or(self.end, |t| t.pos)
+    }
+    /// Where the last consumed token starts.
+    fn last(&self) -> Pos {
+        self.pos
+            .checked_sub(1)
+            .map_or(Pos::START, |i| self.tokens[i].pos)
+    }
+    /// An error about `token`, just returned by [`next`](Self::next): at it,
+    /// or at the end of input if there was none.
+    fn at_found(&self, token: &Option<Token>, msg: String) -> Diagnostic {
+        let pos = if token.is_some() {
+            self.last()
+        } else {
+            self.end
+        };
+        Diagnostic::new(pos, msg)
+    }
+    /// `expected {what}, found {token}`, at `token` (see [`at_found`](Self::at_found)).
+    fn expected(&self, what: &str, token: Option<Token>) -> Diagnostic {
+        let msg = format!("expected {what}, found {}", found(&token));
+        self.at_found(&token, msg)
+    }
+    /// An error at the next token, or at the end of input.
+    fn at_here(&self, msg: impl Into<String>) -> Diagnostic {
+        Diagnostic::new(self.here(), msg)
+    }
+    /// An error at the last consumed token.
+    fn at_last(&self, msg: impl Into<String>) -> Diagnostic {
+        Diagnostic::new(self.last(), msg)
+    }
+    fn expect(&mut self, want: &Token) -> PResult<()> {
         match self.next() {
             Some(ref t) if t == want => Ok(()),
-            other => Err(format!("expected {want:?}, found {other:?}")),
+            other => Err(self.expected(&want.to_string(), other)),
         }
     }
-    fn ident(&mut self) -> Result<String, String> {
+    fn ident(&mut self) -> PResult<String> {
         match self.next() {
             Some(Token::Ident(s)) => Ok(s),
-            other => Err(format!("expected identifier, found {other:?}")),
+            other => Err(self.expected("identifier", other)),
         }
     }
     fn is_ident(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Token::Ident(s)) if s == kw)
     }
 
-    fn decl(&mut self) -> Result<Decl, String> {
+    fn decl(&mut self) -> PResult<Decl> {
         match self.peek() {
             Some(Token::Ident(k)) if k == "package" => self.package_decl(),
             Some(Token::Ident(k)) if k == "entity" => self.entity_decl(),
@@ -88,37 +147,40 @@ impl Parser {
             Some(Token::Ident(k)) if k == "materialized" => {
                 self.next(); // materialized
                 if !self.is_ident("view") {
-                    return Err("`materialized` must be followed by `view`".into());
+                    return Err(self.at_here("`materialized` must be followed by `view`"));
                 }
                 self.view_decl(true)
             }
             Some(Token::Ident(k)) if k == "form" => self.form_decl(),
             Some(Token::Ident(k)) if k == "on" => self.on_decl(),
-            other => Err(format!(
+            other => Err(self.at_here(format!(
                 "expected a declaration (package/entity/requires/authority/actor/bootstrap/rel/context/view/\
                  materialized view/form/on), \
-                 found {other:?}"
-            )),
+                 found {}",
+                found(&other.cloned())
+            ))),
         }
     }
 
-    fn keyword(&mut self, expected: &str) -> Result<(), String> {
+    fn keyword(&mut self, expected: &str) -> PResult<()> {
         match self.ident()?.as_str() {
             actual if actual == expected => Ok(()),
-            actual => Err(format!("expected `{expected}`, found `{actual}`")),
+            actual => Err(self.at_last(format!("expected `{expected}`, found `{actual}`"))),
         }
     }
 
-    fn package_decl(&mut self) -> Result<Decl, String> {
+    fn package_decl(&mut self) -> PResult<Decl> {
         self.next(); // package
         let id = self.ident()?;
         self.keyword("bootstrap")?;
         let version = match self.next() {
             Some(Token::Int(n)) if (0..=u32::MAX as i64).contains(&n) => n as u32,
             other => {
-                return Err(format!(
-                    "package bootstrap version must be a u32, found {other:?}"
-                ))
+                let msg = format!(
+                    "package bootstrap version must be a u32, found {}",
+                    found(&other)
+                );
+                return Err(self.at_found(&other, msg));
             }
         };
         Ok(Decl::Package {
@@ -127,22 +189,20 @@ impl Parser {
         })
     }
 
-    fn signed_int(&mut self, what: &str) -> Result<i64, String> {
+    fn signed_int(&mut self, what: &str) -> PResult<i64> {
         match self.next() {
             Some(Token::Int(n)) => Ok(n),
             Some(Token::Minus) => match self.next() {
                 Some(Token::Int(n)) => n
                     .checked_neg()
-                    .ok_or_else(|| format!("{what} is below i64::MIN")),
-                other => Err(format!(
-                    "expected integer after `-` for {what}, found {other:?}"
-                )),
+                    .ok_or_else(|| self.at_last(format!("{what} is below i64::MIN"))),
+                other => Err(self.expected(&format!("integer after `-` for {what}"), other)),
             },
-            other => Err(format!("expected integer for {what}, found {other:?}")),
+            other => Err(self.expected(&format!("integer for {what}"), other)),
         }
     }
 
-    fn entity_decl(&mut self) -> Result<Decl, String> {
+    fn entity_decl(&mut self) -> PResult<Decl> {
         self.next(); // entity
         let name = self.ident()?;
         self.expect(&Token::Eq)?;
@@ -150,8 +210,9 @@ impl Parser {
         Ok(Decl::Entity { name, id })
     }
 
-    fn requires_decl(&mut self) -> Result<Decl, String> {
+    fn requires_decl(&mut self) -> PResult<Decl> {
         self.next(); // requires
+        let kind_pos = self.here();
         let kind = self.ident()?;
         let name = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -214,23 +275,26 @@ impl Parser {
                 }
             }
             other => {
-                return Err(format!(
+                return Err(Diagnostic::new(
+                    kind_pos,
+                    format!(
                 "unknown capability requirement `{other}` (expected allocate, random, or schedule)"
-            ))
+            ),
+                ))
             }
         };
         self.expect(&Token::RParen)?;
         Ok(decl)
     }
 
-    fn authority_decl(&mut self) -> Result<Decl, String> {
+    fn authority_decl(&mut self) -> PResult<Decl> {
         self.next(); // authority
         let name = self.ident()?;
         self.expect(&Token::LBrace)?;
         let mut writes = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated authority block".into());
+                return Err(self.at_here("unterminated authority block"));
             }
             self.keyword("write")?;
             writes.push(self.ident()?);
@@ -239,7 +303,8 @@ impl Parser {
         Ok(Decl::Authority { name, writes })
     }
 
-    fn actor_decl(&mut self) -> Result<Decl, String> {
+    fn actor_decl(&mut self) -> PResult<Decl> {
+        let start = self.here();
         self.next(); // actor
         let entity = self.ident()?;
         self.expect(&Token::LBrace)?;
@@ -248,37 +313,48 @@ impl Parser {
         let mut authority = None;
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated actor block".into());
+                return Err(self.at_here("unterminated actor block"));
             }
+            let field_pos = self.here();
             let field = self.ident()?;
             let value = self.ident()?;
             let slot = match field.as_str() {
                 "inbox" => &mut inbox,
                 "cursor" => &mut cursor,
                 "authority" => &mut authority,
-                _ => return Err(format!("unknown actor field `{field}`")),
+                _ => {
+                    return Err(Diagnostic::new(
+                        field_pos,
+                        format!("unknown actor field `{field}`"),
+                    ))
+                }
             };
             if slot.replace(value).is_some() {
-                return Err(format!("actor field `{field}` declared twice"));
+                return Err(Diagnostic::new(
+                    field_pos,
+                    format!("actor field `{field}` declared twice"),
+                ));
             }
         }
         self.next();
+        let missing = |field: &str| Diagnostic::new(start, format!("actor needs `{field}`"));
         Ok(Decl::Actor {
             entity,
-            inbox: inbox.ok_or_else(|| "actor needs `inbox`".to_string())?,
-            cursor: cursor.ok_or_else(|| "actor needs `cursor`".to_string())?,
-            authority: authority.ok_or_else(|| "actor needs `authority`".to_string())?,
+            inbox: inbox.ok_or_else(|| missing("inbox"))?,
+            cursor: cursor.ok_or_else(|| missing("cursor"))?,
+            authority: authority.ok_or_else(|| missing("authority"))?,
         })
     }
 
-    fn bootstrap_decl(&mut self) -> Result<Decl, String> {
+    fn bootstrap_decl(&mut self) -> PResult<Decl> {
         self.next(); // bootstrap
         self.expect(&Token::LBrace)?;
         let mut facts = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated bootstrap block".into());
+                return Err(self.at_here("unterminated bootstrap block"));
             }
+            let pos = self.here();
             let rel = self.ident()?;
             self.expect(&Token::LParen)?;
             let values = if matches!(self.peek(), Some(Token::RParen)) {
@@ -287,13 +363,13 @@ impl Parser {
                 self.bootstrap_values()?
             };
             self.expect(&Token::RParen)?;
-            facts.push(BootstrapFact { rel, values });
+            facts.push(BootstrapFact { rel, values, pos });
         }
         self.next(); // }
         Ok(Decl::Bootstrap { facts })
     }
 
-    fn bootstrap_values(&mut self) -> Result<Vec<BootstrapValue>, String> {
+    fn bootstrap_values(&mut self) -> PResult<Vec<BootstrapValue>> {
         let mut values = vec![self.bootstrap_value()?];
         while matches!(self.peek(), Some(Token::Comma)) {
             self.next();
@@ -302,7 +378,7 @@ impl Parser {
         Ok(values)
     }
 
-    fn bootstrap_value(&mut self) -> Result<BootstrapValue, String> {
+    fn bootstrap_value(&mut self) -> PResult<BootstrapValue> {
         match self.next() {
             Some(Token::Ident(name)) if name == "true" => Ok(BootstrapValue::Bool(true)),
             Some(Token::Ident(name)) if name == "false" => Ok(BootstrapValue::Bool(false)),
@@ -314,11 +390,11 @@ impl Parser {
                 Some(Token::Int(value)) => value
                     .checked_neg()
                     .map(BootstrapValue::Int)
-                    .ok_or_else(|| "bootstrap integer is below i64::MIN".into()),
+                    .ok_or_else(|| self.at_last("bootstrap integer is below i64::MIN")),
                 Some(Token::Float(value)) => Ok(BootstrapValue::Float(
                     grmpl_core::FiniteF64::new(-value.get()).expect("finite negation stays finite"),
                 )),
-                other => Err(format!("expected a number after `-`, found {other:?}")),
+                other => Err(self.expected("a number after `-`", other)),
             },
             Some(Token::LParen) => {
                 let values = if matches!(self.peek(), Some(Token::RParen)) {
@@ -329,11 +405,11 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(BootstrapValue::Tuple(values))
             }
-            other => Err(format!("expected bootstrap literal, found {other:?}")),
+            other => Err(self.expected("bootstrap literal", other)),
         }
     }
 
-    fn identlist(&mut self) -> Result<Vec<String>, String> {
+    fn identlist(&mut self) -> PResult<Vec<String>> {
         let mut out = vec![self.ident()?];
         while matches!(self.peek(), Some(Token::Comma)) {
             self.next();
@@ -342,7 +418,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn rel_decl(&mut self) -> Result<Decl, String> {
+    fn rel_decl(&mut self) -> PResult<Decl> {
         self.next(); // rel
         let name = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -352,7 +428,7 @@ impl Parser {
     }
 
     /// `collist := col ("," col)*` where `col := Ident (":" Ident)?`.
-    fn collist(&mut self) -> Result<Vec<ColDecl>, String> {
+    fn collist(&mut self) -> PResult<Vec<ColDecl>> {
         let mut out = vec![self.col_decl()?];
         while matches!(self.peek(), Some(Token::Comma)) {
             self.next();
@@ -361,7 +437,8 @@ impl Parser {
         Ok(out)
     }
 
-    fn col_decl(&mut self) -> Result<ColDecl, String> {
+    fn col_decl(&mut self) -> PResult<ColDecl> {
+        let pos = self.here();
         let name = self.ident()?;
         let ty = if matches!(self.peek(), Some(Token::Colon)) {
             self.next(); // :
@@ -369,10 +446,10 @@ impl Parser {
         } else {
             None
         };
-        Ok(ColDecl { name, ty })
+        Ok(ColDecl { name, ty, pos })
     }
 
-    fn view_decl(&mut self, materialized: bool) -> Result<Decl, String> {
+    fn view_decl(&mut self, materialized: bool) -> PResult<Decl> {
         self.next(); // view
         let name = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -387,7 +464,7 @@ impl Parser {
         let mut atoms = Vec::new();
         while !self.is_ident("yield") {
             if matches!(self.peek(), Some(Token::RBrace)) | self.peek().is_none() {
-                return Err("view body must end with a `yield`".into());
+                return Err(self.at_here("view body must end with a `yield`"));
             }
             atoms.push(self.atom()?);
         }
@@ -410,10 +487,11 @@ impl Parser {
     /// grouping column. A second aggregate, an unknown aggregate name, or a
     /// wrong aggregate arity (`count` takes no column; `sum`/`min`/`max` take
     /// one) is a parse error.
-    fn yield_clause(&mut self) -> Result<(Vec<String>, Option<AggYield>), String> {
+    fn yield_clause(&mut self) -> PResult<(Vec<String>, Option<AggYield>)> {
         let mut yields = Vec::new();
         let mut agg: Option<AggYield> = None;
         loop {
+            let pos = self.here();
             let name = self.ident()?;
             if matches!(self.peek(), Some(Token::LParen)) {
                 self.next(); // (
@@ -423,28 +501,31 @@ impl Parser {
                     Some(self.ident()?)
                 };
                 self.expect(&Token::RParen)?;
+                let at = |msg: String| Diagnostic::new(pos, msg);
                 let func = match name.as_str() {
                     "count" => AggFunc::Count,
                     "sum" => AggFunc::Sum,
                     "min" => AggFunc::Min,
                     "max" => AggFunc::Max,
                     other => {
-                        return Err(format!(
+                        return Err(at(format!(
                             "unknown aggregate `{other}` (expected count, sum, min, or max)"
-                        ))
+                        )))
                     }
                 };
                 match (func, &col) {
                     (AggFunc::Count, Some(c)) => {
-                        return Err(format!("aggregate `count` takes no column, found `{c}`"))
+                        return Err(at(format!(
+                            "aggregate `count` takes no column, found `{c}`"
+                        )))
                     }
                     (AggFunc::Sum | AggFunc::Min | AggFunc::Max, None) => {
-                        return Err(format!("aggregate `{name}` needs a column"))
+                        return Err(at(format!("aggregate `{name}` needs a column")))
                     }
                     _ => {}
                 }
                 if agg.is_some() {
-                    return Err("a view `yield` may contain at most one aggregate".into());
+                    return Err(at("a view `yield` may contain at most one aggregate".into()));
                 }
                 agg = Some(AggYield { func, col });
             } else {
@@ -459,7 +540,8 @@ impl Parser {
         Ok((yields, agg))
     }
 
-    fn atom(&mut self) -> Result<Atom, String> {
+    fn atom(&mut self) -> PResult<Atom> {
+        let pos = self.here();
         let mut rel = self.ident()?;
         let inherit = rel == "inherit" && matches!(self.peek(), Some(Token::Ident(_)));
         if inherit {
@@ -472,10 +554,15 @@ impl Parser {
             args.push(self.arg()?);
         }
         self.expect(&Token::RParen)?;
-        Ok(Atom { rel, args, inherit })
+        Ok(Atom {
+            rel,
+            args,
+            inherit,
+            pos,
+        })
     }
 
-    fn arg(&mut self) -> Result<Arg, String> {
+    fn arg(&mut self) -> PResult<Arg> {
         match self.next() {
             Some(Token::Ident(s)) if s == "true" => Ok(Arg::Bool(true)),
             Some(Token::Ident(s)) if s == "false" => Ok(Arg::Bool(false)),
@@ -487,24 +574,24 @@ impl Parser {
                 Some(Token::Int(n)) => n
                     .checked_neg()
                     .map(Arg::Int)
-                    .ok_or_else(|| "integer literal is below i64::MIN".into()),
+                    .ok_or_else(|| self.at_last("integer literal is below i64::MIN")),
                 Some(Token::Float(n)) => Ok(Arg::Float(
                     grmpl_core::FiniteF64::new(-n.get()).expect("finite negation stays finite"),
                 )),
-                other => Err(format!("expected a number after `-`, found {other:?}")),
+                other => Err(self.expected("a number after `-`", other)),
             },
-            other => Err(format!("expected an argument, found {other:?}")),
+            other => Err(self.expected("an argument", other)),
         }
     }
 
-    fn form_decl(&mut self) -> Result<Decl, String> {
+    fn form_decl(&mut self) -> PResult<Decl> {
         self.next(); // form
         let name = self.ident()?;
         self.expect(&Token::LBrace)?;
         let mut rules = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated form body".into());
+                return Err(self.at_here("unterminated form body"));
             }
             rules.push(self.rule()?);
         }
@@ -512,17 +599,17 @@ impl Parser {
         Ok(Decl::Form { name, rules })
     }
 
-    fn rule(&mut self) -> Result<FormRule, String> {
+    fn rule(&mut self) -> PResult<FormRule> {
         let mut seq = Vec::new();
         while !matches!(self.peek(), Some(Token::Arrow)) {
             match self.next() {
                 Some(Token::Str(s)) => seq.push(PAtom::Lit(s)),
                 Some(Token::Ident(s)) => seq.push(PAtom::Bind(s)),
-                other => return Err(format!("expected a pattern atom or `->`, found {other:?}")),
+                other => return Err(self.expected("a pattern atom or `->`", other)),
             }
         }
         if seq.is_empty() {
-            return Err("form rule has an empty pattern".into());
+            return Err(self.at_here("form rule has an empty pattern"));
         }
         self.expect(&Token::Arrow)?;
         let tag = self.ident()?;
@@ -540,18 +627,21 @@ impl Parser {
         })
     }
 
-    fn on_decl(&mut self) -> Result<Decl, String> {
+    fn on_decl(&mut self) -> PResult<Decl> {
+        let start = self.here();
         self.next(); // on
                      // `on watch <view> { … }` — the reactive-handler surface — shares the
                      // `on` keyword with the message-handler `on <inbox> parse <form> { … }`,
                      // disambiguated by the `watch` keyword immediately after `on`.
         if self.is_ident("watch") {
-            return self.on_watch_decl();
+            return self.on_watch_decl(start);
         }
         let inbox = self.ident()?;
         match self.ident()?.as_str() {
             "parse" => {}
-            other => return Err(format!("expected `parse` in on-handler, found `{other}`")),
+            other => {
+                return Err(self.at_last(format!("expected `parse` in on-handler, found `{other}`")))
+            }
         }
         let form = self.ident()?;
         self.expect(&Token::LBrace)?;
@@ -559,7 +649,7 @@ impl Parser {
         let mut word_arms = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated on-handler".into());
+                return Err(self.at_here("unterminated on-handler"));
             }
             // Each arm is `match Tag(vars)` followed by either a `{ stmt* }`
             // statement body (v1) or a `[ word* ]` concatenative body (P11);
@@ -569,9 +659,10 @@ impl Parser {
                 Some(Token::LBrace) => stmt_arms.push(self.stmt_arm(tag, vars)?),
                 Some(Token::LBracket) => word_arms.push(self.word_arm(tag, vars)?),
                 other => {
-                    return Err(format!(
-                        "expected `{{` (statement arm) or `[` (concatenative arm), found {other:?}"
-                    ))
+                    return Err(self.at_here(format!(
+                        "expected `{{` (statement arm) or `[` (concatenative arm), found {}",
+                        found(&other.cloned())
+                    )))
                 }
             }
         }
@@ -585,10 +676,10 @@ impl Parser {
     }
 
     /// `on watch <view> ("including" "current")? "{" ("inbox"|"cursor"|"seqs")
-    /// Ident … "}"` — a reactive handler over a maintained view. `on` and the
-    /// `watch` keyword are already consumed. Each of the three relation bindings
-    /// must appear exactly once; order is free.
-    fn on_watch_decl(&mut self) -> Result<Decl, String> {
+    /// Ident … "}"` — a reactive handler over a maintained view. `on` (which
+    /// starts at `start`) and the `watch` keyword are already consumed. Each of
+    /// the three relation bindings must appear exactly once; order is free.
+    fn on_watch_decl(&mut self, start: Pos) -> PResult<Decl> {
         self.next(); // watch
         let view = self.ident()?;
         let including_current = if self.is_ident("including") {
@@ -596,9 +687,9 @@ impl Parser {
             match self.ident()?.as_str() {
                 "current" => {}
                 other => {
-                    return Err(format!(
+                    return Err(self.at_last(format!(
                         "expected `current` after `including`, found `{other}`"
-                    ))
+                    )))
                 }
             }
             true
@@ -609,34 +700,43 @@ impl Parser {
         let mut inbox: Option<String> = None;
         let mut cursor: Option<String> = None;
         let mut seqs: Option<String> = None;
-        let set = |slot: &mut Option<String>, rel: String, key: &str| -> Result<(), String> {
+        let set = |slot: &mut Option<String>, rel: String, key: &str, pos: Pos| -> PResult<()> {
             if slot.is_some() {
-                return Err(format!("on-watch binding `{key}` set twice"));
+                return Err(Diagnostic::new(
+                    pos,
+                    format!("on-watch binding `{key}` set twice"),
+                ));
             }
             *slot = Some(rel);
             Ok(())
         };
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated on-watch body".into());
+                return Err(self.at_here("unterminated on-watch body"));
             }
+            let pos = self.here();
             let key = self.ident()?;
             let rel = self.ident()?;
             match key.as_str() {
-                "inbox" => set(&mut inbox, rel, "inbox")?,
-                "cursor" => set(&mut cursor, rel, "cursor")?,
-                "seqs" => set(&mut seqs, rel, "seqs")?,
+                "inbox" => set(&mut inbox, rel, "inbox", pos)?,
+                "cursor" => set(&mut cursor, rel, "cursor", pos)?,
+                "seqs" => set(&mut seqs, rel, "seqs", pos)?,
                 other => {
-                    return Err(format!(
-                        "unknown on-watch binding `{other}` (expected inbox, cursor, or seqs)"
+                    return Err(Diagnostic::new(
+                        pos,
+                        format!(
+                            "unknown on-watch binding `{other}` (expected inbox, cursor, or seqs)"
+                        ),
                     ))
                 }
             }
         }
         self.next(); // }
-        let inbox = inbox.ok_or("on-watch missing `inbox` binding")?;
-        let cursor = cursor.ok_or("on-watch missing `cursor` binding")?;
-        let seqs = seqs.ok_or("on-watch missing `seqs` binding")?;
+        let missing =
+            |key: &str| Diagnostic::new(start, format!("on-watch missing `{key}` binding"));
+        let inbox = inbox.ok_or_else(|| missing("inbox"))?;
+        let cursor = cursor.ok_or_else(|| missing("cursor"))?;
+        let seqs = seqs.ok_or_else(|| missing("seqs"))?;
         Ok(Decl::OnWatch {
             view,
             inbox,
@@ -647,10 +747,10 @@ impl Parser {
     }
 
     /// `match Tag ( identlist? )` — the shared head of both arm surfaces.
-    fn arm_header(&mut self) -> Result<(String, Vec<String>), String> {
+    fn arm_header(&mut self) -> PResult<(String, Vec<String>)> {
         match self.ident()?.as_str() {
             "match" => {}
-            other => return Err(format!("expected `match`, found `{other}`")),
+            other => return Err(self.at_last(format!("expected `match`, found `{other}`"))),
         }
         let tag = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -663,12 +763,12 @@ impl Parser {
         Ok((tag, vars))
     }
 
-    fn stmt_arm(&mut self, tag: String, vars: Vec<String>) -> Result<Arm, String> {
+    fn stmt_arm(&mut self, tag: String, vars: Vec<String>) -> PResult<Arm> {
         self.expect(&Token::LBrace)?;
         let mut stmts = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated match arm".into());
+                return Err(self.at_here("unterminated match arm"));
             }
             stmts.push(self.stmt()?);
         }
@@ -677,12 +777,12 @@ impl Parser {
     }
 
     /// `[ word* ]` — a point-free concatenative arm body.
-    fn word_arm(&mut self, tag: String, vars: Vec<String>) -> Result<ConcatArm, String> {
+    fn word_arm(&mut self, tag: String, vars: Vec<String>) -> PResult<ConcatArm> {
         self.expect(&Token::LBracket)?;
         let mut words = Vec::new();
         while !matches!(self.peek(), Some(Token::RBracket)) {
             if self.peek().is_none() {
-                return Err("unterminated concatenative arm".into());
+                return Err(self.at_here("unterminated concatenative arm"));
             }
             words.push(self.word()?);
         }
@@ -695,7 +795,7 @@ impl Parser {
     /// literal push. The seam words consume a fixed number of *immediate*
     /// operands from the token stream (a view/relation name, a column, a match
     /// op, a key count) — their stack operands come at runtime, not here.
-    fn word(&mut self) -> Result<Word, String> {
+    fn word(&mut self) -> PResult<Word> {
         match self.next() {
             Some(Token::Str(s)) => Ok(Word::Lit(Value::text(&s))),
             Some(Token::Int(n)) => Ok(Word::Lit(Value::Int(n))),
@@ -706,11 +806,11 @@ impl Parser {
                 Some(Token::Int(n)) => n
                     .checked_neg()
                     .map(|n| Word::Lit(Value::Int(n)))
-                    .ok_or_else(|| "integer literal is below i64::MIN".into()),
+                    .ok_or_else(|| self.at_last("integer literal is below i64::MIN")),
                 Some(Token::Float(n)) => Ok(Word::Lit(Value::Float(
                     grmpl_core::FiniteF64::new(-n.get()).expect("finite negation stays finite"),
                 ))),
-                other => Err(format!("expected a number after `-`, found {other:?}")),
+                other => Err(self.expected("a number after `-`", other)),
             },
             Some(Token::Ident(kw)) => match kw.as_str() {
                 "self" => Ok(Word::SelfEntity),
@@ -747,7 +847,7 @@ impl Parser {
                     let op = match self.next() {
                         Some(Token::Eq) => MatchOp::Exact,
                         Some(Token::Tilde) => MatchOp::Word,
-                        other => return Err(format!("expected `=` or `~`, found {other:?}")),
+                        other => return Err(self.expected("`=` or `~`", other)),
                     };
                     Ok(Word::Resolve { view, col, op })
                 }
@@ -755,7 +855,10 @@ impl Parser {
                     let rel = self.ident()?;
                     let keyn = match self.next() {
                         Some(Token::Int(n)) if n >= 0 => n as usize,
-                        other => return Err(format!("`find` needs a key count, found {other:?}")),
+                        other => {
+                            let msg = format!("`find` needs a key count, found {}", found(&other));
+                            return Err(self.at_found(&other, msg));
+                        }
                     };
                     Ok(Word::Find { rel, keyn })
                 }
@@ -763,13 +866,13 @@ impl Parser {
                 "assert" => Ok(Word::Assert(self.ident()?)),
                 "retract" => Ok(Word::Retract(self.ident()?)),
                 "emit" => Ok(Word::Emit(self.ident()?)),
-                other => Err(format!("unknown word `{other}`")),
+                other => Err(self.at_last(format!("unknown word `{other}`"))),
             },
-            other => Err(format!("expected a word, found {other:?}")),
+            other => Err(self.expected("a word", other)),
         }
     }
 
-    fn stmt(&mut self) -> Result<Stmt, String> {
+    fn stmt(&mut self) -> PResult<Stmt> {
         let kw = self.ident()?;
         match kw.as_str() {
             "let" => {
@@ -800,9 +903,9 @@ impl Parser {
                 match self.ident()?.as_str() {
                     "as" => {}
                     other => {
-                        return Err(format!(
+                        return Err(self.at_last(format!(
                             "expected `as` after fresh capability, found `{other}`"
-                        ))
+                        )))
                     }
                 }
                 Ok(Stmt::Fresh {
@@ -815,16 +918,17 @@ impl Parser {
                 match self.ident()?.as_str() {
                     "below" => {}
                     other => {
-                        return Err(format!(
+                        return Err(self.at_last(format!(
                             "expected `below` after random capability, found `{other}`"
-                        ))
+                        )))
                     }
                 }
                 let bound = self.expr()?;
                 match self.ident()?.as_str() {
                     "as" => {}
                     other => {
-                        return Err(format!("expected `as` after random bound, found `{other}`"))
+                        return Err(self
+                            .at_last(format!("expected `as` after random bound, found `{other}`")))
                     }
                 }
                 Ok(Stmt::Random {
@@ -854,13 +958,13 @@ impl Parser {
                 let args = self.paren_sargs()?;
                 match self.ident()?.as_str() {
                     "where" => {}
-                    other => return Err(format!("expected `where`, found `{other}`")),
+                    other => return Err(self.at_last(format!("expected `where`, found `{other}`"))),
                 }
                 let col = self.ident()?;
                 let op = match self.next() {
                     Some(Token::Eq) => MatchOp::Exact,
                     Some(Token::Tilde) => MatchOp::Word,
-                    other => return Err(format!("expected `=` or `~`, found {other:?}")),
+                    other => return Err(self.expected("`=` or `~`", other)),
                 };
                 let rhs = self.sarg()?;
                 Ok(Stmt::Resolve {
@@ -891,16 +995,16 @@ impl Parser {
                 rel: self.ident()?,
                 args: self.paren_sargs()?,
             }),
-            other => Err(format!("unknown statement `{other}`")),
+            other => Err(self.at_last(format!("unknown statement `{other}`"))),
         }
     }
 
-    fn stmt_block(&mut self) -> Result<Vec<Stmt>, String> {
+    fn stmt_block(&mut self) -> PResult<Vec<Stmt>> {
         self.expect(&Token::LBrace)?;
         let mut statements = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
             if self.peek().is_none() {
-                return Err("unterminated statement block".into());
+                return Err(self.at_here("unterminated statement block"));
             }
             statements.push(self.stmt()?);
         }
@@ -908,11 +1012,11 @@ impl Parser {
         Ok(statements)
     }
 
-    fn expr(&mut self) -> Result<Expr, String> {
+    fn expr(&mut self) -> PResult<Expr> {
         self.expr_or()
     }
 
-    fn expr_or(&mut self) -> Result<Expr, String> {
+    fn expr_or(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_and()?;
         while matches!(self.peek(), Some(Token::OrOr)) {
             self.next();
@@ -925,7 +1029,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_and(&mut self) -> Result<Expr, String> {
+    fn expr_and(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_equality()?;
         while matches!(self.peek(), Some(Token::AndAnd)) {
             self.next();
@@ -938,7 +1042,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_equality(&mut self) -> Result<Expr, String> {
+    fn expr_equality(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_comparison()?;
         loop {
             let op = match self.peek() {
@@ -956,7 +1060,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_comparison(&mut self) -> Result<Expr, String> {
+    fn expr_comparison(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_additive()?;
         loop {
             let op = match self.peek() {
@@ -976,7 +1080,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_additive(&mut self) -> Result<Expr, String> {
+    fn expr_additive(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_multiplicative()?;
         loop {
             let op = match self.peek() {
@@ -994,7 +1098,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_multiplicative(&mut self) -> Result<Expr, String> {
+    fn expr_multiplicative(&mut self) -> PResult<Expr> {
         let mut expression = self.expr_unary()?;
         loop {
             let op = match self.peek() {
@@ -1013,7 +1117,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn expr_unary(&mut self) -> Result<Expr, String> {
+    fn expr_unary(&mut self) -> PResult<Expr> {
         let op = match self.peek() {
             Some(Token::Minus) => Some(UnaryOp::Neg),
             Some(Token::Bang) => Some(UnaryOp::Not),
@@ -1029,7 +1133,7 @@ impl Parser {
         self.expr_primary()
     }
 
-    fn expr_primary(&mut self) -> Result<Expr, String> {
+    fn expr_primary(&mut self) -> PResult<Expr> {
         match self.next() {
             Some(Token::Ident(name)) if name == "true" => Ok(Expr::Lit(Value::Bool(true))),
             Some(Token::Ident(name)) if name == "false" => Ok(Expr::Lit(Value::Bool(false))),
@@ -1058,11 +1162,11 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(expression)
             }
-            other => Err(format!("expected expression, found {other:?}")),
+            other => Err(self.expected("expression", other)),
         }
     }
 
-    fn paren_sargs(&mut self) -> Result<Vec<SArg>, String> {
+    fn paren_sargs(&mut self) -> PResult<Vec<SArg>> {
         self.expect(&Token::LParen)?;
         if matches!(self.peek(), Some(Token::RParen)) {
             self.next();
@@ -1077,7 +1181,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn paren_exprs(&mut self) -> Result<Vec<Expr>, String> {
+    fn paren_exprs(&mut self) -> PResult<Vec<Expr>> {
         self.expect(&Token::LParen)?;
         if matches!(self.peek(), Some(Token::RParen)) {
             self.next();
@@ -1092,7 +1196,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn sarg(&mut self) -> Result<SArg, String> {
+    fn sarg(&mut self) -> PResult<SArg> {
         match self.next() {
             Some(Token::Ident(s)) if s == "true" => Ok(SArg::Bool(true)),
             Some(Token::Ident(s)) if s == "false" => Ok(SArg::Bool(false)),
@@ -1104,13 +1208,13 @@ impl Parser {
                 Some(Token::Int(n)) => n
                     .checked_neg()
                     .map(SArg::Int)
-                    .ok_or_else(|| "integer literal is below i64::MIN".into()),
+                    .ok_or_else(|| self.at_last("integer literal is below i64::MIN")),
                 Some(Token::Float(n)) => Ok(SArg::Float(
                     grmpl_core::FiniteF64::new(-n.get()).expect("finite negation stays finite"),
                 )),
-                other => Err(format!("expected a number after `-`, found {other:?}")),
+                other => Err(self.expected("a number after `-`", other)),
             },
-            other => Err(format!("expected an argument, found {other:?}")),
+            other => Err(self.expected("an argument", other)),
         }
     }
 }

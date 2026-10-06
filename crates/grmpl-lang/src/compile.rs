@@ -38,6 +38,7 @@ use crate::ast::{
 };
 use crate::behavior_ir::{BehaviorIr, BehaviorOp, BoolExpr, CompareOp, ExprIr, FindArg, ValueExpr};
 use crate::concat::{ConcatArm, Schemas, Word};
+use crate::diagnostic::{Diagnostic, Pos, Spanned};
 use crate::ir::{Comp, CtorSpec, FormIr, PredExpr, QueryIr, RowExpr, RuleIr};
 use crate::package::ResolvedGrantSet;
 use crate::parser::parse;
@@ -66,6 +67,8 @@ struct ViewDef {
     /// The relation a materialized view is stored in, assigned once every
     /// declared relation has its id. `None` for an ordinary view.
     backing: Option<RelId>,
+    /// Where the declaration starts.
+    pos: Pos,
 }
 
 /// An aggregate view's fold over its `n` grouping columns and the aggregated
@@ -96,6 +99,8 @@ struct OnDef {
     /// v1 statement arms and P11 concatenative arms coexist in one handler.
     arms: Vec<Arm>,
     concat_arms: Vec<ConcatArm>,
+    /// Where the declaration starts.
+    pos: Pos,
 }
 
 /// The static wiring of an `on watch` declaration (P5). It names the watched
@@ -262,8 +267,12 @@ impl Program {
     /// ([`SeqAlloc`] vs [`CatalogAlloc`]). Everything else — parsing, duplicate
     /// checks, column typing, concatenative stack-effect checking — is identical
     /// regardless of where ids come from.
+    ///
+    /// An error the source can be blamed for is rendered at its position
+    /// ([`Diagnostic::render`]); a store failure is returned as it is.
     fn compile_alloc(src: &str, alloc: &mut dyn RelAlloc) -> Result<Program, String> {
-        let decls = parse(src)?;
+        let at = |pos: Pos, msg: String| Diagnostic::new(pos, msg).render(src, None);
+        let decls = parse(src).map_err(|d| d.render(src, None))?;
         let mut rels = HashMap::new();
         let mut views = HashMap::new();
         let mut forms = HashMap::new();
@@ -272,46 +281,50 @@ impl Program {
         let mut capabilities = Vec::new();
         let mut actors = BTreeMap::new();
         let mut contexts = BTreeSet::new();
+        let mut view_order = Vec::new();
 
-        for decl in decls {
+        for Spanned { node: decl, pos } in decls {
             match decl {
                 Decl::Package { .. }
                 | Decl::Entity { .. }
                 | Decl::Authority { .. }
                 | Decl::Bootstrap { .. } => {}
                 Decl::RequireAllocate { name, counter, .. } => {
-                    capabilities.push((name, counter, CapabilityKind::Allocate));
+                    capabilities.push((name, counter, CapabilityKind::Allocate, pos));
                 }
                 Decl::RequireRandom { name, state, .. } => {
-                    capabilities.push((name, state, CapabilityKind::Random));
+                    capabilities.push((name, state, CapabilityKind::Random, pos));
                 }
                 Decl::RequireSchedule { name, timers, .. } => {
-                    capabilities.push((name, timers, CapabilityKind::Schedule));
+                    capabilities.push((name, timers, CapabilityKind::Schedule, pos));
                 }
                 Decl::Actor { entity, inbox, .. } => {
                     if actors.insert(entity.clone(), ActorDef { inbox }).is_some() {
-                        return Err(format!("actor `{entity}` is declared twice"));
+                        return Err(at(pos, format!("actor `{entity}` is declared twice")));
                     }
                 }
                 Decl::Rel { name, cols } => {
                     if rels.contains_key(&name) {
-                        return Err(format!("relation `{name}` declared twice"));
+                        return Err(at(pos, format!("relation `{name}` declared twice")));
                     }
                     let mut columns = Vec::with_capacity(cols.len());
                     for c in &cols {
                         if columns.iter().any(|col: &Column| col.name == c.name) {
-                            return Err(format!(
-                                "relation `{name}` has a duplicate column `{}`",
-                                c.name
+                            return Err(at(
+                                c.pos,
+                                format!("relation `{name}` has a duplicate column `{}`", c.name),
                             ));
                         }
                         let ty = match &c.ty {
                             None => Ty::Any,
                             Some(t) => Ty::parse(t).ok_or_else(|| {
-                                format!(
-                                    "relation `{name}` column `{}` has unknown type `{t}` \
-                                     (expected Ent, Int, Text, Bool, Tuple, Bytes, or Any)",
-                                    c.name
+                                at(
+                                    c.pos,
+                                    format!(
+                                        "relation `{name}` column `{}` has unknown type `{t}` \
+                                         (expected Ent, Int, Text, Bool, Tuple, Bytes, or Any)",
+                                        c.name
+                                    ),
                                 )
                             })?,
                         };
@@ -322,7 +335,7 @@ impl Program {
                 }
                 Decl::Context { name } => {
                     if rels.contains_key(&name) {
-                        return Err(format!("relation `{name}` declared twice"));
+                        return Err(at(pos, format!("relation `{name}` declared twice")));
                     }
                     let columns = vec![
                         Column::new("first", Ty::Ent),
@@ -342,6 +355,7 @@ impl Program {
                     agg,
                     materialized,
                 } => {
+                    view_order.push(name.clone());
                     views.insert(
                         name,
                         ViewDef {
@@ -351,6 +365,7 @@ impl Program {
                             agg,
                             materialized,
                             backing: None,
+                            pos,
                         },
                     );
                 }
@@ -369,6 +384,7 @@ impl Program {
                             form,
                             arms: stmt_arms,
                             concat_arms: word_arms,
+                            pos,
                         },
                     );
                 }
@@ -380,7 +396,7 @@ impl Program {
                     including_current,
                 } => {
                     if watches.contains_key(&view) {
-                        return Err(format!("view `{view}` is watched twice"));
+                        return Err(at(pos, format!("view `{view}` is watched twice")));
                     }
                     watches.insert(
                         view,
@@ -406,22 +422,61 @@ impl Program {
             view_cursor: None,
             contexts,
         };
+        for name in &view_order {
+            prog.check_view(name).map_err(|(pos, msg)| at(pos, msg))?;
+        }
         prog.bind_materialized_views(alloc)?;
-        for (name, relation, kind) in capabilities {
+        for (name, relation, kind, pos) in capabilities {
             let relation_id = prog.rel_id(&relation).ok_or_else(|| {
-                format!("capability `{name}` names undeclared relation `{relation}`")
+                at(
+                    pos,
+                    format!("capability `{name}` names undeclared relation `{relation}`"),
+                )
             })?;
-            prog.insert_capability(name, kind, relation_id)?;
+            prog.insert_capability(name, kind, relation_id)
+                .map_err(|msg| at(pos, msg))?;
         }
         // "Declared stack effects first": statically check every concatenative
         // arm's cell arithmetic now, so a malformed point-free body fails at
         // compile time rather than mid-commit.
-        for on in prog.ons.values() {
+        let mut ons: Vec<&OnDef> = prog.ons.values().collect();
+        ons.sort_by_key(|on| on.pos);
+        for on in ons {
             for arm in &on.concat_arms {
-                arm.check(&prog)?;
+                arm.check(&prog).map_err(|msg| at(on.pos, msg))?;
             }
         }
         Ok(prog)
+    }
+
+    /// Check a view's body for what no instantiation could get past: each atom
+    /// names a declared relation, a plain atom at its arity, and a materialized
+    /// view binds everything it stores. The error is placed at the offending
+    /// atom, or at the view. The rest (`inherit` misuse, unbound yields) still
+    /// surfaces when the view is instantiated.
+    fn check_view(&self, name: &str) -> Result<(), (Pos, String)> {
+        let view = &self.views[name];
+        for atom in &view.atoms {
+            let info = self.rels.get(&atom.rel).ok_or_else(|| {
+                let msg = format!("view `{name}` uses undeclared relation `{}`", atom.rel);
+                (atom.pos, msg)
+            })?;
+            if !atom.inherit && atom.args.len() != info.arity() {
+                return Err((
+                    atom.pos,
+                    format!(
+                        "`{}` has arity {} but was used with {} args",
+                        atom.rel,
+                        info.arity(),
+                        atom.args.len()
+                    ),
+                ));
+            }
+        }
+        if view.materialized {
+            self.materialized_columns(name).map_err(|msg| (view.pos, msg))?;
+        }
+        Ok(())
     }
 
     /// Give every `materialized view` its backing relation, and the program the
@@ -2061,11 +2116,13 @@ impl Program {
             .collect()
     }
 
-    pub(crate) fn validate_behaviors(&self) -> Result<(), String> {
+    /// Lower every handler, in inbox order; an error is placed at the handler.
+    pub(crate) fn validate_behaviors(&self) -> Result<(), (Pos, String)> {
         let mut inboxes: Vec<_> = self.ons.keys().cloned().collect();
         inboxes.sort();
         for inbox in inboxes {
-            self.handler_irs(&inbox)?;
+            self.handler_irs(&inbox)
+                .map_err(|msg| (self.ons[&inbox].pos, msg))?;
         }
         Ok(())
     }

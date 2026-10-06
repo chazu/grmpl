@@ -71,6 +71,11 @@ fn main() {
         }
     };
     if let Err(e) = result {
+        // A world's compile error leads with `line:col:`; name the file it is in.
+        let e = match (cmd, args.get(1)) {
+            ("run" | "serve", Some(world)) => grmpl_lang::diagnostic::with_path(&e, world),
+            _ => e,
+        };
         eprintln!("error: {e}");
         std::process::exit(1);
     }

@@ -62,8 +62,8 @@ fn load(
     store: Arc<dyn WorldStore>,
     source: &str,
 ) -> Result<(Arc<Runtime>, Vec<CompiledActor>, String), String> {
-    let declarations = grmpl_lang::parse(source)?;
-    if !declarations.iter().any(|d| matches!(d, Decl::Package { .. })) {
+    let declarations = grmpl_lang::parse(source).map_err(|d| d.render(source, None))?;
+    if !declarations.iter().any(|d| matches!(d.node, Decl::Package { .. })) {
         let runtime = Runtime::compile(store, source, REL_BASE)?;
         return Ok((runtime, Vec::new(), "a program".into()));
     }

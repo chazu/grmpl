@@ -1,6 +1,11 @@
 //! A tiny tokenizer for the surface syntax. Skips whitespace and `//` comments.
+//! Every token carries the position it starts at, and so does every error.
+
+use std::fmt;
 
 use grmpl_core::FiniteF64;
+
+use crate::diagnostic::{Diagnostic, LineIndex, Pos, Spanned};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Token {
@@ -35,12 +40,64 @@ pub enum Token {
     Tilde,   // ~
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+/// A token as a message names it: ``found `view` `` or ``expected `)` ``.
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Token::Ident(s) => return write!(f, "`{s}`"),
+            Token::Str(s) => return write!(f, "`\"{s}\"`"),
+            Token::Int(n) => return write!(f, "`{n}`"),
+            Token::Float(n) => return write!(f, "`{}`", n.get()),
+            Token::LParen => "(",
+            Token::RParen => ")",
+            Token::LBrace => "{",
+            Token::RBrace => "}",
+            Token::LBracket => "[",
+            Token::RBracket => "]",
+            Token::Comma => ",",
+            Token::Colon => ":",
+            Token::Arrow => "->",
+            Token::Eq => "=",
+            Token::EqEq => "==",
+            Token::Ne => "!=",
+            Token::Lt => "<",
+            Token::Le => "<=",
+            Token::Gt => ">",
+            Token::Ge => ">=",
+            Token::Plus => "+",
+            Token::Minus => "-",
+            Token::Star => "*",
+            Token::Slash => "/",
+            Token::Percent => "%",
+            Token::Bang => "!",
+            Token::AndAnd => "&&",
+            Token::OrOr => "||",
+            Token::Tilde => "~",
+        };
+        write!(f, "`{text}`")
+    }
+}
+
+/// A lexed source: its tokens, and the position just past the last of them,
+/// where an error at end of input points.
+#[derive(Debug)]
+pub struct Lexed {
+    pub tokens: Vec<Spanned<Token>>,
+    pub end: Pos,
+}
+
+pub fn lex(src: &str) -> Result<Lexed, Diagnostic> {
     let mut out = Vec::new();
     let bytes: Vec<char> = src.chars().collect();
+    let lines = LineIndex::new(&bytes);
+    let mut starts = Vec::new();
+    let mut end = 0;
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        let start = i;
+        let at = |msg: String| Diagnostic::new(lines.pos(start), msg);
+        let lexed = out.len();
         match c {
             ' ' | '\t' | '\r' | '\n' => i += 1,
             '/' if i + 1 < bytes.len() && bytes[i + 1] == '/' => {
@@ -156,7 +213,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
                 if i >= bytes.len() {
-                    return Err("unterminated string literal".into());
+                    return Err(at("unterminated string literal".into()));
                 }
                 i += 1; // closing quote
                 out.push(Token::Str(s));
@@ -175,7 +232,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         i += 1;
                     }
                     if i == fractional {
-                        return Err("a decimal point must be followed by digits".into());
+                        return Err(at("a decimal point must be followed by digits".into()));
                     }
                 }
                 if i < bytes.len() && matches!(bytes[i], 'e' | 'E') {
@@ -189,17 +246,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                         i += 1;
                     }
                     if i == exponent {
-                        return Err("a float exponent must contain digits".into());
+                        return Err(at("a float exponent must contain digits".into()));
                     }
                 }
                 let text: String = bytes[start..i].iter().collect();
                 if is_float {
-                    let n: f64 = text.parse().map_err(|_| format!("bad float `{text}`"))?;
+                    let n: f64 = text
+                        .parse()
+                        .map_err(|_| at(format!("bad float `{text}`")))?;
                     let n = FiniteF64::new(n)
-                        .ok_or_else(|| format!("float literal `{text}` is not finite"))?;
+                        .ok_or_else(|| at(format!("float literal `{text}` is not finite")))?;
                     out.push(Token::Float(n));
                 } else {
-                    let n: i64 = text.parse().map_err(|_| format!("bad integer `{text}`"))?;
+                    let n: i64 = text
+                        .parse()
+                        .map_err(|_| at(format!("bad integer `{text}`")))?;
                     out.push(Token::Int(n));
                 }
             }
@@ -211,20 +272,41 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let text: String = bytes[start..i].iter().collect();
                 out.push(Token::Ident(text));
             }
-            other => return Err(format!("unexpected character `{other}`")),
+            other => return Err(at(format!("unexpected character `{other}`"))),
+        }
+        if out.len() > lexed {
+            starts.push(lines.pos(start));
+            end = i;
         }
     }
-    Ok(out)
+    let tokens = out
+        .into_iter()
+        .zip(starts)
+        .map(|(node, pos)| Spanned { node, pos })
+        .collect();
+    Ok(Lexed {
+        tokens,
+        end: lines.pos(end),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn tokens(src: &str) -> Vec<Token> {
+        lex(src)
+            .unwrap()
+            .tokens
+            .into_iter()
+            .map(|t| t.node)
+            .collect()
+    }
+
     #[test]
     fn distinguishes_integer_and_float_literals() {
         assert_eq!(
-            lex("1 1.0 0.25 1e3 2.5e-2").unwrap(),
+            tokens("1 1.0 0.25 1e3 2.5e-2"),
             vec![
                 Token::Int(1),
                 Token::Float(FiniteF64::new(1.0).unwrap()),
@@ -237,7 +319,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_and_malformed_float_literals() {
-        assert!(lex("1e9999").unwrap_err().contains("not finite"));
+        assert!(lex("1e9999").unwrap_err().msg.contains("not finite"));
         assert!(lex("1.").is_err());
         assert!(lex("1e+").is_err());
     }
@@ -245,7 +327,7 @@ mod tests {
     #[test]
     fn tokenizes_expression_operators_without_stealing_arrow_or_comments() {
         assert_eq!(
-            lex("a-1 <= b && b != 0 -> x // ignored\n c/2").unwrap(),
+            tokens("a-1 <= b && b != 0 -> x // ignored\n c/2"),
             vec![
                 Token::Ident("a".into()),
                 Token::Minus,

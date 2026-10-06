@@ -33,6 +33,7 @@ pub mod behavior;
 pub mod behavior_ir;
 pub mod compile;
 pub mod concat;
+pub mod diagnostic;
 pub mod ir;
 pub mod lexer;
 pub mod package;
@@ -45,6 +46,7 @@ pub use behavior::{
 pub use behavior_ir::{BehaviorIr, BehaviorOp, BoolExpr, CompareOp, ExprIr, FindArg, ValueExpr};
 pub use compile::{CapabilityKind, DeclaredSchemas, Program};
 pub use concat::{ConcatArm, Schemas, StackEffect, Word};
+pub use diagnostic::{Diagnostic, Pos};
 pub use ir::{Comp, CtorSpec, FormIr, MapExpr, PredExpr, QueryIr, RowExpr, RuleIr};
 pub use package::{
     AuthorityRequest, CapabilityGrant, CapabilityRequirement, CompiledActor, CompiledBootstrapFact,
