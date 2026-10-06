@@ -112,7 +112,7 @@ enum Kind {
 /// Open the Ent at `dir`, laid out as `kind` says. The layout is durable, so a
 /// reopen keeps it.
 fn open_ent(dir: &std::path::Path, kind: Kind) -> EntStore {
-    let store = EntStore::open(dir).expect("open ent store");
+    let store = EntStore::open_with(dir, grmpl_ent::Durability::Os).expect("open ent store");
     match kind {
         Kind::Ent => {}
         Kind::EntKd => store.set_default_layout(Layout::Kd).expect("lay the store out as k-d trees"),

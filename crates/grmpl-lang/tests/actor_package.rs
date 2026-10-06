@@ -23,7 +23,7 @@ bootstrap { inbox(ACTOR, 0, ("start")) inbox_seq(ACTOR, 1) }
 
 fn compile(source: &str) -> Result<CompiledPackage, String> {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     CompiledPackage::compile_with_catalog(source, &store, 100)
 }
 

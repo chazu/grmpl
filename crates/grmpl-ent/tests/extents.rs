@@ -88,7 +88,7 @@ fn an_entity_column_search_is_exact_at_every_edition() {
 /// on disk.
 fn reopened(dir: &std::path::Path, rooms: u64, to: impl Fn(u64, u64) -> u64) -> EntStore {
     {
-        let store = EntStore::open(dir).unwrap();
+        let store = EntStore::open_with(dir, grmpl_ent::Durability::Os).unwrap();
         // This measures the B+ layout's extents, so it pins that layout.
         store.set_default_layout(Layout::Ordered).unwrap();
         for chunk in (0..rooms).collect::<Vec<_>>().chunks(1_000) {
@@ -100,7 +100,7 @@ fn reopened(dir: &std::path::Path, rooms: u64, to: impl Fn(u64, u64) -> u64) -> 
             store.commit(&ups).unwrap();
         }
     }
-    EntStore::open(dir).unwrap()
+    EntStore::open_with(dir, grmpl_ent::Durability::Os).unwrap()
 }
 
 #[test]

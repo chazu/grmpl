@@ -35,7 +35,7 @@ impl Lcg {
 #[test]
 fn watch_tracks_find_under_random_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     // q = distinct( located ⋈_thing named  →  project (place, name) )
     // concat layout after join: [0]=thing_l [1]=place [2]=thing_r [3]=name

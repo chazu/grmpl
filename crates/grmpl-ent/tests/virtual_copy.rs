@@ -165,7 +165,7 @@ fn instances_match_an_explicit_copy_model_under_churn() {
         let dir = tempfile::tempdir().unwrap();
         let mut model = Model::default();
         {
-            let store = EntStore::open(dir.path()).unwrap();
+            let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
             let seed_rows = template();
             let ed = store.commit(&seed_rows).unwrap().0;
             model.commit(ed, &seed_rows);
@@ -202,7 +202,7 @@ fn instances_match_an_explicit_copy_model_under_churn() {
                 agree(&store, &model, &ctx);
             }
         }
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         agree(&store, &model, &format!("seed {seed} after reopen"));
     }
     // Both outcomes must actually have been exercised.
@@ -265,7 +265,7 @@ fn forks_and_consolidation_carry_an_instance() {
 #[test]
 fn a_large_instance_adds_log_n_nodes() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     // 20 000 facts in the template block, plus unrelated facts around it.
     let mut rows = Vec::new();
     for i in 0..20_000u64 {

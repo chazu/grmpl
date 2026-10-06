@@ -39,7 +39,7 @@ fn commit_work_is_path_sized_not_relation_sized() {
     let mut costs = Vec::new();
     for rows in [500i64, 5_000] {
         let dir = tempfile::tempdir().unwrap();
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         fill(&store, rows);
 
         // Measure steady-state commits, after the bulk load.
@@ -71,7 +71,7 @@ fn commit_work_is_path_sized_not_relation_sized() {
 #[test]
 fn re_persisting_an_unchanged_world_is_free() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     fill(&store, 1_000);
 
     // A commit touching a *different* relation must not re-encode REL's tree.
@@ -91,7 +91,7 @@ fn re_persisting_an_unchanged_world_is_free() {
 fn fact_roots_are_persisted_per_live_edition() {
     let dir = tempfile::tempdir().unwrap();
     let editions = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         for k in 0..8i64 {
             store.commit(&[(REL, t(k), 1)]).unwrap();
         }
@@ -100,7 +100,7 @@ fn fact_roots_are_persisted_per_live_edition() {
 
     // Reopen and read every intermediate edition: each must show exactly the
     // rows committed by then.
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.current(), editions);
     for e in 1..=editions.0 {
         let rows = store.read_at(REL, Edition(e)).unwrap();
@@ -118,7 +118,7 @@ fn fact_roots_are_persisted_per_live_edition() {
 #[test]
 fn consolidation_retires_superseded_fact_roots() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     for k in 0..20i64 {
         store.commit(&[(REL, t(k), 1)]).unwrap();
     }
@@ -132,7 +132,7 @@ fn consolidation_retires_superseded_fact_roots() {
 
     // …and it all survives a reopen, from the retained roots alone.
     drop(store);
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.current(), cur);
     assert_eq!(store.read_at(REL, cur).unwrap().len(), 20);
     assert!(store.read_at(REL, Edition(1)).is_err());
@@ -143,7 +143,7 @@ fn consolidation_retires_superseded_fact_roots() {
 #[test]
 fn count_is_answered_from_the_measure() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     // Weights that are not all 1, so the count is not the total weight.
     let updates: Vec<(RelId, Tuple, Diff)> =

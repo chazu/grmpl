@@ -169,12 +169,12 @@ fn one_commit_is_exactly_one_edition_regardless_of_size() {
 fn a_multi_update_commit_is_all_or_nothing_across_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let e = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         store
             .commit(&[(A, t(1, 1), 1), (A, t(2, 2), 1), (B, t(3, 3), 1)])
             .unwrap()
     };
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.current(), e, "the edition clock did not survive the reopen");
     assert_eq!(store.read_at(A, e).unwrap().len(), 2, "part of the commit was lost");
     assert_eq!(store.read_at(B, e).unwrap().len(), 1);
@@ -228,7 +228,7 @@ fn consolidation_preserves_every_as_of_read_at_or_above_the_watermark() {
 fn the_watermark_survives_a_reopen_and_is_a_noop_on_an_empty_store() {
     let dir = tempfile::tempdir().unwrap();
     let (wm, cur) = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         assert_eq!(store.consolidate(Edition(5)).unwrap(), Edition(0), "empty consolidate");
         for k in 0..10i64 {
             store.commit(&[(A, t(k, 0), 1)]).unwrap();
@@ -239,7 +239,7 @@ fn the_watermark_survives_a_reopen_and_is_a_noop_on_an_empty_store() {
         assert_eq!(store.consolidate(Edition(9_999)).unwrap(), store.current());
         (store.watermark(), store.current())
     };
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.watermark(), wm, "the watermark did not survive the reopen");
     assert_eq!(store.current(), cur);
     assert_eq!(store.read_at(A, cur).unwrap().len(), 10, "the checkpoint did not survive");
@@ -258,7 +258,7 @@ fn a_fork_is_identical_at_the_cut_then_evolves_independently() {
     for seed in 1..=8u64 {
         let mut rng = Rng::new(seed ^ 0xF0);
         let dir = tempfile::tempdir().unwrap();
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         for _ in 0..20 {
             let updates: Vec<(RelId, Tuple, Diff)> = (0..1 + rng.below(3))
                 .map(|_| (RELS[rng.below(2) as usize], t(rng.below(8) as i64, 0), 1))

@@ -37,7 +37,7 @@ fn build(n: i64) -> FactTree {
 #[test]
 fn records_scale_with_runs_not_tuples() {
     let dir = tempfile::tempdir().unwrap();
-    let gran = Granfilade::open(dir.path()).unwrap();
+    let gran = Granfilade::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let tree = build(ROWS);
     gran.persist(&tree).unwrap();
 
@@ -67,7 +67,7 @@ fn records_scale_with_runs_not_tuples() {
 #[test]
 fn an_edit_still_writes_only_its_path() {
     let dir = tempfile::tempdir().unwrap();
-    let gran = Granfilade::open(dir.path()).unwrap();
+    let gran = Granfilade::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let v0 = build(ROWS);
     gran.persist(&v0).unwrap();
     let before = gran.node_count().unwrap();
@@ -92,7 +92,7 @@ fn an_edit_still_writes_only_its_path() {
 #[test]
 fn wide_nodes_round_trip_through_the_granfilade() {
     let dir = tempfile::tempdir().unwrap();
-    let gran = Granfilade::open(dir.path()).unwrap();
+    let gran = Granfilade::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     // Several sizes: below one leaf, exactly one split, and deep enough to build
     // internal levels above internal levels.

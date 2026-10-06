@@ -350,7 +350,7 @@ fn runs_and_holes_round_trip_through_the_granfilade() {
     for layout in [Layout::Ordered, Layout::Kd] {
         let lay = Lay(layout, true);
         let dir = tempfile::tempdir().unwrap();
-        let gran = Granfilade::open(dir.path()).unwrap();
+        let gran = Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
         let mut rng = Rng::new(9);
         let (mut t, mut m) = (T::new(), Model::default());
         for _ in 0..200 {

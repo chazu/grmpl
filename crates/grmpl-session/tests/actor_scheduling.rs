@@ -150,7 +150,7 @@ bootstrap {
 "#;
 
 fn open(path: &std::path::Path) -> Arc<dyn WorldStore> {
-    Arc::new(EntStore::open(path).unwrap())
+    Arc::new(EntStore::open_with(path, grmpl_ent::Durability::Os).unwrap())
 }
 
 fn policy(targets: &[&str]) -> RuntimePolicy {

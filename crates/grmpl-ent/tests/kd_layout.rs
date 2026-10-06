@@ -56,7 +56,7 @@ const BLOCK: u64 = 100;
 const BLOCKS: u64 = 20;
 
 fn store(dir: &std::path::Path, layout: Layout) -> EntStore {
-    let s = EntStore::open(dir).unwrap();
+    let s = EntStore::open_with(dir, grmpl_ent::Durability::Os).unwrap();
     s.set_default_layout(layout).unwrap();
     s
 }
@@ -131,7 +131,7 @@ fn a_kd_world_answers_as_the_ordered_one_does() {
                 _ => {
                     // Reopen both: every node now starts on disk.
                     drop(std::mem::take(&mut stores));
-                    stores = dirs.iter().map(|d| EntStore::open(d.path()).unwrap()).collect();
+                    stores = dirs.iter().map(|d| EntStore::open_with(d.path(), grmpl_ent::Durability::Os).unwrap()).collect();
                     assert_eq!(stores[1].layout(EXITS), Layout::Kd, "the layout survives a reopen");
                 }
             }
@@ -182,7 +182,7 @@ fn a_kd_world_answers_as_the_ordered_one_does() {
 fn the_layout_is_chosen_before_the_first_write_and_kept() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let s = EntStore::open(dir.path()).unwrap();
+        let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         assert_eq!(s.layout(EXITS), Layout::default());
         s.set_layout(EXITS, Layout::Kd).unwrap();
         s.set_layout(NAMES, Layout::Ordered).unwrap();
@@ -199,7 +199,7 @@ fn the_layout_is_chosen_before_the_first_write_and_kept() {
         s.set_layout(RelId(9), Layout::Ordered).unwrap();
     }
     // Durable: a reopen sees the choices without any further commit.
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(s.layout(EXITS), Layout::Kd);
     assert_eq!(s.layout(NAMES), Layout::Ordered);
     assert_eq!(s.layout(RelId(9)), Layout::Ordered);
@@ -224,7 +224,7 @@ fn reopened(dir: &std::path::Path, layout: Layout, rooms: u64, to: impl Fn(u64, 
             s.commit(&ups).unwrap();
         }
     }
-    EntStore::open(dir).unwrap()
+    EntStore::open_with(dir, grmpl_ent::Durability::Os).unwrap()
 }
 
 /// Frames a read pages in on a cold store.
@@ -321,7 +321,7 @@ fn graft_compare_frames(n: u64, copy: u64) -> u64 {
         let a = s.current();
         (a, s.instance_template(&[EXITS], 1_000_000, 1_000_000 + copy, 4_000_000).unwrap())
     };
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let (rows, frames) = paged(&s, |s| s.compare(EXITS, a, b).unwrap());
     assert_eq!(rows.len() as u64, copy);
     frames
@@ -383,7 +383,7 @@ fn a_compare_into_fresh_space_is_placed_by_the_extents() {
         let a = s.current();
         (a, s.instance_template(&[EXITS], lo, hi, 10_000_000).unwrap())
     };
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let (rows, frames) = paged(&s, |s| s.compare(EXITS, a, b).unwrap());
     assert_eq!(rows.len(), 1_000);
     assert!(frames <= 150, "a compare across a graft into fresh space paged {frames} frames");
@@ -406,7 +406,7 @@ fn a_compare_without_extents_is_placed_by_the_splits_above() {
         let a = s.current();
         (a, s.commit(&[(NUMS, Tuple::from([Value::Int(25_000), Value::Int(7)]), 1)]).unwrap())
     };
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let (rows, frames) = paged(&s, |s| s.compare(NUMS, a, b).unwrap());
     assert_eq!(rows.len(), 1);
     assert!(frames <= 80, "a one-row compare without extents paged {frames} frames");

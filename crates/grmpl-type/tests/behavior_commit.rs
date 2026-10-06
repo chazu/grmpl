@@ -99,9 +99,9 @@ fn commit_boundary_rechecks_stored_behavior_under_random_churn() {
     for seed in 1..=24u64 {
         let mut rng = Rng::new(seed);
         let dir = tempfile::tempdir().unwrap();
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         let sound_dir = tempfile::tempdir().unwrap();
-        let sound_store = EntStore::open(sound_dir.path()).unwrap();
+        let sound_store = EntStore::open_with(sound_dir.path(), grmpl_ent::Durability::Os).unwrap();
 
         for _ in 0..30 {
             // Random write-set and random whole-relation authority.
@@ -171,7 +171,7 @@ fn unauthorized_behavior_is_rejected_at_commit() {
     let prog = program();
     let slot = prog.rel_id("slot").unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     // A behavior that writes w0 and w1, but the authority owns only slot + w0.
     let behavior = behavior_writing(&[0usize, 1].into_iter().collect());
@@ -216,7 +216,7 @@ requires random rolls(state: rng_state, owner: WORLD, algorithm: xorshift64star_
 bootstrap { rng_state(WORLD, 1) }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let package = CompiledPackage::compile_with_catalog(source, &store, 100).unwrap();
     let slot = package.program.rel_id("slot").unwrap();
     let rng_state = package.program.rel_id("rng_state").unwrap();
@@ -308,7 +308,7 @@ fn stored_schedule_code_cannot_bypass_the_granted_target_allowlist() {
         bootstrap { inbox_seq(ACTOR, 0) }
     "#;
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let package = CompiledPackage::compile_with_catalog(source, &store, 100).unwrap();
     let grants = GrantSet::new()
         .grant_schedule("world_clock", "clock", "timers", "inbox_seq", ["ACTOR"])

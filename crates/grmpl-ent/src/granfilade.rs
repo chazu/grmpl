@@ -404,9 +404,26 @@ struct Remembered {
     prune_at: usize,
 }
 
+/// **How far a durable write must reach before it counts.** Every commit,
+/// persist and sweep ends in one sync of this kind.
+///
+/// * [`Disk`](Durability::Disk), the default, is the patch–edition law as
+///   stated: a commit returns only once its edition survives power loss.
+/// * [`Os`](Durability::Os) hands the write to the operating system and returns:
+///   it survives the process dying, not the machine. It is for throwaway test
+///   stores, whose suites otherwise spend most of their time in `fsync`. Nothing
+///   a world is served from may open with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    #[default]
+    Disk,
+    Os,
+}
+
 /// The content-addressed node store for the Ent, plus the one root record.
 pub struct Granfilade {
     db: Database,
+    durability: Durability,
     nodes: fjall::Keyspace,
     meta: fjall::Keyspace,
     /// **Keys known to be durable in *this* granfilade (G-1).** A memoized
@@ -425,8 +442,8 @@ pub struct Granfilade {
     /// Bytes in the frames [`encoded`](Self::encoded) counts: what the commit
     /// path writes, before the node store compresses it.
     encoded_bytes: AtomicU64,
-    /// **Durability ops counter (group commit).** `SyncAll`s issued since this
-    /// handle was opened.
+    /// **Durability ops counter (group commit).** Syncs issued since this
+    /// handle was opened, of whichever [`Durability`].
     syncs: AtomicU64,
     /// **Paging ops counter.** Node frames read from disk since this handle was
     /// opened — what lets a test fail if `open` goes back to reading the world.
@@ -440,6 +457,11 @@ impl Granfilade {
     /// live under keys this version does not read, so opening it would look
     /// like an empty world.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Arc<Granfilade>> {
+        Self::open_with(path, Durability::Disk)
+    }
+
+    /// [`open`](Self::open), syncing every write as `durability` says.
+    pub fn open_with(path: impl AsRef<std::path::Path>, durability: Durability) -> Result<Arc<Granfilade>> {
         let db = Database::builder(path.as_ref()).open().map_err(store_err)?;
         let nodes = db
             .keyspace("nodes", KeyspaceCreateOptions::default)
@@ -449,6 +471,7 @@ impl Granfilade {
             .map_err(store_err)?;
         let gran = Granfilade {
             db,
+            durability,
             nodes,
             meta,
             present: Mutex::new(HashSet::new()),
@@ -523,11 +546,21 @@ impl Granfilade {
         }
         batch.insert(&self.meta, ROOT_KEY.to_vec(), root);
         batch.commit().map_err(store_err)?;
-        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
-        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.sync()?;
         // Only after the batch is durable may these count as present — otherwise
         // a crash mid-write would leave the memo claiming a node is on disk.
         self.present.lock().unwrap().extend(written);
+        Ok(())
+    }
+
+    /// Make every write so far as durable as [`Durability`] asks, and count it.
+    fn sync(&self) -> Result<()> {
+        let mode = match self.durability {
+            Durability::Disk => PersistMode::SyncAll,
+            Durability::Os => PersistMode::Buffer,
+        };
+        self.db.persist(mode).map_err(store_err)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -550,8 +583,7 @@ impl Granfilade {
             batch.insert(&self.nodes, k.to_vec(), v.clone());
         }
         batch.commit().map_err(store_err)?;
-        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
-        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.sync()?;
         self.present.lock().unwrap().extend(nodes.into_iter().map(|(k, _)| k));
         Ok(ck)
     }
@@ -747,8 +779,7 @@ impl Granfilade {
             }
         }
         batch.commit().map_err(store_err)?;
-        self.db.persist(PersistMode::SyncAll).map_err(store_err)?;
-        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.sync()?;
         // A swept key is no longer on disk; a resident node still holding it
         // must be written again if a later root reaches it.
         let mut present = self.present.lock().unwrap();

@@ -43,7 +43,7 @@ on inbox parse command {
 #[test]
 fn arithmetic_control_flow_and_fault_cursor_law() {
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     let runtime = Runtime::compile(Arc::clone(&store), SOURCE, 100).unwrap();
     let inbox = runtime.relation("inbox").unwrap();
     let cursor = runtime.relation("cursor").unwrap();
@@ -161,7 +161,7 @@ on inbox parse command {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     let runtime = Runtime::compile(Arc::clone(&store), source, 100).unwrap();
     let inbox = runtime.relation("inbox").unwrap();
     let cursor = runtime.relation("cursor").unwrap();
@@ -203,7 +203,7 @@ on inbox parse command {
 fn float_behavior_results_survive_close_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let result = {
-        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
         let runtime = Runtime::compile(Arc::clone(&store), SOURCE, 100).unwrap();
         let inbox = runtime.relation("inbox").unwrap();
         let cursor = runtime.relation("cursor").unwrap();
@@ -235,7 +235,7 @@ fn float_behavior_results_survive_close_and_reopen() {
         result
     };
 
-    let reopened = EntStore::open(dir.path()).unwrap();
+    let reopened = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let rows = reopened.read_at(result, reopened.current()).unwrap();
     assert!(rows.contains(&(
         Tuple::from([

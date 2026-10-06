@@ -275,7 +275,7 @@ fn backfollow_and_compare_survive_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let mut rng = Rng(seed ^ 0xD15C);
         {
-            let mut branches = vec![EntStore::open(dir.path()).unwrap()];
+            let mut branches = vec![EntStore::open_with(dir.path(), crate::Durability::Os).unwrap()];
             seed_world(&branches[0]);
             clear_blocks(&branches[0], &[6, 7]);
             churn(&mut branches, &mut rng, 50, &mut check_laws);
@@ -283,7 +283,7 @@ fn backfollow_and_compare_survive_a_reopen() {
         }
         // Reopen: the index comes back as far as it was made durable, and
         // catches up the rest.
-        let root = EntStore::open(dir.path()).unwrap();
+        let root = EntStore::open_with(dir.path(), crate::Durability::Os).unwrap();
         let ids: Vec<u64> = root.dag().tree().iter().map(|(b, _)| b).collect();
         // The index was made durable: nothing is left to redo.
         assert_eq!(root.history_backlog(), 0, "seed {seed}: the history index did not persist");

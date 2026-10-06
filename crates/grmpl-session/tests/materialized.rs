@@ -151,7 +151,7 @@ fn a_current_copy_is_read_and_a_stale_one_is_not() {
 fn a_materialized_view_survives_a_reopen_as_stored_rows() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
         let rt = Runtime::compile(Arc::clone(&store), &source(true), 100).unwrap();
         let (located, named) = (rt.relation("located").unwrap(), rt.relation("named").unwrap());
         store
@@ -164,7 +164,7 @@ fn a_materialized_view_survives_a_reopen_as_stored_rows() {
         let ghost = Tuple::from([ent(7), Value::text("ghost")]);
         store.commit(&[(rt.relation("view:world").unwrap(), ghost, 1)]).unwrap();
     }
-    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     let rt = Runtime::compile(Arc::clone(&store), &source(true), 100).unwrap();
     // The ghost proves the answer came from the stored rows, not a rebuild.
     assert_eq!(sorted(rt.view("world", &[]).unwrap()).len(), 2);

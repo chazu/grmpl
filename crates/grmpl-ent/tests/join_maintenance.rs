@@ -184,7 +184,7 @@ fn maintaining_a_large_join_after_a_small_commit_reads_a_few_frames() {
     const N: u64 = 10_000;
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         // The bound is the B+ layout's: a k-d tree over a scattered column
         // pays about the square root of its leaves for a lead-column read.
         store.set_default_layout(grmpl_ent::Layout::Ordered).unwrap();
@@ -199,7 +199,7 @@ fn maintaining_a_large_join_after_a_small_commit_reads_a_few_frames() {
             store.commit(&ups).unwrap();
         }
     }
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let from = store.current();
     // One thing moves: a retraction and an assertion in r.
     store

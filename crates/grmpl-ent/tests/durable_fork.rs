@@ -35,7 +35,7 @@ fn forking_a_durable_world_writes_directories_not_facts() {
     let mut costs = Vec::new();
     for rows in [50i64, 5_000] {
         let dir = tempfile::tempdir().unwrap();
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         seed(&store, rows);
 
         let encoded_before = store.frames_encoded();
@@ -54,7 +54,7 @@ fn forking_a_durable_world_writes_directories_not_facts() {
 #[test]
 fn branches_diverge_without_disturbing_each_other() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     seed(&store, 10);
     let cut = store.current();
     let fork = store.fork_at(cut).unwrap();
@@ -78,7 +78,7 @@ fn branches_diverge_without_disturbing_each_other() {
 fn a_fork_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let (branch, cut) = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         seed(&store, 20);
         let cut = store.current();
         let fork = store.fork_at(cut).unwrap();
@@ -90,7 +90,7 @@ fn a_fork_survives_a_reopen() {
     // first-class, durable world. (Both branches share one granfilade handle:
     // the directory lock is exclusive, which is exactly why one node store
     // holding every branch is the right shape.)
-    let root = EntStore::open(dir.path()).unwrap();
+    let root = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let fork = root.branch(branch).unwrap();
     assert_eq!(fork.read_at(REL, fork.current()).unwrap().len(), 20, "shared state lost");
     assert_eq!(
@@ -113,7 +113,7 @@ fn a_fork_survives_a_reopen() {
 #[test]
 fn gc_preserves_every_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     seed(&store, 200);
     let fork = store.fork_at(store.current()).unwrap();
 
@@ -129,7 +129,7 @@ fn gc_preserves_every_branch() {
     let branch = fork.branch_id();
     drop(fork);
     drop(store);
-    let fork = EntStore::open_branch(dir.path(), branch).unwrap();
+    let fork = EntStore::open_branch_with(dir.path(), branch, grmpl_ent::Durability::Os).unwrap();
     assert_eq!(
         fork.read_at(REL, fork.current()).unwrap().len(),
         200,
@@ -142,7 +142,7 @@ fn gc_preserves_every_branch() {
 #[test]
 fn forking_at_a_past_edition_cuts_there() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     for k in 0..10i64 {
         store.commit(&[(REL, t(k), 1)]).unwrap();
     }

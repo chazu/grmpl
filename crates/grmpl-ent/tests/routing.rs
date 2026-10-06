@@ -111,7 +111,7 @@ fn churn(store: &dyn TraceStore, rel: RelId, a: i64) {
 #[test]
 fn a_commit_no_watch_reads_evaluates_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Tally { inner: EntStore::open(dir.path()).unwrap(), scans: Mutex::new(0) };
+    let store = Tally { inner: EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap(), scans: Mutex::new(0) };
 
     const WATCHES: u64 = 50;
     let watches: Vec<OnWatch> = (0..WATCHES).map(watch).collect();
@@ -137,7 +137,7 @@ fn a_commit_no_watch_reads_evaluates_nothing() {
 #[test]
 fn a_commit_a_watch_reads_is_still_delivered() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Tally { inner: EntStore::open(dir.path()).unwrap(), scans: Mutex::new(0) };
+    let store = Tally { inner: EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap(), scans: Mutex::new(0) };
     let w = watch(0);
     w.install(&store, &NoSchemas).unwrap();
 
@@ -165,7 +165,7 @@ fn a_commit_a_watch_reads_is_still_delivered() {
 #[test]
 fn touched_since_never_reports_a_false_negative() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     // Interleave commits across two relations so spans differ per relation.
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
@@ -208,7 +208,7 @@ fn touched_since_never_reports_a_false_negative() {
 #[test]
 fn disjoint_key_ranges_of_one_relation_do_not_wake_each_other() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     let lo = |n: i64| Tuple::from([Value::Int(n)]);
     let (a_lo, a_hi) = (lo(0), lo(100));

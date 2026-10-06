@@ -227,7 +227,7 @@ fn kd_reads_and_writes_agree_with_the_model() {
 #[test]
 fn kd_trees_round_trip_through_the_granfilade() {
     let dir = tempfile::tempdir().unwrap();
-    let gran = Granfilade::open(dir.path()).unwrap();
+    let gran = Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
     let mut rng = Rng::new(7);
     let mut t = T::new();
     let mut m = Model::new();
@@ -294,7 +294,7 @@ fn grafts_keep_the_lead_levels_balanced_and_share_the_copy() {
     // The last copy still shares the template's nodes: persisting it after the
     // template writes only the new spine.
     let dir = tempfile::tempdir().unwrap();
-    let gran = Granfilade::open(dir.path()).unwrap();
+    let gran = Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
     gran.persist(&template).unwrap();
     let before = gran.frames_encoded();
     let one = template.kd_graft(&lead(0), &lead(200), 1_000_000).unwrap();

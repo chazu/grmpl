@@ -44,14 +44,14 @@ fn opening_a_world_reads_a_few_frames_whatever_its_size() {
     for rows in [1_000i64, 40_000] {
         let dir = tempfile::tempdir().unwrap();
         let cur = {
-            let store = EntStore::open(dir.path()).unwrap();
+            let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
             // The bound is the B+ layout's depth.
             store.set_default_layout(Layout::Ordered).unwrap();
             build(&store, 4, rows, 100);
             store.current()
         };
 
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         assert_eq!(store.current(), cur);
         let at_open = store.frames_paged();
         opens.push(at_open);
@@ -79,13 +79,13 @@ fn opening_a_world_reads_a_few_frames_whatever_its_size() {
 fn a_pinned_reader_keeps_its_version_through_consolidation_and_gc() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         for k in 0..400i64 {
             store.commit(&[(RelId(1), t(k), 1)]).unwrap();
         }
     }
     // Reopen, so everything the reader reaches starts out paged.
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let pinned = Edition(150);
     let reader = store.reader_at(pinned);
 
@@ -103,7 +103,7 @@ fn a_pinned_reader_keeps_its_version_through_consolidation_and_gc() {
 
     // And the world itself survives a reopen from the root alone.
     drop(store);
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.read_at(RelId(1), store.current()).unwrap().len(), 400);
 }
 
@@ -113,7 +113,7 @@ fn a_watchers_interest_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let (lo, hi) = (t(0), t(10));
     let registered = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         store.commit(&[(REL, t(100), 1)]).unwrap();
         let from = store.current();
         // Registering is a read; the next commit makes it durable with the
@@ -124,7 +124,7 @@ fn a_watchers_interest_survives_a_reopen() {
         from
     };
 
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     // A change outside the interest, after the reopen. A canopy rebuilt empty
     // would have to widen to "the relation changed"; the persisted one knows.
     store.commit(&[(REL, t(60), 1)]).unwrap();

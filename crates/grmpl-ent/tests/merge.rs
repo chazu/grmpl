@@ -277,14 +277,14 @@ fn consolidated_history_cannot_be_replayed() {
 fn a_merge_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let (m_id, want) = {
-        let t = EntStore::open(dir.path()).unwrap();
+        let t = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         seed(&t);
         let s = t.fork_at(t.current()).unwrap();
         s.commit(&[(R, row(50, 1), 1)]).unwrap();
         let m = merge(&t, &s);
         (m.branch_id(), state(&m))
     };
-    let root = EntStore::open(dir.path()).unwrap();
+    let root = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let m = root.branch(m_id).unwrap();
     assert_eq!(state(&m), want);
     let rec = m.dag().get(m_id).unwrap();

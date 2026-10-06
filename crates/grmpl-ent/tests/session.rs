@@ -59,14 +59,14 @@ fn moo_session_runtime_is_durable_across_reopen_on_the_ent_store() {
     let dir = tempfile::tempdir().unwrap();
     // Build a little world, then drop the server + store.
     {
-        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+        let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
         let server = server(store);
         let mut alice = server.login("alice").unwrap();
         alice.submit("dig library").unwrap();
         alice.submit("create tome").unwrap();
     }
     // Reopen the ent store: the same identity and world are still there.
-    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open(dir.path()).unwrap());
+    let store: Arc<dyn WorldStore> = Arc::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     let server = server(store);
     let mut alice = server.login("alice").unwrap(); // reconnect rebinds the identity
     let looked = alice.submit("look").unwrap();

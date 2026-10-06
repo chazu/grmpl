@@ -711,7 +711,7 @@ fn randomized_synthesized_type_admits_every_runtime_row() {
 
     for _ in 0..64 {
         let dir = tempfile::tempdir().unwrap();
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         let cat = MemSchemas::default();
 
         // Random base relations with concrete schemas, registered for typing.

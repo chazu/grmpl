@@ -25,7 +25,7 @@ fn schema(cols: &[(&str, Ty)]) -> Schema {
 fn catalog_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let bound = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         store.register("located", RelId(1)).unwrap();
         store.register("named", RelId(2)).unwrap();
         store.register("held", RelId(5)).unwrap();
@@ -34,7 +34,7 @@ fn catalog_survives_reopen() {
         store.entries().unwrap()
     };
     // Reopened from the granfilade, the names still resolve to the same ids.
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.entries().unwrap(), bound, "catalog did not survive reopen");
     assert_eq!(store.rel_id("held").unwrap(), Some(RelId(5)));
     // `entries` is sorted by name — it is a range walk of one contiguous span.
@@ -64,10 +64,10 @@ fn schema_round_trips_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let s = schema(&[("thing", Ty::Ent), ("place", Ty::Ent)]);
     {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         store.put_schema(RelId(1), &s, Edition(1)).unwrap();
     }
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.schema(RelId(1)).unwrap(), Some(s));
     assert_eq!(store.schema(RelId(2)).unwrap(), None);
 }
@@ -131,7 +131,7 @@ fn gc_does_not_collect_the_catalog_or_schemas() {
     use grmpl_core::{EditionStore, TraceStore, Tuple, Value};
 
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     store.register("located", RelId(1)).unwrap();
     let s = schema(&[("thing", Ty::Ent), ("place", Ty::Ent)]);
     store.put_schema(RelId(1), &s, Edition(1)).unwrap();
@@ -149,7 +149,7 @@ fn gc_does_not_collect_the_catalog_or_schemas() {
     // …and they are still there after a reopen, i.e. the surviving nodes really
     // are the persisted ones, not in-memory leftovers.
     drop(store);
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(store.rel_id("located").unwrap(), Some(RelId(1)));
     assert_eq!(store.schema(RelId(1)).unwrap(), Some(s));
 }

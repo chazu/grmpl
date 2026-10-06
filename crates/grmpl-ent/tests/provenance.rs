@@ -71,11 +71,11 @@ fn a_template_knows_its_instances_and_an_instance_its_template() {
 fn provenance_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let at = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         seed(&store);
         store.instance_template(&[ROOMS, EXITS], 1_000, 1_010, 5_000).unwrap()
     };
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert_eq!(targets(&store, 1_000, 1_010, at), vec![6_000]);
     assert_eq!(store.origin_of(Entity(6_002), at).0, Entity(1_002));
 }

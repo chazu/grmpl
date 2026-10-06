@@ -422,7 +422,7 @@ mod tests {
 
         // …and it round-trips through the granfilade.
         let dir = tempfile::tempdir().unwrap();
-        let gran = crate::granfilade::Granfilade::open(dir.path()).unwrap();
+        let gran = crate::granfilade::Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
         let ck = gran.persist(c.enfilade()).unwrap();
         let back: CanopyEnf = gran.load(ck).unwrap();
         let want: Vec<_> = c.enfilade().iter().map(|(k, v)| (k.clone(), v.clone())).collect();

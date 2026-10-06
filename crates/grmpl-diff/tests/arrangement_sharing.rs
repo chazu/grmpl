@@ -70,7 +70,7 @@ fn seed(store: &CountingStore) {
 #[test]
 fn shared_subdag_is_read_once_within_a_query() {
     let dir = tempfile::tempdir().unwrap();
-    let store = CountingStore::new(EntStore::open(dir.path()).unwrap());
+    let store = CountingStore::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     seed(&store);
     let at = store.current();
 
@@ -90,7 +90,7 @@ fn shared_subdag_is_read_once_within_a_query() {
 #[test]
 fn shared_arrangement_spans_multiple_queries() {
     let dir = tempfile::tempdir().unwrap();
-    let store = CountingStore::new(EntStore::open(dir.path()).unwrap());
+    let store = CountingStore::new(EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     seed(&store);
     let at = store.current();
 

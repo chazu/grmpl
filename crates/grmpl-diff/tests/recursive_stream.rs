@@ -61,7 +61,7 @@ fn commit_and_check(
 #[test]
 fn implements_transitive_closure_with_edge_deletion() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let q = implements_query();
 
     let mut stream = q.watch(&store, store.current());
@@ -95,7 +95,7 @@ fn implements_transitive_closure_with_edge_deletion() {
 #[test]
 fn recursive_watch_tracks_find_under_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let q = implements_query();
 
     let mut stream = q.watch(&store, store.current());

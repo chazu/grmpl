@@ -79,7 +79,7 @@ fn a_fork_is_a_replay_checkpoint() {
     // is a fork point"), and on the Ent it is a new branch in the same
     // granfilade — O(edit), sharing every node, not an O(state) copy.
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(grmpl_ent::EntStore::open(dir.path()).unwrap());
+    let store = Arc::new(grmpl_ent::EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap());
     let shared: Arc<dyn WorldStore> = store.clone();
     let server = Server::new(MooRuntime::builtin(shared).unwrap());
     let relations = server.world().relations().all();

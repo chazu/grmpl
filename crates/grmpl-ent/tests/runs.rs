@@ -32,7 +32,7 @@ fn load(s: &EntStore) {
 #[test]
 fn runs_are_off_unless_a_relation_asks() {
     let dir = tempfile::tempdir().unwrap();
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert!(!s.runs(PLAIN) && !s.runs(FOLDED), "runs are off by default");
     s.set_runs(FOLDED, true).unwrap();
     load(&s);
@@ -47,7 +47,7 @@ fn runs_are_off_unless_a_relation_asks() {
     // What folding buys: a cold range read touches a few frames, not a
     // block's worth of leaves.
     drop(s);
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let cold = |rel: RelId| {
         let before = s.frames_paged();
         assert_eq!(s.range_at(rel, at, &lo, &hi).unwrap().len(), 1_000);
@@ -79,7 +79,7 @@ fn runs_are_off_unless_a_relation_asks() {
 fn a_relations_shape_is_fixed_once_written_and_carried() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let s = EntStore::open(dir.path()).unwrap();
+        let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         s.set_runs(FOLDED, true).unwrap();
         s.set_layout(FOLDED, Layout::Kd).unwrap();
         // A second setting keeps the first: the shape is both.
@@ -93,7 +93,7 @@ fn a_relations_shape_is_fixed_once_written_and_carried() {
         assert!(s.set_default_runs(true).is_err(), "a written relation would change");
     }
     // Durable without any further commit.
-    let s = EntStore::open(dir.path()).unwrap();
+    let s = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     assert!(s.runs(FOLDED) && !s.runs(PLAIN));
     assert_eq!(s.layout(FOLDED), Layout::Kd);
     // A fork carries shapes, and a merge unites them.

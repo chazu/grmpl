@@ -34,7 +34,7 @@ pub use canopy::{Canopy, Endorsement, InterestId};
 pub use context::{ContextEnf, Scope};
 pub use dag::{Branch, BranchId, Dag};
 pub use dsp::Displace;
-pub use granfilade::{Granfilade, Persist};
+pub use granfilade::{Durability, Granfilade, Persist};
 pub use measure::{Count, Extent, Measure};
 pub use spanfilade::{GraftSpan, Spanfilade};
 pub use store::{EntStore, Holding, MergeConflict, MergeOutcome, Shape, SpanCompare, Version};
@@ -265,7 +265,7 @@ mod tests {
         agree(&t, &r, &mut rng, "original after relocation");
         // A relocated tree persists in normalized form and reloads equal.
         let dir = tempfile::tempdir().unwrap();
-        let gran = crate::Granfilade::open(dir.path()).unwrap();
+        let gran = crate::Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
         let ck = gran.persist(&edited).unwrap();
         let back: F = gran.load(ck).unwrap();
         agree(&back, &want, &mut rng, "reloaded relocation");
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn graft_persists_in_log_n_new_nodes() {
         let dir = tempfile::tempdir().unwrap();
-        let gran = crate::Granfilade::open(dir.path()).unwrap();
+        let gran = crate::Granfilade::open_with(dir.path(), crate::Durability::Os).unwrap();
         let mut t = F::new();
         for e in 0..20_000u64 {
             t = t.insert(key(e, 0), 1);

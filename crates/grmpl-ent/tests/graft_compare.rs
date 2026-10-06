@@ -259,7 +259,7 @@ fn a_copy_edited_afterwards_reports_only_the_edit() {
 fn frames(n: u64, copy: u64) -> (u64, u64) {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         // These bounds are the B+ layout's, so they pin it; `kd_layout.rs`
         // has the k-d layout's.
         store.set_default_layout(Layout::Ordered).unwrap();
@@ -273,7 +273,7 @@ fn frames(n: u64, copy: u64) -> (u64, u64) {
         (a, store.instance_template(&[R], 1_000_000, 1_000_000 + copy, 4_000_000).unwrap())
     };
     let measure = |f: &dyn Fn(&EntStore)| {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         let before = store.frames_paged();
         f(&store);
         store.frames_paged() - before
@@ -311,7 +311,7 @@ fn a_compare_reads_the_edit_however_the_spines_were_rebuilt() {
     const N: u64 = 30_000;
     let dir = tempfile::tempdir().unwrap();
     let eds = {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         store.set_default_layout(Layout::Ordered).unwrap();
         let ids: Vec<u64> = (0..N).map(|i| i * 3).collect();
         for chunk in ids.chunks(5_000) {
@@ -325,7 +325,7 @@ fn a_compare_reads_the_edit_however_the_spines_were_rebuilt() {
         [e0, e1, e2, e3]
     };
     let cold = |a: Edition, b: Edition, rows: usize| {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         let before = store.frames_paged();
         assert_eq!(store.compare(R, a, b).unwrap().len(), rows);
         store.frames_paged() - before

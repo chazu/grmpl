@@ -32,7 +32,7 @@ use crate::canopy::{Canopy, InterestId};
 use crate::context::{self, ContextEnf};
 use crate::dag::{BranchId, Dag};
 use crate::dsp::Displace;
-use crate::granfilade::{content_key, ContentKey, Dec, Enc, Granfilade, Persist, StagedWrite};
+use crate::granfilade::{content_key, ContentKey, Dec, Durability, Enc, Granfilade, Persist, StagedWrite};
 use crate::history::{History, Holder};
 use crate::measure::{Count, Extent, Measure};
 use crate::spanfilade::{GraftSpan, Spanfilade};
@@ -749,7 +749,22 @@ impl EntStore {
     /// [`Dag::ROOT`]. The granfilade must not already be open: use
     /// [`branch`](Self::branch) when it is.
     pub fn open_branch(path: impl AsRef<std::path::Path>, branch: BranchId) -> Result<EntStore> {
-        let gran = Granfilade::open(path)?;
+        Self::open_branch_with(path, branch, Durability::Disk)
+    }
+
+    /// [`open`](Self::open) with a chosen [`Durability`]. Tests on throwaway
+    /// stores pass [`Durability::Os`]; nothing a world is served from may.
+    pub fn open_with(path: impl AsRef<std::path::Path>, durability: Durability) -> Result<EntStore> {
+        Self::open_branch_with(path, Dag::ROOT, durability)
+    }
+
+    /// [`open_branch`](Self::open_branch) with a chosen [`Durability`].
+    pub fn open_branch_with(
+        path: impl AsRef<std::path::Path>,
+        branch: BranchId,
+        durability: Durability,
+    ) -> Result<EntStore> {
+        let gran = Granfilade::open_with(path, durability)?;
         let root = EntRoot::load(&gran)?;
         let inner = root.state(branch)?;
         let family = Family {

@@ -44,7 +44,7 @@ on inbox parse command {{
     let named_behavior = Program::behavior(&named, "inbox", Entity(1)).unwrap();
     let concat_behavior = Program::behavior(&concatenative, "inbox", Entity(1)).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let snapshot = Snapshot::at_current(&store);
     let message = Tuple::from([Value::text("go")]);
     let named_patch = named_behavior(&snapshot, &message).unwrap();

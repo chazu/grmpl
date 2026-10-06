@@ -231,7 +231,7 @@ fn stabbing_a_large_scope_relation_reads_a_few_frames() {
     // 20 000 disjoint room-sized scopes, plus a few enclosing regions.
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = EntStore::open(dir.path()).unwrap();
+        let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
         // The bound is the B+ layout's depth.
         store.set_default_layout(Layout::Ordered).unwrap();
         let rows: Vec<(RelId, Tuple, Diff)> = (0..20_000u64)
@@ -242,7 +242,7 @@ fn stabbing_a_large_scope_relation_reads_a_few_frames() {
             store.commit(chunk).unwrap();
         }
     }
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     let before = store.frames_paged();
     let hits = store.read_containing(SCOPES, store.current(), 0, 1, &[ent(123_456)]).unwrap();
     let paged = store.frames_paged() - before;

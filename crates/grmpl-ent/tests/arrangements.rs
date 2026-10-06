@@ -44,7 +44,7 @@ fn sorted(mut v: Vec<(Tuple, Diff)>) -> Vec<(Tuple, Diff)> {
 #[test]
 fn a_trailing_column_range_matches_a_full_scan() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
 
     let mut updates: Vec<(RelId, Tuple, Diff)> = Vec::new();
     for a in 0..12i64 {
@@ -89,7 +89,7 @@ fn a_trailing_column_range_matches_a_full_scan() {
 #[test]
 fn an_arrangement_is_maintained_by_later_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     store
         .commit(&[(REL, row(1, 5, "x"), 1), (REL, row(2, 5, "y"), 1), (REL, row(3, 9, "z"), 1)])
         .unwrap();
@@ -120,7 +120,7 @@ fn an_arrangement_is_maintained_by_later_commits() {
 #[test]
 fn arrangements_are_total() {
     let dir = tempfile::tempdir().unwrap();
-    let store = EntStore::open(dir.path()).unwrap();
+    let store = EntStore::open_with(dir.path(), grmpl_ent::Durability::Os).unwrap();
     store.commit(&[(REL, row(1, 2, "a"), 1)]).unwrap();
     let at = store.current();
     let (l, h) = (Value::Int(i64::MIN), Value::Int(i64::MAX));
