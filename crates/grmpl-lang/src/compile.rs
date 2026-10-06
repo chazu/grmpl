@@ -527,6 +527,13 @@ impl Program {
         out
     }
 
+    /// The names of every declared view, materialized or not, in name order.
+    pub fn views(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.views.keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
     /// The yielded column names of a view (in order).
     pub fn view_yields(&self, name: &str) -> Option<&[String]> {
         self.views.get(name).map(|v| v.yields.as_slice())
@@ -559,6 +566,11 @@ impl Program {
     /// The `RelId` assigned to a declared relation.
     pub fn rel_id(&self, name: &str) -> Option<RelId> {
         self.rels.get(name).map(|r| r.id)
+    }
+
+    /// The declared arity of the relation with id `rel`, typed or not.
+    pub fn rel_arity(&self, rel: RelId) -> Option<usize> {
+        self.rels.values().find(|r| r.id == rel).map(RelInfo::arity)
     }
 
     /// Resolve a package entity constant.
@@ -749,6 +761,17 @@ impl Program {
             }),
             _ => Ok(plan),
         }
+    }
+
+    /// A view's plan with its parameters left **unbound**: each is an ordinary
+    /// variable, joined wherever it repeats, rather than a literal filter. It
+    /// is [`view_ir`](Self::view_ir) for every argument at once, so it carries
+    /// every comparison the view makes between its relations and none between
+    /// a column and a caller's argument, whose type nothing declares. This is
+    /// the plan a load-time type check reads.
+    pub fn view_ir_unbound(&self, name: &str) -> Result<QueryIr, String> {
+        let v = self.views.get(name).ok_or_else(|| format!("no view `{name}`"))?;
+        self.plan_view(name, &HashMap::new(), &v.yields, true)
     }
 
     /// A view's **open linear** form, what a materialized view stores: its

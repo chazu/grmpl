@@ -405,7 +405,10 @@ corresponding tickets for detail.
 
 * **P7 — Core IR** (CBPV split reified).
 * **P8 — Typing:** value/row types (P8a, landed — `grmpl-type::check_query`;
-  only its own tests call it, the runtime does not), effect rows +
+  the runtime calls it at load, through `check_views`: every declared view,
+  its parameters unbound, is typed in the partial mode, where a relation with
+  no registered schema is a row of `Any` of its declared arity, and an
+  ill-typed view fails the load by name), effect rows +
   relation-level Authority check (P8b, landed — `grmpl-type::effect`: infer an
   `on`-handler's write set and check it against a process `Authority` at
   relation granularity; key-ranges stay checked at commit; the runtime calls

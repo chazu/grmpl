@@ -39,6 +39,12 @@
 //! commit-boundary rule (schemas are opt-in) but inverts the default: to *type*
 //! a plan, its relations must be declared.
 //!
+//! [`check_query_partial`] relaxes that for callers that know each relation's
+//! arity but not every type: a relation with no schema types as a row of
+//! [`Ty::Any`] columns, which can raise no comparison error. The runtime checks
+//! every view this way when it loads a world ([`check_views`]), so an untyped
+//! relation loads and an ill-typed view does not.
+//!
 //! ## Effect rows & the Authority check (P8b)
 //!
 //! P8a types the *read* side; the [`effect`] module types the *write* side. It
@@ -58,7 +64,7 @@ use std::fmt;
 
 use grmpl_core::{Edition, RelId, Schema, SchemaCatalog, Ty, Value};
 use grmpl_diff::Agg;
-use grmpl_lang::{Comp, PredExpr, QueryIr, RowExpr};
+use grmpl_lang::{Comp, PredExpr, Program, QueryIr, RowExpr};
 
 pub mod effect;
 
@@ -229,7 +235,74 @@ pub fn check_query(
     schemas: &dyn SchemaCatalog,
     at: Edition,
 ) -> Result<RowTy, TypeError> {
-    synth(q, schemas, at, None)
+    let env = Env {
+        schemas,
+        at,
+        untyped: None,
+    };
+    synth(q, &env, None)
+}
+
+/// [`check_query`] for a plan over relations that may have no schema: a base
+/// relation with none as-of `at` types as a row of `arity(rel)` [`Ty::Any`]
+/// columns. `Any` is compatible with every type, so an untyped relation adds
+/// only range and arity checks; every error is one strict mode would also
+/// report. A relation with neither a schema nor an arity is still
+/// [`TypeError::UnschemaedRelation`].
+pub fn check_query_partial(
+    q: &QueryIr,
+    schemas: &dyn SchemaCatalog,
+    at: Edition,
+    arity: &dyn Fn(RelId) -> Option<usize>,
+) -> Result<RowTy, TypeError> {
+    let env = Env {
+        schemas,
+        at,
+        untyped: Some(arity),
+    };
+    synth(q, &env, None)
+}
+
+/// A view that fails the load-time check: its name and its first type error.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ViewError {
+    pub view: String,
+    pub error: TypeError,
+}
+
+impl fmt::Display for ViewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "view `{}` is ill-typed: {}", self.view, self.error)
+    }
+}
+
+impl std::error::Error for ViewError {}
+
+/// Type every view `prog` declares, in name order, against `schemas` as-of
+/// `at` (P8a at load). Each view is planned with its parameters unbound
+/// ([`Program::view_ir_unbound`]): an argument's type is the caller's, so the
+/// check covers what the view itself compares — literals, entity constants,
+/// shared variables, aggregates. Relations are typed in the partial mode, a
+/// relation the registry has no schema for taking its declared arity.
+///
+/// A view whose body cannot be planned is skipped: like every semantic error
+/// in a view, that one surfaces where the view is instantiated.
+pub fn check_views(
+    prog: &Program,
+    schemas: &dyn SchemaCatalog,
+    at: Edition,
+) -> Result<(), ViewError> {
+    let arity = |rel| prog.rel_arity(rel);
+    for view in prog.views() {
+        let Ok(plan) = prog.view_ir_unbound(view) else {
+            continue;
+        };
+        check_query_partial(&plan, schemas, at, &arity).map_err(|error| ViewError {
+            view: view.to_owned(),
+            error,
+        })?;
+    }
+    Ok(())
 }
 
 /// Type a reified [`Comp`]: [`Comp::Find`]/[`Comp::Watch`] carry a relational
@@ -322,24 +395,32 @@ fn union_ty(a: &RowTy, b: &RowTy) -> Result<RowTy, TypeError> {
     ))
 }
 
+/// Where [`synth`] finds a base relation's row type.
+struct Env<'a> {
+    schemas: &'a dyn SchemaCatalog,
+    at: Edition,
+    /// The arity of a relation with no schema, typed as all [`Ty::Any`]
+    /// (the partial mode); `None` makes such a relation an error.
+    untyped: Option<&'a dyn Fn(RelId) -> Option<usize>>,
+}
+
 /// Bottom-up row-type synthesis. `recur` is the row type bound to
 /// [`QueryIr::Recur`] by the nearest enclosing [`QueryIr::Iterate`], if any.
-fn synth(
-    q: &QueryIr,
-    schemas: &dyn SchemaCatalog,
-    at: Edition,
-    recur: Option<&RowTy>,
-) -> Result<RowTy, TypeError> {
+fn synth(q: &QueryIr, env: &Env, recur: Option<&RowTy>) -> Result<RowTy, TypeError> {
     match q {
         QueryIr::Rel(r) => {
-            let schema = schemas
-                .schema_at(*r, at)
-                .map_err(|e| TypeError::Registry(e.to_string()))?
-                .ok_or(TypeError::UnschemaedRelation(*r))?;
-            Ok(RowTy::from_schema(&schema))
+            let schema = env
+                .schemas
+                .schema_at(*r, env.at)
+                .map_err(|e| TypeError::Registry(e.to_string()))?;
+            match (schema, env.untyped.and_then(|arity| arity(*r))) {
+                (Some(schema), _) => Ok(RowTy::from_schema(&schema)),
+                (None, Some(arity)) => Ok(RowTy(vec![Ty::Any; arity])),
+                (None, None) => Err(TypeError::UnschemaedRelation(*r)),
+            }
         }
         QueryIr::Map { input, map } => {
-            let ti = synth(input, schemas, at, recur)?;
+            let ti = synth(input, env, recur)?;
             let mut cols = Vec::with_capacity(map.out.len());
             for e in &map.out {
                 cols.push(expr_ty(e, &ti)?);
@@ -347,12 +428,12 @@ fn synth(
             Ok(RowTy(cols))
         }
         QueryIr::Filter { input, pred } => {
-            let ti = synth(input, schemas, at, recur)?;
+            let ti = synth(input, env, recur)?;
             check_pred(pred, &ti)?;
             Ok(ti)
         }
         QueryIr::Project { input, cols } => {
-            let ti = synth(input, schemas, at, recur)?;
+            let ti = synth(input, env, recur)?;
             let mut out = Vec::with_capacity(cols.len());
             for &i in cols {
                 out.push(col(&ti, i)?);
@@ -365,8 +446,8 @@ fn synth(
             left_key,
             right_key,
         } => {
-            let tl = synth(left, schemas, at, recur)?;
-            let tr = synth(right, schemas, at, recur)?;
+            let tl = synth(left, env, recur)?;
+            let tr = synth(right, env, recur)?;
             if left_key.len() != right_key.len() {
                 return Err(TypeError::KeyArityMismatch {
                     left: left_key.len(),
@@ -390,14 +471,14 @@ fn synth(
             Ok(RowTy(cols))
         }
         QueryIr::Union(a, b) => {
-            let ta = synth(a, schemas, at, recur)?;
-            let tb = synth(b, schemas, at, recur)?;
+            let ta = synth(a, env, recur)?;
+            let tb = synth(b, env, recur)?;
             union_ty(&ta, &tb)
         }
-        QueryIr::Negate(q) => synth(q, schemas, at, recur),
-        QueryIr::Distinct(q) => synth(q, schemas, at, recur),
+        QueryIr::Negate(q) => synth(q, env, recur),
+        QueryIr::Distinct(q) => synth(q, env, recur),
         QueryIr::Reduce { input, key, agg } => {
-            let ti = synth(input, schemas, at, recur)?;
+            let ti = synth(input, env, recur)?;
             let mut cols = Vec::with_capacity(key.len() + 1);
             for &i in key {
                 cols.push(col(&ti, i)?);
@@ -409,12 +490,12 @@ fn synth(
         // The input's columns, then the inherited value, whose type is
         // whatever the scope bound.
         QueryIr::Inherit { input, .. } => {
-            let mut t = synth(input, schemas, at, recur)?;
+            let mut t = synth(input, env, recur)?;
             t.0.push(Ty::Any);
             Ok(t)
         }
         // The stored copy holds the same rows; the plan is what they mean.
-        QueryIr::Materialized { plan, .. } => synth(plan, schemas, at, recur),
+        QueryIr::Materialized { plan, .. } => synth(plan, env, recur),
         QueryIr::Iterate { init, step } => {
             // The runtime fixpoint is `distinct(init ∪ step(Recur))`, so the row
             // type is the least `t` with `t = union_ty(t_init, synth(step, t))`.
@@ -433,10 +514,10 @@ fn synth(
             // (a concrete type → `Any`) and never back down (`union_ty`/`lub` are
             // monotone and `t_init` is always folded back in), so the row type
             // stabilizes in at most `arity` rounds.
-            let t_init = synth(init, schemas, at, recur)?;
+            let t_init = synth(init, env, recur)?;
             let mut t = t_init.clone();
             loop {
-                let t_step = synth(step, schemas, at, Some(&t))?;
+                let t_step = synth(step, env, Some(&t))?;
                 if t_init.arity() != t_step.arity() {
                     return Err(TypeError::IterateArityMismatch {
                         init: t_init.arity(),

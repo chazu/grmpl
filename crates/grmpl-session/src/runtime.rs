@@ -21,7 +21,7 @@ use grmpl_proc::{
     enqueue_seq, Backoff, ClockDriver, FireNextOutcome, Materialized, OnWatch, Process,
     Scheduler,
 };
-use grmpl_type::{check_handler_authority, EffectChecker};
+use grmpl_type::{check_handler_authority, check_views, EffectChecker};
 
 const DEFAULT_DRIVE_FUEL: usize = 1_024;
 
@@ -150,7 +150,9 @@ fn view_maintainers(program: &Program) -> std::result::Result<Vec<Materialized>,
 
 impl Runtime {
     /// Compile and bind `source`, recovering stable relation ids from the
-    /// store's durable catalog and registering every declared schema.
+    /// store's durable catalog and registering every declared schema. Every
+    /// view is then type-checked against those schemas (P8a); an ill-typed
+    /// view fails the load, naming the view.
     ///
     /// Compilation is provisioning-time and must not race another compiler on
     /// the same store, matching `Program::compile_with_catalog`'s contract.
@@ -168,6 +170,7 @@ impl Runtime {
         program
             .register_schemas(store.as_ref(), store.as_ref(), effective)
             .map_err(|e| e.to_string())?;
+        check_views(&program, store.as_ref(), effective).map_err(|e| e.to_string())?;
         let views = view_maintainers(&program)?;
         for view in &views {
             if view.cursor(store.as_ref()).map_err(|e| e.to_string())?.is_none() {
@@ -184,7 +187,9 @@ impl Runtime {
         }))
     }
 
-    /// Compile, authorize, and atomically install a versioned package.
+    /// Compile, authorize, and atomically install a versioned package. Its
+    /// views are type-checked as [`compile`](Self::compile)'s are, before the
+    /// bootstrap commits.
     ///
     /// Provisioning metadata may be written before the world commit, but the
     /// bootstrap facts and package marker always land together as edition 1.
@@ -221,6 +226,8 @@ impl Runtime {
         package
             .program
             .register_schemas(store.as_ref(), store.as_ref(), effective)
+            .map_err(|error| error.to_string())?;
+        check_views(&package.program, store.as_ref(), effective)
             .map_err(|error| error.to_string())?;
 
         let expected = package.marker_tuple();

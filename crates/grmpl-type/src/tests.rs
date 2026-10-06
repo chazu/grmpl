@@ -81,6 +81,79 @@ fn unschemaed_relation_is_an_error() {
     );
 }
 
+// ---- partial mode ----------------------------------------------------------
+
+/// Relation 7 is untyped with arity 2; every other relation has no arity.
+fn arity_of_7(rel: RelId) -> Option<usize> {
+    (rel == RelId(7)).then_some(2)
+}
+
+#[test]
+fn partial_mode_types_an_unschemaed_relation_as_any() {
+    let cat = MemSchemas::with(&[(1, &[("n", Ty::Int)])]);
+    assert_eq!(
+        check_query_partial(&rel(7), &cat, AT, &arity_of_7).unwrap().cols(),
+        &[Ty::Any, Ty::Any]
+    );
+    // A registered schema still wins, and no arity is still an error.
+    assert_eq!(
+        check_query_partial(&rel(1), &cat, AT, &arity_of_7).unwrap().cols(),
+        &[Ty::Int]
+    );
+    assert_eq!(
+        check_query_partial(&rel(8), &cat, AT, &arity_of_7),
+        Err(TypeError::UnschemaedRelation(RelId(8)))
+    );
+}
+
+#[test]
+fn partial_mode_any_columns_compare_with_everything_but_keep_their_arity() {
+    let cat = MemSchemas::with(&[(1, &[("n", Ty::Int)])]);
+    let join = QueryIr::Join {
+        left: Box::new(rel(1)),
+        right: Box::new(rel(7)),
+        left_key: vec![0],
+        right_key: vec![1],
+    };
+    assert_eq!(
+        check_query_partial(&join, &cat, AT, &arity_of_7).unwrap().cols(),
+        &[Ty::Int, Ty::Any, Ty::Any]
+    );
+    let past_the_end = QueryIr::Project {
+        input: Box::new(rel(7)),
+        cols: vec![2],
+    };
+    assert_eq!(
+        check_query_partial(&past_the_end, &cat, AT, &arity_of_7),
+        Err(TypeError::ColumnOutOfRange { index: 2, arity: 2 })
+    );
+}
+
+#[test]
+fn check_views_names_the_ill_typed_view() {
+    let prog = grmpl_lang::Program::compile(
+        "rel score(who: Ent, n: Int)\nrel tag(who, label)\n\
+         view fine(who) { score(who, n) tag(who, label) yield label, n }\n\
+         view bad() { score(who, n) score(n, m) yield who }",
+        1,
+    )
+    .unwrap();
+    // No registry at all: the typed relation is untyped too, so even `bad`
+    // passes.
+    check_views(&prog, &grmpl_core::NoSchemas, AT).unwrap();
+    // With the declared schemas, `bad` joins an `Int` to an `Ent`.
+    let cat = MemSchemas::default();
+    for name in ["score", "tag"] {
+        cat.put_schema(prog.rel_id(name).unwrap(), &prog.schema(name).unwrap(), AT)
+            .unwrap();
+    }
+    let err = check_views(&prog, &cat, AT).unwrap_err();
+    assert!(
+        err.view == "bad" && matches!(err.error, TypeError::JoinKeyMismatch { .. }),
+        "{err}"
+    );
+}
+
 // ---- map -------------------------------------------------------------------
 
 #[test]
