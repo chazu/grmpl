@@ -6,14 +6,15 @@ The supported product surface is one Rust library crate, `grmpl`, and one
 product binary, `grmpl`:
 
 ```text
-grmpl run [WORLD.grmpl] [STORE_DIR]
+grmpl run WORLD.grmpl [STORE_DIR]
+grmpl moo [STORE_DIR]
 grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]
 grmpl shotengai [STORE_DIR]
 grmpl showcase
 ```
 
-`run` and `serve` are adapters over the same `grmpl::Runtime` and built-in
-`grmpl::MooRuntime`. They load through the durable catalog, register the
+`run` is a generic REPL over any world on `grmpl::Runtime`; `moo` and `serve`
+are adapters over the same `grmpl::Runtime` and built-in `grmpl::MooRuntime`. They load through the durable catalog, register the
 program's schemas, atomically install source-owned bootstrap facts, allocate durable inbox
 sequences, instantiate the same behaviors, and use the same retry policy.
 `grmpld` has been removed. The semantic crates (`grmpl-core`, `grmpl-diff`,

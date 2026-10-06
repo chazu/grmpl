@@ -9,7 +9,7 @@ run = "cargo test --workspace"
 [tasks.moo]
 description = "Play the MOO example (worlds/moo.grmpl) in a REPL against a persistent store"
 dir = "{{config_root}}"
-run = "cargo run -p grmpl-cli --quiet -- run worlds/moo.grmpl .grmpl/moo"
+run = "cargo run -p grmpl-cli --quiet -- moo .grmpl/moo"
 
 [tasks.showcase]
 description = "Run the narrated tour of the substrate's features"

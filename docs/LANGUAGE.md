@@ -9,7 +9,7 @@ into afterwards.
 The running example throughout is [`worlds/moo.grmpl`](../worlds/moo.grmpl), a
 small MOO (a multi-room text world). Everything the world *means* — rooms,
 verbs, an autonomous cat, a hand of cards and how it scores — lives in that file
-as relations, views, and behaviors. The binary that runs it (`grmpl run`) only
+as relations, views, and behaviors. The binary that runs it (`grmpl moo`) only
 does terminal I/O and drives the clock.
 
 ---
@@ -564,12 +564,13 @@ Putting it together, the MOO uses every construct:
 Run it and poke at it:
 
 ```sh
-grmpl run                 # play the built-in MOO in a REPL
-grmpl run worlds/moo.grmpl /tmp/mansion   # a file + a persistent store
+grmpl moo                 # play the built-in MOO in a REPL
+grmpl moo /tmp/mansion    # ... against a persistent store
+grmpl run worlds/moo.grmpl   # inspect any world: :rels, :views, ? VIEW ARG…
 grmpl showcase            # a narrated tour of the substrate's features
 ```
 
-Inside the REPL, `help` lists the world's commands: `look`, `go north`,
+Inside `grmpl moo`, `help` lists the world's commands: `look`, `go north`,
 `take lamp`, `greet cat`, `deal`/`cards`/`score`, `watch`, and more. Every one of
 them is a view or a behavior in the file above — never a privileged engine
 operation.

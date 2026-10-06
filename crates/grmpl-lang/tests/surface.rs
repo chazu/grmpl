@@ -81,6 +81,20 @@ fn view_compiles_to_a_relational_query() {
 }
 
 #[test]
+fn the_program_lists_its_relations_and_views() {
+    let src = format!("{SRC}\nmaterialized view names() {{ named(thing, name) yield name }}");
+    let prog = Program::compile(&src, 1).unwrap();
+    // Declared relations only: the materialized view's backing relation and
+    // cursor are the compiler's, not the source's.
+    assert_eq!(prog.rel_names(), ["located", "named", "permits"]);
+    assert_eq!(prog.view_names(), ["names", "visible"]);
+    assert_eq!(prog.view_params("visible").unwrap(), ["viewer"]);
+    assert!(prog.view_params("names").unwrap().is_empty());
+    assert_eq!(prog.view_yields("visible").unwrap(), ["thing", "name"]);
+    assert!(prog.view_params("absent").is_none());
+}
+
+#[test]
 fn form_compiles_to_a_parser() {
     let prog = Program::compile(SRC, 1).unwrap();
     let command = prog.form("command").unwrap();

@@ -191,6 +191,32 @@ fn take_verb_moves_a_thing_through_the_compiled_behavior() {
     });
 }
 
+#[test]
+fn grmpl_moo_plays_the_builtin_world() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let store = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_grmpl"))
+        .arg("moo")
+        .arg(store.path().join("moo"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("grmpl runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"take lamp\ninventory\nquit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("running the built-in MOO"), "{stdout}");
+    assert!(stdout.contains("You are carrying: brass lamp."), "{stdout}");
+}
+
 fn tokens(line: &str) -> Tuple {
     Tuple::new(line.split_whitespace().map(Value::text).collect::<Vec<_>>())
 }

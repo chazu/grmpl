@@ -16,6 +16,7 @@ grmpl-diff = { path = "../grmpl-diff" }
 grmpl-lang = { path = "../grmpl-lang" }
 grmpl-proc = { path = "../grmpl-proc" }
 grmpl-ent = { path = "../grmpl-ent" }
+grmpl-type = { path = "../grmpl-type" }
 tempfile = "3"
 
 [dev-dependencies]

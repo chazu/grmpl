@@ -1,11 +1,11 @@
 # A full session with the grmpl MOO
 
-A real, unedited playthrough of `grmpl run` (the built-in [`worlds/moo.grmpl`](../worlds/moo.grmpl)), captured by piping the commands below into the binary. Every response is produced by the world's own `view`s and behaviors — the host only prints them.
+A real, unedited playthrough of `grmpl moo` (the built-in [`worlds/moo.grmpl`](../worlds/moo.grmpl)), captured by piping the commands below into the binary. Every response is produced by the world's own `view`s and behaviors — the host only prints them.
 
 > Reproduce it yourself:
 >
 > ```sh
-> cargo run -p grmpl-cli -- run
+> cargo run -p grmpl-cli -- moo
 > ```
 
 ---

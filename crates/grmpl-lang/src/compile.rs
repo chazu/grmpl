@@ -532,6 +532,30 @@ impl Program {
         self.views.get(name).map(|v| v.yields.as_slice())
     }
 
+    /// The parameter names of a view (in order): the arguments
+    /// [`view`](Self::view) binds.
+    pub fn view_params(&self, name: &str) -> Option<&[String]> {
+        self.views.get(name).map(|v| v.params.as_slice())
+    }
+
+    /// The names of every declared view, in name order.
+    pub fn view_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.views.keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// The names of the relations the source declares, in name order. The
+    /// reserved relations the compiler adds (a materialized view's backing
+    /// relation and cursor, a package's install marker) are left out: their
+    /// names hold a colon, which source cannot spell.
+    pub fn rel_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> =
+            self.rels.keys().map(String::as_str).filter(|name| !name.contains(':')).collect();
+        names.sort();
+        names
+    }
+
     /// The `RelId` assigned to a declared relation.
     pub fn rel_id(&self, name: &str) -> Option<RelId> {
         self.rels.get(name).map(|r| r.id)

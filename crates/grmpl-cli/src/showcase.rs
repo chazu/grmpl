@@ -42,7 +42,7 @@ pub fn run() -> Result<(), String> {
     scene_forks()?;
     scene_live_behaviors()?;
     scene_scheduling()?;
-    println!("\n═══ End of tour. Try `grmpl run` to play the world yourself. ═══");
+    println!("\n═══ End of tour. Try `grmpl moo` to play the world yourself. ═══");
     Ok(())
 }
 

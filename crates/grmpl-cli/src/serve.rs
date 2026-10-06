@@ -1,5 +1,5 @@
 //! `grmpl serve [WORLD.grmpl] [STORE_DIR] [ADDR]` — expose the same world
-//! runtime as `grmpl run` through the line-oriented TCP adapter.
+//! runtime as `grmpl moo` through the line-oriented TCP adapter.
 
 use std::net::TcpListener;
 use std::sync::Arc;
