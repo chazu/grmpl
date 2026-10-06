@@ -23,6 +23,8 @@ pub mod canopy;
 pub mod context;
 pub mod dag;
 pub mod dsp;
+#[cfg(test)]
+mod format_golden;
 pub mod granfilade;
 mod history;
 pub mod measure;

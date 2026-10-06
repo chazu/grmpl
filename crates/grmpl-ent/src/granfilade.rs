@@ -574,6 +574,18 @@ impl Granfilade {
         Ok(self.meta.get(key).map_err(store_err)?.map(|s| s.as_ref().to_vec()))
     }
 
+    /// The stored frame under `ck`, for the fixtures that pin the format.
+    #[cfg(test)]
+    pub(crate) fn frame(&self, ck: &ContentKey) -> Option<Vec<u8>> {
+        self.nodes.get(ck).unwrap().map(|s| s.as_ref().to_vec())
+    }
+
+    /// The stored root record, for the fixtures that pin the format.
+    #[cfg(test)]
+    pub(crate) fn root_record(&self) -> Option<Vec<u8>> {
+        self.meta_get(ROOT_KEY).unwrap()
+    }
+
     /// Persist `tree`'s nodes, returning its root content key (`None` if
     /// empty), **without** naming it from the root record — so the next GC
     /// collects it. For tests and tools that exercise the node store directly.

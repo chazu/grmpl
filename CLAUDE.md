@@ -57,7 +57,10 @@ collision-resistant against chosen input.
 
 Decoders reject any other version loudly (`Error::Codec`) rather than misreading
 an evolved layout. **Bump `FORMAT_VERSION` on any change to the tag set or
-framing.**
+framing.** Golden fixtures enforce it: `tests/golden/v{N}.txt` in `grmpl-core`
+(wire) and `grmpl-ent` (node frames, root record) pin the bytes, so an
+encoding that changes under the same version fails; bump, then bless with
+`GRMPL_BLESS=1`. Old files stay as the format's history.
 
 **Every decoder treats its bytes as hostile**: any input gives `Ok` or
 `Error::Codec`, never a panic. Nesting is bounded (`wire::MAX_DEPTH`,
