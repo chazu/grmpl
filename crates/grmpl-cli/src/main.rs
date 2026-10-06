@@ -7,12 +7,14 @@
 //!   through the TCP session adapter.
 //! * `grmpl shotengai [STORE_DIR]` — play the durable Kasumi Shotengai RPG.
 //! * `grmpl showcase` — a narrated tour of the substrate's distinctive features.
+//! * `grmpl store verify|info|history DIR …` — offline tools over a store.
 
 mod moo;
 mod run;
 mod serve;
 mod shotengai;
 mod showcase;
+mod store;
 
 const USAGE: &str = "\
 grmpl — a differential, relational substrate you can play
@@ -33,6 +35,14 @@ USAGE:
                                           Defaults to .grmpl/shotengai.
     grmpl showcase                        Run a narrated tour of the substrate's
                                           distinctive features.
+    grmpl store verify DIR                Check every node frame a store's root
+                                          reaches: present, hashing to its key,
+                                          decodable. Exits nonzero on damage.
+    grmpl store info DIR                  Branches, clocks, catalog, relations
+                                          (rows, layout, runs, schema), totals.
+    grmpl store history DIR REL [EDITION] [--branch B]
+                                          The versions, on every branch, that
+                                          share nodes with REL as of EDITION.
     grmpl help                            Show this help.
 
 Inside `grmpl run` or `grmpl moo`, type `help` for the commands.";
@@ -50,6 +60,7 @@ fn main() {
         ),
         "shotengai" => shotengai::run(args.get(1).cloned()),
         "showcase" => showcase::run(),
+        "store" => store::run(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())

@@ -34,7 +34,7 @@ pub use canopy::{Canopy, Endorsement, InterestId};
 pub use context::{ContextEnf, Scope};
 pub use dag::{Branch, BranchId, Dag};
 pub use dsp::Displace;
-pub use granfilade::{Durability, Granfilade, Persist};
+pub use granfilade::{Durability, Granfilade, Persist, Verification};
 pub use measure::{Count, Extent, Measure};
 pub use spanfilade::{GraftSpan, Spanfilade};
 pub use store::{EntStore, Holding, MergeConflict, MergeOutcome, Shape, SpanCompare, Version};

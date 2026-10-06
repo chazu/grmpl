@@ -753,21 +753,13 @@ impl Granfilade {
     /// The caller must keep new roots from being written while this runs (the
     /// store holds its root lock).
     pub fn gc(&self) -> Result<usize> {
-        let mut stack: Vec<ContentKey> = self.root()?.into_iter().flatten().collect();
+        let mut roots: Vec<ContentKey> = self.root()?.into_iter().flatten().collect();
         {
             let mut rem = self.remembered.lock().unwrap();
             rem.nodes.retain(|(_, w)| w.upgrade().is_some_and(|n| !n.resident()));
-            stack.extend(rem.nodes.iter().map(|(ck, _)| *ck));
+            roots.extend(rem.nodes.iter().map(|(ck, _)| *ck));
         }
-        let mut marked: HashSet<ContentKey> = HashSet::new();
-        while let Some(ck) = stack.pop() {
-            if !marked.insert(ck) {
-                continue;
-            }
-            if let Some(frame) = self.nodes.get(ck).map_err(store_err)? {
-                stack.extend(refs_of(frame.as_ref())?);
-            }
-        }
+        let marked = self.mark(roots, |_, frame| frame.map_or(Ok(Vec::new()), refs_of))?;
         let mut swept = Vec::new();
         let mut batch = self.db.batch();
         for kv in self.nodes.iter() {
@@ -789,8 +781,125 @@ impl Granfilade {
         Ok(swept.len())
     }
 
+    /// **The mark walk** GC and [`verify`](Self::verify) share: every key
+    /// reachable from `roots` through frames' reference runs, each handed once
+    /// to `visit` with its frame (`None` when no frame is stored under it),
+    /// which returns the references to follow. Type-agnostic, as GC is.
+    fn mark(
+        &self,
+        roots: Vec<ContentKey>,
+        mut visit: impl FnMut(&ContentKey, Option<&[u8]>) -> Result<Vec<ContentKey>>,
+    ) -> Result<HashSet<ContentKey>> {
+        let mut stack = roots;
+        let mut marked: HashSet<ContentKey> = HashSet::new();
+        while let Some(ck) = stack.pop() {
+            if !marked.insert(ck) {
+                continue;
+            }
+            let frame = self.nodes.get(ck).map_err(store_err)?;
+            stack.extend(visit(&ck, frame.as_ref().map(|f| f.as_ref()))?);
+        }
+        Ok(marked)
+    }
+
+    /// **Check every frame the root record reaches**, reading frames straight
+    /// from the node store and never paging a tree in, so a damaged store is
+    /// reported rather than panicking a reader. Each reachable frame must be
+    /// stored, hash to its key, and decode as a frame: its header, and the
+    /// agreement of its tag, count and references that GC and the decoder rely
+    /// on. A payload is typed by the tree that links it, so the hash is what
+    /// vouches for it. A frame whose header decodes is followed, mismatched or
+    /// not, so damage beneath it is found too.
+    ///
+    /// Read-only, and blind to paged nodes held in memory: run it on a store
+    /// no one has open, where a [`gc`](Self::gc) would sweep exactly the
+    /// unreachable frames counted here.
+    pub fn verify(&self) -> Result<Verification> {
+        let roots: Vec<ContentKey> = self.root()?.into_iter().flatten().collect();
+        let mut v = Verification::default();
+        let marked = self.mark(roots, |ck, frame| {
+            let Some(frame) = frame else {
+                v.missing.push(*ck);
+                return Ok(Vec::new());
+            };
+            if grmpl_core::hash::sha256(frame) != *ck {
+                v.mismatched.push(*ck);
+            }
+            match check_frame(frame) {
+                Ok(refs) => Ok(refs),
+                Err(e) => {
+                    v.undecodable.push((*ck, e.to_string()));
+                    Ok(Vec::new())
+                }
+            }
+        })?;
+        v.reachable = marked.len();
+        for kv in self.nodes.iter() {
+            let (k, f) = kv.into_inner().map_err(store_err)?;
+            v.frames += 1;
+            v.bytes += f.len() as u64;
+            let key: Option<ContentKey> = k.as_ref().try_into().ok();
+            if !key.is_some_and(|key| marked.contains(&key)) {
+                v.unreachable += 1;
+            }
+        }
+        for keys in [&mut v.missing, &mut v.mismatched] {
+            keys.sort_unstable();
+        }
+        v.undecodable.sort_unstable();
+        Ok(v)
+    }
+
+    /// Bytes in every stored frame, before the node store compresses them.
+    pub fn node_bytes(&self) -> Result<u64> {
+        let mut bytes = 0;
+        for kv in self.nodes.iter() {
+            bytes += kv.into_inner().map_err(store_err)?.1.len() as u64;
+        }
+        Ok(bytes)
+    }
+
+    /// **Test hook: damage the node store.** Overwrite the frame under `ck`
+    /// with `frame`, or delete it (`None`), bypassing every check. For tests
+    /// of [`verify`](Self::verify) and of tools that must survive corruption;
+    /// nothing else may call it.
+    #[doc(hidden)]
+    pub fn clobber_frame(&self, ck: &ContentKey, frame: Option<&[u8]>) -> Result<()> {
+        match frame {
+            Some(f) => self.nodes.insert(ck.to_vec(), f.to_vec()).map_err(store_err)?,
+            None => self.nodes.remove(ck.to_vec()).map_err(store_err)?,
+        }
+        self.present.lock().unwrap().remove(ck);
+        self.sync()
+    }
+
     fn is_present(&self, ck: &ContentKey) -> bool {
         self.present.lock().unwrap().contains(ck)
+    }
+}
+
+/// **What [`Granfilade::verify`] found.** Keys are listed sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Verification {
+    /// Distinct keys reachable from the root record, stored or not.
+    pub reachable: usize,
+    /// Reachable keys with no frame stored under them.
+    pub missing: Vec<ContentKey>,
+    /// Reachable frames that do not hash to their key.
+    pub mismatched: Vec<ContentKey>,
+    /// Reachable frames that do not decode as a frame, and why.
+    pub undecodable: Vec<(ContentKey, String)>,
+    /// Frames stored, and their bytes.
+    pub frames: usize,
+    pub bytes: u64,
+    /// Stored frames the root record does not reach: what a sweep removes.
+    pub unreachable: usize,
+}
+
+impl Verification {
+    /// Whether every reachable frame is stored, intact and decodable.
+    pub fn is_sound(&self) -> bool {
+        self.missing.is_empty() && self.mismatched.is_empty() && self.undecodable.is_empty()
     }
 }
 
@@ -838,6 +947,25 @@ const TAG_SPLIT: u8 = 2;
 /// `K`, `V` or `M`.
 fn refs_of(frame: &[u8]) -> Result<Vec<ContentKey>> {
     let (_tag, refs, _pos) = decode_header(frame)?;
+    Ok(refs)
+}
+
+/// Decode a frame as far as no type is needed: its header, then its count,
+/// which must agree with its references for the tags that have children (an
+/// internal node has one more child than separators, a split two). Returns
+/// its references.
+fn check_frame(frame: &[u8]) -> Result<Vec<ContentKey>> {
+    let (tag, refs, pos) = decode_header(frame)?;
+    let count = frame.get(pos..pos + 4).ok_or_else(|| trunc("count"))?;
+    let count = u32::from_be_bytes(count.try_into().unwrap()) as usize;
+    match tag {
+        TAG_LEAF => {}
+        TAG_INTERNAL if count + 1 == refs.len() => {}
+        TAG_INTERNAL => return Err(Error::Codec("granfilade: malformed internal node".into())),
+        TAG_SPLIT if refs.len() == 2 => {}
+        TAG_SPLIT => return Err(Error::Codec("granfilade: malformed split node".into())),
+        _ => return Err(Error::Codec(format!("granfilade: unknown node tag {tag}"))),
+    }
     Ok(refs)
 }
 

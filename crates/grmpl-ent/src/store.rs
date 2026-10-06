@@ -833,6 +833,27 @@ impl EntStore {
         Ok(facts.map(|t| search_box(&t, bounds)).unwrap_or_default())
     }
 
+    /// Every relation this branch has written, in id order.
+    pub fn relations(&self) -> Vec<RelId> {
+        self.inner.lock().unwrap().rel_ids()
+    }
+
+    /// How many rows `rel` holds at `at`: its Fact root's size, read off the
+    /// root without walking the relation.
+    pub fn rows_at(&self, rel: RelId, at: Edition) -> Result<usize> {
+        let inner = self.inner.lock().unwrap();
+        if at.0 < inner.watermark {
+            return Err(door("rows_at", at.0, inner.watermark));
+        }
+        Ok(inner.fact_at(rel, at.0).map_or(0, |t| t.len()))
+    }
+
+    /// **The shape of `rel`'s Fact trees**: its [`layout`](Self::layout) and
+    /// whether its rows fold into [`runs`](Self::runs).
+    pub fn shape(&self, rel: RelId) -> Shape {
+        self.inner.lock().unwrap().shape_of(rel)
+    }
+
     /// **The layout of `rel`'s Fact trees** ([`Layout`]): the B+ tree ordered
     /// by the whole key, or binary splits on any column (Gold's `SplitLoaf`,
     /// fidelity gap G8).
@@ -1430,6 +1451,15 @@ impl EntStore {
     pub fn stored_nodes(&self) -> Result<usize> {
         match &self.family.gran {
             Some(g) => g.node_count(),
+            None => Ok(0),
+        }
+    }
+
+    /// Bytes in the stored nodes' frames, before the node store compresses
+    /// them. `0` for an in-memory store.
+    pub fn stored_bytes(&self) -> Result<u64> {
+        match &self.family.gran {
+            Some(g) => g.node_bytes(),
             None => Ok(0),
         }
     }
